@@ -39,14 +39,24 @@ vi.mock('./integrations/googleSheets', async (importOriginal) => {
   return { ...actual, readGoogleSheetLedger: googleSheetsMocks.read, requestGoogleSheetsAccessToken: googleSheetsMocks.requestToken, revokeGoogleSheetsAccessToken: googleSheetsMocks.revoke }
 })
 
-beforeEach(async () => {
-  savedDecisionStore.clear(); localStorage.clear()
+beforeEach(() => {
+  // clearMocks clears call history, but it does not discard queued
+  // mockResolvedValueOnce/mockRejectedValueOnce implementations.
+  savedDecisionStore.clear()
+  localStorage.clear()
+  sessionStorage.clear()
+  googleSheetsMocks.read.mockReset()
+  googleSheetsMocks.requestToken.mockReset()
+  googleSheetsMocks.revoke.mockReset()
+  vi.mocked(readCardStatementPdf).mockReset()
   vi.mocked(readCardStatementPdf).mockImplementation(async () => syntheticStatement)
   vi.mocked(requestGoogleSheetsAccessToken).mockResolvedValue('test-access-token')
   vi.mocked(readGoogleSheetLedger).mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'CONTROLE ORÇAMENTÁRIO PESSOAL 2026', transactions: [], rowCount: 1 })
-  vi.mocked(revokeGoogleSheetsAccessToken).mockClear()
 })
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 
 describe('fluxo completo no navegador', () => {
   it('restaura o vínculo e tenta atualizar uma vez ao abrir o app', async () => {
@@ -71,7 +81,10 @@ describe('fluxo completo no navegador', () => {
     expect(loadGoogleSheetLink()).toMatchObject({ spreadsheetId: 'spreadsheet-id-12345', autoConnect: false })
     await user.click(reconnect)
     await waitFor(() => expect(readGoogleSheetLedger).toHaveBeenCalledTimes(2))
+    await screen.findByRole('button', { name: 'Atualizar dados' })
     expect(requestGoogleSheetsAccessToken).toHaveBeenLastCalledWith(expect.any(String))
+    expect(requestGoogleSheetsAccessToken).toHaveBeenCalledTimes(3)
+    expect(readGoogleSheetLedger).toHaveBeenLastCalledWith('spreadsheet-id-12345', 'test-access-token')
     expect(loadGoogleSheetLink()).toMatchObject({ spreadsheetId: 'spreadsheet-id-12345', autoConnect: true })
     expect(screen.getByText('Aba: CUSTOS ANO')).toBeInTheDocument()
   })
@@ -83,8 +96,14 @@ describe('fluxo completo no navegador', () => {
     await user.click(screen.getByRole('button', { name: 'Trocar planilha' }))
     const input = screen.getByLabelText('URL ou ID da planilha')
     await user.clear(input); await user.type(input, 'new-spreadsheet-id-67890')
+    vi.mocked(readGoogleSheetLedger).mockRejectedValueOnce(new GoogleSheetsError('A aba CUSTOS ANO não foi encontrada.', 'TAB_MISSING'))
+    await user.click(screen.getByRole('button', { name: 'Validar e trocar planilha' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('CUSTOS ANO não foi encontrada')
+    expect(loadGoogleSheetLink()).toMatchObject({ spreadsheetId: 'spreadsheet-id-12345' })
+
     vi.mocked(readGoogleSheetLedger).mockResolvedValueOnce({ spreadsheetId: 'new-spreadsheet-id-67890', spreadsheetTitle: 'Planilha nova', transactions: [], rowCount: 8 })
     await user.click(screen.getByRole('button', { name: 'Validar e trocar planilha' }))
+    await screen.findByRole('button', { name: 'Atualizar dados' })
     await waitFor(() => expect(loadGoogleSheetLink()?.spreadsheetId).toBe('new-spreadsheet-id-67890'))
     expect(screen.getByText('Planilha nova')).toBeInTheDocument()
   })
@@ -93,6 +112,7 @@ describe('fluxo completo no navegador', () => {
     const user = userEvent.setup()
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha vinculada', lastUpdated: null, autoConnect: true })
     render(<App />)
+    await screen.findByText('✓ Planilha vinculada · Google conectado')
     await user.click(await screen.findByRole('button', { name: 'Desconectar Google' }))
     expect(revokeGoogleSheetsAccessToken).toHaveBeenCalledWith('test-access-token')
     expect(loadGoogleSheetLink()).toMatchObject({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', autoConnect: false })
