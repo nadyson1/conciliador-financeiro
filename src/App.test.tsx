@@ -413,6 +413,8 @@ describe('fluxo completo no navegador', () => {
     expect(await screen.findByText(/PDF lido · 2 páginas · 2 cartões · 2 compras/)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    await user.click(screen.getByRole('button', { name: 'Mostrar conciliadas' }))
+    await user.click(screen.getByRole('button', { name: 'Mostrar tudo' }))
     expect(screen.getByText(/MERCADO EXEMPLO/)).toBeInTheDocument()
     expect(screen.getByText(/ESTORNO MODELO/)).toBeInTheDocument()
     expect(screen.getByText('CRÉDITO/ESTORNO')).toBeInTheDocument()
@@ -504,10 +506,69 @@ describe('fluxo completo no navegador', () => {
     expect(decisionSyncMocks.tombstone).toHaveBeenCalledWith(decision)
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    await user.click(await screen.findByRole('button', { name: 'Mostrar conciliadas' }))
     const row = screen.getByText(/Amazon Kindle Unltd/).closest('article')!
     expect(within(row).queryByText('AUSÊNCIA CONFIRMADA')).not.toBeInTheDocument()
     expect(within(row).getByText('MATCHED · Crédito_Bradesco')).toBeInTheDocument()
     expect(within(row).queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
+  })
+
+  it('rebaixa para REVIEW um vínculo confirmado cuja linha teve a data editada', async () => {
+    const user = userEvent.setup()
+    const statement: CardStatement = { ...structuredClone(syntheticStatement), statementIdentity: 'statement-kindle-date-edit', dueDate: '2026-03-12', transactions: [{ ...syntheticStatement.transactions[0], id: 'kindle-date-edit', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description: 'Amazon Kindle Unltd', originalDescription: 'Amazon Kindle Unltd', amount: 299 }] }
+    const identity = `${statement.statementIdentity}:${stableFingerprint([statement.transactions[0].cardIdentifier, statement.transactions[0].date, statement.transactions[0].originalDescription, statement.transactions[0].amount, statement.transactions[0].direction, null, null])}`
+    const saved = { key: `STATEMENT_MATCH_CONFIRMED:${JSON.stringify([identity])}`, schemaVersion: 1 as const, kind: 'STATEMENT_MATCH_CONFIRMED', identities: [identity], selected: ['kindle-edited-row'], updatedAt: new Date().toISOString() }
+    savedDecisionStore.set(saved.key, saved)
+    const edited = { id: 'kindle-edited-row', source: 'SHEET' as const, sheetRecordId: 'kindle-edited-row', bankTransactionId: null, date: '2026-04-12', description: 'Assinatura Kindle unlimited (2 meses)', originalDescription: 'Assinatura Kindle unlimited (2 meses)', amount: 299, direction: 'DEBIT' as const, type: 'OTHER' as const, paymentMethod: 'Crédito_Bradesco', category: 'Assinaturas', month: '04 - Abril', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    vi.mocked(readCardStatementPdf).mockResolvedValueOnce(statement)
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha editada', transactions: [edited], rowCount: 1 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha editada', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic'], 'kindle-date-edit.pdf', { type: 'application/pdf' }))
+    await screen.findByText(/PDF lido · 2 páginas/)
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    const row = screen.getByText(/Amazon Kindle Unltd/).closest('article')!
+    expect(within(row).getByText('REVISAR CORRESPONDÊNCIA')).toBeInTheDocument()
+    expect(within(row).getByText(/CUSTOS ANO: 12\/04\/2026 · Assinatura Kindle unlimited/)).toBeInTheDocument()
+    expect(within(row).queryByText('COMPRA DE CARTÃO NÃO REGISTRADA')).not.toBeInTheDocument()
+    expect(savedDecisionStore.has(saved.key)).toBe(true)
+  })
+
+  it('recolhe faturas conciliadas, destaca exceções e mantém expansão somente na interface', async () => {
+    const user = userEvent.setup()
+    const clearStatement: CardStatement = { ...structuredClone(syntheticStatement), fileName: 'fatura-julho.pdf', statementIdentity: 'statement-july-clear', dueDate: '2025-07-12', reportedTotal: 6000, purchasesDebitsTotal: 6000, cardSubtotals: [{ cardIdentifier: '4321 XXXX XXXX 1111', amount: 6000 }], transactions: [{ ...syntheticStatement.transactions[0], id: 'july-clear-purchase', cardIdentifier: '4321 XXXX XXXX 1111', purchaseDate: '2025-06-02', date: '2025-06-02', invoiceDueDate: '2025-07-12', statementDueDate: '2025-07-12', amount: 6000, originalDescription: 'MERCADO JULHO', description: 'MERCADO JULHO' }] }
+    const issueStatement: CardStatement = { ...structuredClone(syntheticStatement), fileName: 'fatura-agosto.pdf', statementIdentity: 'statement-august-issue', dueDate: '2025-08-12', reportedTotal: 7000, purchasesDebitsTotal: 7000, cardSubtotals: [{ cardIdentifier: '4321 XXXX XXXX 1111', amount: 7000 }], transactions: [
+      { ...syntheticStatement.transactions[0], id: 'august-matched-purchase', cardIdentifier: '4321 XXXX XXXX 1111', purchaseDate: '2025-07-02', date: '2025-07-02', invoiceDueDate: '2025-08-12', statementDueDate: '2025-08-12', amount: 4000, originalDescription: 'SERVIÇO EXISTENTE', description: 'SERVIÇO EXISTENTE' },
+      { ...syntheticStatement.transactions[0], id: 'august-missing-purchase', cardIdentifier: '4321 XXXX XXXX 1111', purchaseDate: '2025-07-08', date: '2025-07-08', invoiceDueDate: '2025-08-12', statementDueDate: '2025-08-12', amount: 3000, originalDescription: 'LOJA AUSENTE', description: 'LOJA AUSENTE' },
+    ] }
+    const row = (id: string, date: string, description: string, amount: number) => ({ id, source: 'SHEET' as const, sheetRecordId: id, bankTransactionId: null, date, description, originalDescription: description, amount, direction: 'DEBIT' as const, type: 'OTHER' as const, paymentMethod: 'Crédito_Bradesco', category: 'Casa', month: '', year: date.slice(0, 4), isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} })
+    const sheetRows = [row('july-sheet', '2025-07-12', 'Compra cartão cadastrada', 6000), row('august-sheet', '2025-08-12', 'Compra cartão cadastrada', 4000)]
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha UX', transactions: sheetRows, rowCount: sheetRows.length })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha UX', lastUpdated: null, autoConnect: true })
+    vi.mocked(readCardStatementPdf).mockResolvedValueOnce(clearStatement).mockResolvedValueOnce(issueStatement)
+    const { container } = render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo,Forma de pagamento,ID\n12/07/2025,GASTOS CARTAO DE CREDITO,"60,00",Débito,Débito,pay-july\n12/08/2025,GASTOS CARTAO DE CREDITO,"70,00",Débito,Débito,pay-august'], 'pagamentos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), [new File(['july pdf'], 'fatura-julho.pdf', { type: 'application/pdf' }), new File(['august pdf'], 'fatura-agosto.pdf', { type: 'application/pdf' })])
+    await waitFor(() => expect(screen.getAllByText(/PDF lido · 2 páginas/)).toHaveLength(2))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    expect(container.querySelectorAll('.statement-results')).toHaveLength(2)
+    expect(screen.getByText(/LOJA AUSENTE/)).toBeInTheDocument()
+    expect(screen.queryByText(/SERVIÇO EXISTENTE/)).not.toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: 'Mostrar tudo' })[0]).toHaveAttribute('aria-expanded', 'false')
+    await user.click(screen.getByRole('button', { name: 'Só pendências' }))
+    expect(container.querySelectorAll('.statement-results')).toHaveLength(1)
+    await user.click(screen.getByRole('button', { name: 'Todas' }))
+    const issueInvoice = [...container.querySelectorAll<HTMLElement>('.statement-results')].find((card) => card.textContent?.includes('LOJA AUSENTE'))!
+    await user.click(within(issueInvoice).getByRole('button', { name: 'Mostrar conciliadas' }))
+    expect(screen.getByText(/SERVIÇO EXISTENTE/)).toBeInTheDocument()
+    await user.click(within(issueInvoice).getByRole('button', { name: 'Recolher' }))
+    expect(screen.queryByText(/SERVIÇO EXISTENTE/)).not.toBeInTheDocument()
+    expect(savedDecisionStore.size).toBe(0)
   })
 
   it('remove confirmação MISSING_ADDED_TO_SHEET órfã quando a linha já não existe na CUSTOS ANO', async () => {
@@ -617,6 +678,7 @@ describe('fluxo completo no navegador', () => {
     await screen.findByText('julho.pdf')
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    await user.click(screen.getByRole('button', { name: 'Mostrar ignorados' }))
     expect(screen.getAllByText('COMPRA IGNORADA')).toHaveLength(1)
     expect([...savedDecisionStore.values()][0].kind).toBe('CARD_PURCHASE_IGNORED')
     expect([...savedDecisionStore.values()][0].identities[0]).toBe(savedIdentity)

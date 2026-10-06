@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { BankTransaction, CardStatement, LedgerTransaction } from '../domain/types'
-import { findExistingCostYearCandidates, identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
+import { deriveCardPurchaseStatus, findExistingCostYearCandidates, identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
 import { findDuplicateGroups, reconcile } from '../matching/reconcile'
 
 const syntheticPages = [
@@ -390,7 +390,7 @@ describe('PDF de fatura do cartão', () => {
     statement.transactions[0].installment = null
     statement.transactions[0].totalInstallments = null
     expect(reconcileCardStatement(statement, [ledger('same-day', '2026-05-12', 'ASAAS OFICINA CR', 9450)]).matches[0].status).toBe('CARD_MATCHED')
-    expect(reconcileCardStatement(statement, [ledger('old-date', '2026-02-12', 'ASAAS OFICINA CR', 9450)]).matches[0].status).toBe('CARD_MISSING')
+    expect(reconcileCardStatement(statement, [ledger('old-date', '2026-02-12', 'ASAAS OFICINA CR', 9450)]).matches[0].status).toBe('CARD_REVIEW')
   })
 
   it('aceita candidato único por valor, vencimento e Crédito_Bradesco mesmo com descrição humana diferente (PETZ)', () => {
@@ -412,6 +412,50 @@ describe('PDF de fatura do cartão', () => {
     expect(reconcileCardStatement(statement, [kindle]).matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: kindle })
   })
 
+  it('mantém EDZIA PIRES COBDE como candidata à parcela 1/4 apesar da descrição humana diferente', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-06-12'
+    statement.transactions = [{ ...statement.transactions[0], id: 'edzia-pdf', date: '2026-05-27', purchaseDate: '2026-05-27', invoiceDueDate: '2026-06-12', statementDueDate: '2026-06-12', originalDescription: 'EDZIA PIRES COBDE', description: 'EDZIA PIRES COBDE', amount: 25599, installment: 1, totalInstallments: 4 }]
+    const row = { ...ledger('edzia-sheet', '2026-06-12', '(1/4) Consulta Buba Airton', 25599), installment: 1, totalInstallments: 4 }
+    const result = reconcileCardStatement(statement, [row])
+    expect(findExistingCostYearCandidates(statement, statement.transactions[0], [row])).toEqual([row])
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: row })
+  })
+
+  it('usa sequência mensal completa 1/4 a 4/4 como evidência para uma descrição genérica', () => {
+    const statement = installmentStatement('2025-10-30', 'EDZIA PIRES COBDE', 1, 4)
+    statement.dueDate = '2026-02-12'
+    statement.transactions[0].invoiceDueDate = '2026-02-12'
+    statement.transactions[0].statementDueDate = '2026-02-12'
+    statement.transactions[0].amount = 25599
+    const sequence = [1, 2, 3, 4].map((installment, index) => ({ ...ledger(`edzia-${installment}`, ['2025-11-12', '2025-12-12', '2026-01-12', '2026-02-12'][index], `(${installment}/4) Consulta Buba Airton`, 25599), installment, totalInstallments: 4 }))
+    const result = reconcileCardStatement(statement, sequence)
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: { id: 'edzia-1' } })
+    expect(result.matches[0].evidence).toContain('Sequência de parcelas encontrada')
+  })
+
+  it('mantém EDZIA PIRES COBDE como candidata à parcela 1/4 apesar da descrição humana diferente', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-06-12'
+    statement.transactions = [{ ...statement.transactions[0], id: 'edzia-pdf', date: '2026-05-27', purchaseDate: '2026-05-27', invoiceDueDate: '2026-06-12', statementDueDate: '2026-06-12', originalDescription: 'EDZIA PIRES COBDE', description: 'EDZIA PIRES COBDE', amount: 25599, installment: 1, totalInstallments: 4 }]
+    const row = { ...ledger('edzia-sheet', '2026-06-12', '(1/4) Consulta Buba Airton', 25599), installment: 1, totalInstallments: 4 }
+    const result = reconcileCardStatement(statement, [row])
+    expect(findExistingCostYearCandidates(statement, statement.transactions[0], [row])).toEqual([row])
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: row })
+  })
+
+  it('usa sequência mensal completa 1/4 a 4/4 como evidência para uma descrição genérica', () => {
+    const statement = installmentStatement('2025-10-30', 'EDZIA PIRES COBDE', 1, 4)
+    statement.dueDate = '2026-02-12'
+    statement.transactions[0].invoiceDueDate = '2026-02-12'
+    statement.transactions[0].statementDueDate = '2026-02-12'
+    statement.transactions[0].amount = 25599
+    const sequence = [1, 2, 3, 4].map((installment, index) => ({ ...ledger(`edzia-${installment}`, ['2025-11-12', '2025-12-12', '2026-01-12', '2026-02-12'][index], `(${installment}/4) Consulta Buba Airton`, 25599), installment, totalInstallments: 4 }))
+    const result = reconcileCardStatement(statement, sequence)
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: { id: 'edzia-1' } })
+    expect(result.matches[0].evidence).toContain('Sequência de parcelas encontrada')
+  })
+
   it('mantém múltiplas linhas no conjunto plausível e exige revisão quando o valor e vencimento são ambíguos', () => {
     const statement = parseCardStatementPages(syntheticPages)
     statement.dueDate = '2026-05-12'
@@ -430,6 +474,17 @@ describe('PDF de fatura do cartão', () => {
     expect(result.matches.every((match) => match.status === 'CARD_REVIEW')).toBe(true)
     expect(result.matches.flatMap((match) => match.candidates).every((candidate) => candidate.id === row.id)).toBe(true)
     expect(result.matches.some((match) => match.status === 'CARD_MATCHED')).toBe(false)
+  })
+
+  it('converte em REVIEW um candidato já consumido por outra fatura, sem produzir falso MISSING', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-05-12'
+    statement.transactions = [{ ...statement.transactions[0], id: 'cross-invoice', date: '2026-04-27', purchaseDate: '2026-04-27', invoiceDueDate: '2026-05-12', amount: 28950, installment: null, totalInstallments: null }]
+    const row = ledger('shared-due-line', '2026-05-12', 'Registro humano', 28950)
+    const initiallyMatched = reconcileCardStatement(statement, [row]).matches[0]
+    const afterGlobalAssignment = deriveCardPurchaseStatus(initiallyMatched, { consumedSheetIds: new Set([row.id]) })
+    expect(afterGlobalAssignment).toMatchObject({ status: 'CARD_REVIEW', sheet: null, candidates: [row] })
+    expect(afterGlobalAssignment.status).not.toBe('CARD_MISSING')
   })
 
   it('permite resolver candidatos da compra e concilia o pagamento agregado 1:N sem criar outra despesa', () => {

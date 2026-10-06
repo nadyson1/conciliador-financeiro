@@ -323,13 +323,15 @@ function installmentDescriptionSimilarity(left: string, right: string): number {
 
 function hasInstallmentSequence(candidate: LedgerTransaction, rows: LedgerTransaction[]): boolean {
   const current = installmentInfo(candidate)
-  if (!current || current.installment <= 1) return false
+  if (!current) return false
+  const currentMonth = Number(candidate.date.slice(0, 4)) * 12 + Number(candidate.date.slice(5, 7))
   return rows.some((previous) => {
     if (previous.id === candidate.id || previous.amount !== candidate.amount || previous.type !== 'EXPENSE'
       || normalizeDescription(previous.paymentMethod) !== 'credito bradesco') return false
     const info = installmentInfo(previous)
-    return Boolean(info && info.installment === current.installment - 1 && info.total === current.total
-      && previous.date < candidate.date
+    const month = Number(previous.date.slice(0, 4)) * 12 + Number(previous.date.slice(5, 7))
+    return Boolean(info && Math.abs(info.installment - current.installment) === 1 && info.total === current.total
+      && Math.abs(month - currentMonth) === 1
       && installmentDescriptionSimilarity(current.description, info.description) >= 0.45)
   })
 }
@@ -350,15 +352,17 @@ export function findExistingCostYearCandidates(statement: CardStatement, transac
   const installmentCandidate = (item: LedgerTransaction) => {
     if (!isInstallment || item.amount !== transaction.amount) return false
     const info = installmentInfo(item)
-    return Boolean(info && info.installment === transaction.installment && info.total === transaction.totalInstallments
-      && installmentDescriptionSimilarity(transaction.originalDescription, info.description) >= 0.35)
+    if (!info || info.installment !== transaction.installment || info.total !== transaction.totalInstallments) return false
+    const dueDateMatch = Boolean(invoiceDueDate && item.date === invoiceDueDate)
+    const descriptionMatch = installmentDescriptionSimilarity(transaction.originalDescription, info.description) >= 0.35
+    const sequenceMatch = hasInstallmentSequence(item, eligible)
+    return dueDateMatch || descriptionMatch || sequenceMatch
   }
   const nonInstallmentCandidate = (item: LedgerTransaction) => {
     if (isInstallment || item.amount !== transaction.amount) return false
     if (invoiceDueDate && item.date === invoiceDueDate) return true
-    if (dayDistance(item.date, purchaseDate) > 7) return false
     const similarity = descriptionSimilarity(transaction.originalDescription, item.originalDescription)
-    return similarity >= 0.35
+    return similarity >= 0.35 && (dayDistance(item.date, purchaseDate) <= 7 || similarity >= 0.72)
   }
   return eligible.filter(isInstallment ? installmentCandidate : nonInstallmentCandidate).sort((a, b) => isInstallment
     ? installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(b)?.description ?? b.originalDescription) - installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(a)?.description ?? a.originalDescription)
@@ -428,7 +432,7 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
       'Valor exato',
       'Crédito_Bradesco',
       ...(descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35 ? ['Descrição compatível'] : []),
-      ...(sorted[0].date === invoiceDueDate(transaction) ? ['Data da planilha igual ao vencimento da fatura'] : ['Data próxima à compra (registro histórico)']),
+      ...(sorted[0].date === invoiceDueDate(transaction) ? ['Data da planilha igual ao vencimento da fatura'] : dayDistance(sorted[0].date, purchaseDate(transaction)) <= 7 ? ['Data próxima à compra (registro histórico)'] : ['Descrição e valor indicam linha editada; data requer revisão']),
       ...(sorted.length === 1 && sorted[0].date === invoiceDueDate(transaction) ? ['Candidato único por valor, vencimento e Crédito_Bradesco'] : []),
     ] : undefined
     if (group) return { transaction, status: 'CARD_GROUP_MATCHED', sheet: null, candidates: group, evidence: ['Valor exato', 'Crédito_Bradesco', 'Vencimento da fatura', 'Grupo conciliado pela mesma quantidade de lançamentos'] }
@@ -447,4 +451,18 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
   const matchedSheetTotal = eligible.filter((item) => matchedSheetIds.has(item.id)).reduce((sum, item) => sum + item.amount, 0)
   const statementTotal = purchases.reduce((sum, transaction) => sum + transaction.amount, 0)
   return { matches, eligibleSheetTotal: matchedSheetTotal, statementTotal, difference: statementTotal - matchedSheetTotal }
+}
+
+/** Apply persisted ignore/global-consumption state after candidate assignment. */
+export function deriveCardPurchaseStatus(match: CardStatementMatch, options: { ignored?: boolean; consumedSheetIds?: ReadonlySet<string> } = {}): CardStatementMatch {
+  if (options.ignored && match.status === 'CARD_MISSING') return { ...match, status: 'CARD_IGNORED', sheet: null, candidates: [] }
+  const used = options.consumedSheetIds
+  if (!used?.size) return match
+  if (match.status === 'CARD_MATCHED' && match.sheet && used.has(match.sheet.id)) {
+    return { ...match, status: 'CARD_REVIEW', sheet: null, candidates: [match.sheet], evidence: [...(match.evidence ?? []), 'Candidato já atribuído a outra compra; requer revisão'] }
+  }
+  if (match.status === 'CARD_GROUP_MATCHED' && match.candidates.some((row) => used.has(row.id))) {
+    return { ...match, status: 'CARD_REVIEW', sheet: null, candidates: match.candidates, evidence: [...(match.evidence ?? []), 'Parte do grupo já foi atribuída a outra compra; requer revisão'] }
+  }
+  return match
 }
