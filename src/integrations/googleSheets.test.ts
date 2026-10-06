@@ -113,45 +113,54 @@ describe('leitura da aba financeira via Google Sheets', () => {
     expect(generateCostYearId([], (buffer) => { buffer.set([1, 2, 3, 4]); return buffer })).toMatch(/^[0-9a-f]{8}$/)
   })
 
-  it('faz append na próxima linha lógica, ignora checkboxes futuros e não escreve Mês/Ano', async () => {
-    const futureDefaults = Array.from({ length: 250 }, () => ['', '', '', '', '', '', '', '', 'FALSE', 'FALSE'])
-    let currentValues = [headers, values[1], ...futureDefaults] as unknown[][]
-    let appendedUrl = ''
-    let appendedBody: { values: unknown[][] } | null = null
+  it('grava na próxima linha lógica (392), ignora FALSE até a 791 e confirma sem escrever Mês/Ano', async () => {
+    const checkboxDefaults = ['', '', '', '', '', '', '', '', 'FALSE', 'FALSE']
+    const lastExpense = ['2026', 'Último lançamento', 'last-row-id', '31/12/2026', '30,00', '12 - Dezembro', 'Casa', 'Pix', 'FALSE', 'FALSE']
+    // Linhas 2–390 estão preparadas; o último lançamento está na 391 e as linhas 392–791 têm defaults.
+    let currentValues = [headers, ...Array.from({ length: 389 }, () => [...checkboxDefaults]), lastExpense, ...Array.from({ length: 400 }, () => [...checkboxDefaults])] as unknown[][]
+    let batchUrl = ''
+    let batchBody: { valueInputOption: string; data: { range: string; values: unknown[][] }[] } | undefined
+    const columnIndex = (letters: string) => [...letters].reduce((total, letter) => total * 26 + letter.charCodeAt(0) - 64, 0) - 1
     const fetcherMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url.includes(':append')) {
-        appendedUrl = decodeURIComponent(url)
-        appendedBody = JSON.parse(String(init?.body)) as { values: unknown[][] }
-        const row = [...appendedBody.values[0]]
-        row[0] = ''
-        row[1] = 'Conta de telefone'
-        row[2] = String(row[2])
-        row[3] = ''
-        row[3] = '06/01/2026'
-        row[4] = '45,00'
-        row[5] = ''
-        row[6] = 'Casa'
-        row[7] = 'Débito automático'
-        row[8] = 'FALSE'
-        row[9] = 'FALSE'
-        currentValues.splice(2, 0, row)
-        return response({ updates: { updatedRange: "'CUSTOS ANO'!A3:J3" } })
+      if (url.includes('values:batchUpdate')) {
+        batchUrl = url
+        batchBody = JSON.parse(String(init?.body)) as typeof batchBody
+        for (const entry of batchBody!.data) {
+          const match = entry.range.match(/!([A-Z]+)(\d+):([A-Z]+)\d+$/)!
+          const rowNumber = Number(match[2])
+          const start = columnIndex(match[1])
+          const row = currentValues[rowNumber - 1] ?? Array(10).fill('')
+          entry.values[0].forEach((value, index) => { row[start + index] = value })
+          currentValues[rowNumber - 1] = row
+        }
+        const row = currentValues[391]
+        row[0] = '2026' // valores derivados calculados pela planilha
+        row[5] = '01 - Janeiro'
+        return response({ totalUpdatedCells: 8 })
       }
-      if (url.includes('/values/')) return response({ values: currentValues })
+      if (url.includes('/values/')) {
+        const range = decodeURIComponent(url).match(/'CUSTOS ANO'!A(\d+):ZZ\d+/)
+        if (range) return response({ values: [currentValues[Number(range[1]) - 1] ?? []] })
+        return response({ values: currentValues })
+      }
       return response({ properties: { title: 'Finanças' }, sheets: [{ properties: { sheetId: 1, title: 'CUSTOS ANO' } }] })
     })
     const fetcher = fetcherMock as unknown as typeof fetch
     const result = await appendCostYearRecord('abcdefghijklmnop', 'token', { description: 'Conta de telefone', date: '2026-01-06', category: 'Casa', amount: 4500, paymentMethod: 'Débito automático', isFixed: false, isEssential: false }, fetcher, { randomBytes: (buffer) => { buffer.set([0x12, 0x34, 0x56, 0x78]); return buffer } })
-    expect(result).toMatchObject({ rowCount: 2, alreadyPresent: false, transaction: { sheetRecordId: '12345678' } })
-    expect(appendedUrl).toContain("'CUSTOS ANO'!A:H:append")
-    expect(appendedBody!.values[0]).toHaveLength(10)
-    expect(appendedBody!.values[0][5]).toBeNull()
-    expect(appendedBody!.values[0][0]).toBeNull()
-    expect(appendedBody!.values[0][8]).toBe(false)
-    expect(appendedBody!.values[0][8]).toBe(false)
-    expect(fetcherMock.mock.calls.filter(([url]) => String(url).includes(':append'))).toHaveLength(1)
-    expect(fetcherMock.mock.calls.every(([url, init]) => !String(url).includes(':batchClear') && init?.method !== 'DELETE' && !(String(url).includes('/values/') && init?.method === 'PUT'))).toBe(true)
+    expect(result).toMatchObject({ rowCount: 2, alreadyPresent: false, transaction: { sheetRecordId: '12345678', date: '2026-01-06', description: 'Conta de telefone' } })
+    expect(decodeURIComponent(batchUrl)).toContain('/values:batchUpdate')
+    expect(batchUrl).not.toContain(':append')
+    expect(batchBody?.valueInputOption).toBe('USER_ENTERED')
+    expect(batchBody?.data.map((entry) => decodeURIComponent(entry.range))).toEqual([
+      "'CUSTOS ANO'!B392:E392", "'CUSTOS ANO'!G392:J392",
+    ])
+    expect(batchBody?.data.some(({ range }) => /!A392|!F392/.test(decodeURIComponent(range)))).toBe(false)
+    expect(currentValues[390]).toEqual(lastExpense)
+    expect(currentValues[391][1]).toBe('Conta de telefone')
+    expect(currentValues[391][5]).toBe('01 - Janeiro')
+    expect(currentValues[391][0]).toBe('2026')
+    expect(fetcherMock.mock.calls.some(([url]) => String(url).includes(':append'))).toBe(false)
   })
 
   it('não duplica uma linha financeira já existente', async () => {
@@ -162,6 +171,74 @@ describe('leitura da aba financeira via Google Sheets', () => {
     expect(result.alreadyPresent).toBe(true)
     expect(fetcher).toHaveBeenCalledTimes(2)
     expect(fetcher.mock.calls.some(([url]) => String(url).includes(':append'))).toBe(false)
+  })
+
+  it('recalcula a linha quando outra alteração ocupa o destino antes da gravação', async () => {
+    const blank = ['', '', '', '', '', '', '', '', 'FALSE', 'FALSE']
+    let currentValues: unknown[][] = [headers, values[1], blank]
+    let firstCandidateRead = true
+    let writtenRanges: string[] = []
+    const columnIndex = (letters: string) => [...letters].reduce((total, letter) => total * 26 + letter.charCodeAt(0) - 64, 0) - 1
+    const fetcherMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('values:batchUpdate')) {
+        const body = JSON.parse(String(init?.body)) as { data: { range: string; values: unknown[][] }[] }
+        writtenRanges = body.data.map(({ range }) => decodeURIComponent(range))
+        for (const entry of body.data) {
+          const match = decodeURIComponent(entry.range).match(/!([A-Z]+)(\d+):([A-Z]+)\d+$/)!
+          const rowNumber = Number(match[2])
+          const start = columnIndex(match[1])
+          const row = currentValues[rowNumber - 1] ?? Array(10).fill('')
+          entry.values[0].forEach((value, index) => { row[start + index] = value })
+          currentValues[rowNumber - 1] = row
+        }
+        const newRow = currentValues[3]
+        newRow[0] = '2026'
+        newRow[5] = '01 - Janeiro'
+        return response({ totalUpdatedCells: 8 })
+      }
+      if (url.includes('/values/')) {
+        const rowNumber = decodeURIComponent(url).match(/'CUSTOS ANO'!A(\d+):ZZ\d+/)?.[1]
+        if (rowNumber) {
+          if (Number(rowNumber) === 3 && firstCandidateRead) {
+            firstCandidateRead = false
+            currentValues[2] = ['2026', 'Lançamento concorrente', 'concurrent-id', '05/01/2026', '20,00', '01 - Janeiro', 'Casa', 'Pix', 'FALSE', 'FALSE']
+          }
+          return response({ values: [currentValues[Number(rowNumber) - 1] ?? []] })
+        }
+        return response({ values: currentValues })
+      }
+      return response({ properties: { title: 'Finanças' }, sheets: [{ properties: { title: 'CUSTOS ANO' } }] })
+    })
+    const result = await appendCostYearRecord('abcdefghijklmnop', 'token', { description: 'Conta de telefone', date: '2026-01-06', category: 'Casa', amount: 4500, paymentMethod: 'Débito automático', isFixed: false, isEssential: false }, fetcherMock as unknown as typeof fetch, { randomBytes: (buffer) => { buffer.set([0x12, 0x34, 0x56, 0x78]); return buffer } })
+    expect(writtenRanges.every((range) => /4/.test(range))).toBe(true)
+    expect(currentValues[2][1]).toBe('Lançamento concorrente')
+    expect(currentValues[3][1]).toBe('Conta de telefone')
+    expect(result).toMatchObject({ rowCount: 3, transaction: { sheetRecordId: '12345678' } })
+  })
+
+  it('não aceita gravação parcial sem confirmar todos os campos e o ID', async () => {
+    const blank = ['', '', '', '', '', '', '', '', 'FALSE', 'FALSE']
+    const currentValues: unknown[][] = [headers, values[1], blank]
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('values:batchUpdate')) {
+        // Simula API que confirma a requisição, mas só deixa uma parte da linha visível.
+        currentValues[2][1] = 'Conta parcial'
+        void init
+        return response({ totalUpdatedCells: 1 })
+      }
+      if (url.includes('/values/')) {
+        const rowNumber = decodeURIComponent(url).match(/'CUSTOS ANO'!A(\d+):ZZ\d+/)?.[1]
+        return response({ values: rowNumber ? [currentValues[Number(rowNumber) - 1] ?? []] : currentValues })
+      }
+      return response({ properties: { title: 'Finanças' }, sheets: [{ properties: { title: 'CUSTOS ANO' } }] })
+    })
+    await expect(appendCostYearRecord('abcdefghijklmnop', 'token', { description: 'Conta de telefone', date: '2026-01-06', category: 'Casa', amount: 4500, paymentMethod: 'Débito automático', isFixed: false, isEssential: false }, fetcher, { randomBytes: (buffer) => { buffer.set([0x12, 0x34, 0x56, 0x78]); return buffer } }))
+      .rejects.toMatchObject({ code: 'AMBIGUOUS' })
+    expect(fetcher.mock.calls.filter(([url]) => String(url).includes('values:batchUpdate'))).toHaveLength(1)
+    expect(currentValues[2][1]).toBe('Conta parcial')
+    expect(currentValues[2][2]).toBe('')
   })
 
   it('não grava categoria não verificada quando ainda não há opções de categoria carregadas', async () => {
@@ -179,16 +256,23 @@ describe('leitura da aba financeira via Google Sheets', () => {
     expect(fetcherMock.mock.calls.some(([url]) => String(url).includes(':append'))).toBe(false)
   })
 
-  it('releitura após resposta ambígua não repete o append', async () => {
-    const fetcher = vi.fn()
-      .mockResolvedValueOnce(response({ properties: { title: 'Finanças' }, sheets: [{ properties: { title: 'CUSTOS ANO' } }] }))
-      .mockResolvedValueOnce(response({ values }))
-      .mockRejectedValueOnce(new TypeError('network lost'))
-      .mockResolvedValueOnce(response({ properties: { title: 'Finanças' }, sheets: [{ properties: { title: 'CUSTOS ANO' } }] }))
-      .mockResolvedValueOnce(response({ values }))
+  it('não repete a gravação após resposta ambígua quando a releitura não confirma a linha', async () => {
+    const blank = ['', '', '', '', '', '', '', '', 'FALSE', 'FALSE']
+    const currentValues: unknown[][] = [headers, values[1], blank]
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('values:batchUpdate')) throw new TypeError('network lost')
+      if (url.includes('/values/')) {
+        const rowNumber = decodeURIComponent(url).match(/'CUSTOS ANO'!A(\d+):ZZ\d+/)?.[1]
+        return response({ values: rowNumber ? [currentValues[Number(rowNumber) - 1] ?? []] : currentValues })
+      }
+      void init
+      return response({ properties: { title: 'Finanças' }, sheets: [{ properties: { title: 'CUSTOS ANO' } }] })
+    })
     await expect(appendCostYearRecord('abcdefghijklmnop', 'token', { description: 'Novo item', date: '2026-01-06', category: 'Casa', amount: 1000, paymentMethod: 'Pix', isFixed: false, isEssential: false }, fetcher, { randomBytes: (buffer) => { buffer.set([0, 0, 0, 1]); return buffer } }))
       .rejects.toMatchObject({ code: 'AMBIGUOUS' })
-    expect(fetcher.mock.calls.filter(([url]) => String(url).includes(':append'))).toHaveLength(1)
+    expect(fetcher.mock.calls.filter(([url]) => String(url).includes('values:batchUpdate'))).toHaveLength(1)
+    expect(fetcher.mock.calls.some(([url]) => String(url).includes(':append'))).toBe(false)
   })
 
   it.each([[401, 'AUTH'], [403, 'ACCESS'], [404, 'NOT_FOUND']] as const)('classifica resposta HTTP %s', async (status, code) => {

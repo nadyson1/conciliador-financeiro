@@ -106,6 +106,7 @@ describe('fluxo completo no navegador', () => {
     googleSheetsMocks.append.mockImplementationOnce(() => new Promise((resolve) => { resolveAppend = resolve }))
     await user.dblClick(within(dialog).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
     expect(appendCostYearRecord).toHaveBeenCalledOnce()
+    expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'MISSING_ADDED_TO_SHEET' && decision.selected[0] === 'abcd1234')).toBe(false)
     resolveAppend(appendResult)
     expect(await screen.findByText('Lançamento adicionado à CUSTOS ANO e confirmado na conciliação.')).toBeInTheDocument()
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()

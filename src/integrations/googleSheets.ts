@@ -1,7 +1,7 @@
 import type { LedgerTransaction } from '../domain/types'
 import { initialColumnMap, normalizeHeader } from '../importers/csv'
 import { parseLedgerRows } from '../importers/transactions'
-import { normalizeDate } from '../importers/normalize'
+import { normalizeAmount, normalizeDate, parseBoolean } from '../importers/normalize'
 import { COST_YEAR_PAYMENT_METHODS } from '../features/costYearRecord'
 
 export const GOOGLE_SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets'
@@ -168,6 +168,86 @@ function matchesCostRecord(transaction: LedgerTransaction, input: CostYearRecord
     && normalizeHeader(transaction.paymentMethod) === normalizeHeader(input.paymentMethod)
 }
 
+type CostYearHeaderIndexes = Record<(typeof REQUIRED_SHEET_COLUMNS)[number], number>
+
+function checkboxIsFalse(value: unknown) {
+  if (value === false) return true
+  return ['false', 'nao', '0'].includes(normalizeHeader(String(value ?? '')))
+}
+
+function hasLogicalRecordEvidence(row: unknown[], indexes: CostYearHeaderIndexes) {
+  const main = [indexes.description, indexes.date, indexes.amount, indexes.category, indexes.paymentMethod, indexes.id]
+  return main.some((index) => String(row[index] ?? '').trim() !== '')
+    || [indexes.isFixed, indexes.isEssential].some((index) => row[index] != null && !checkboxIsFalse(row[index]) && String(row[index]).trim() !== '')
+}
+
+function hasAnyWriteConflictEvidence(row: unknown[], indexes: CostYearHeaderIndexes) {
+  return row.some((value, index) => {
+    if (index === indexes.month || index === indexes.year) return false
+    if ((index === indexes.isFixed || index === indexes.isEssential) && checkboxIsFalse(value)) return false
+    return String(value ?? '').trim() !== ''
+  })
+}
+
+function logicalNextRow(values: unknown[][], indexes: CostYearHeaderIndexes) {
+  let next = 2
+  values.slice(1).forEach((row, index) => { if (hasLogicalRecordEvidence(row, indexes)) next = index + 3 })
+  return next
+}
+
+function nextSafeWriteRow(values: unknown[][], indexes: CostYearHeaderIndexes) {
+  const first = logicalNextRow(values, indexes)
+  // Search past occupied/non-record cells without touching them; validation-only FALSE and formula blanks remain safe.
+  for (let rowNumber = first; rowNumber <= Math.max(values.length + 1, first + 1); rowNumber += 1) {
+    if (!hasAnyWriteConflictEvidence(values[rowNumber - 1] ?? [], indexes)) return rowNumber
+  }
+  return Math.max(values.length + 1, first)
+}
+
+function writeRanges(rowNumber: number, indexes: CostYearHeaderIndexes, input: CostYearRecordInput, id: string) {
+  const cells = new Map<number, unknown>([
+    [indexes.description, input.description.trim()],
+    [indexes.date, (() => { const [year, month, day] = input.date.split('-'); return `${day}/${month}/${year}` })()],
+    [indexes.category, input.category.trim()],
+    [indexes.amount, input.amount / 100],
+    [indexes.paymentMethod, input.paymentMethod.trim()],
+    [indexes.isFixed, input.isFixed],
+    [indexes.isEssential, input.isEssential],
+    [indexes.id, id],
+  ])
+  const sorted = [...cells.entries()].sort(([a], [b]) => a - b)
+  const groups: { start: number; end: number; values: unknown[] }[] = []
+  for (const [column, value] of sorted) {
+    const current = groups.at(-1)
+    if (current && column === current.end + 1) { current.end = column; current.values.push(value) }
+    else groups.push({ start: column, end: column, values: [value] })
+  }
+  return groups.map((group) => ({ range: `'${SHEET_NAME}'!${columnLetter(group.start)}${rowNumber}:${columnLetter(group.end)}${rowNumber}`, values: [group.values] }))
+}
+
+function expectedMonth(date: string) {
+  const names = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro']
+  const month = Number(date.slice(5, 7))
+  return `${String(month).padStart(2, '0')} - ${names[month - 1]}`
+}
+
+function verifyWrittenCostYearRow(row: unknown[], indexes: CostYearHeaderIndexes, input: CostYearRecordInput, id: string) {
+  const actualDate = normalizeDate(String(row[indexes.date] ?? ''))
+  const actualAmount = normalizeAmount(String(row[indexes.amount] ?? ''))
+  const fixed = parseBoolean(String(row[indexes.isFixed] ?? ''))
+  const essential = parseBoolean(String(row[indexes.isEssential] ?? ''))
+  const valid = String(row[indexes.description] ?? '').trim() === input.description.trim()
+    && actualDate === input.date
+    && String(row[indexes.category] ?? '').trim() === input.category.trim()
+    && actualAmount === input.amount
+    && normalizeHeader(String(row[indexes.paymentMethod] ?? '')) === normalizeHeader(input.paymentMethod)
+    && fixed === input.isFixed && essential === input.isEssential
+    && String(row[indexes.id] ?? '').trim() === id
+    && normalizeHeader(String(row[indexes.month] ?? '')) === normalizeHeader(expectedMonth(input.date))
+    && String(row[indexes.year] ?? '').trim() === input.date.slice(0, 4)
+  if (!valid) throw new GoogleSheetsError('A gravação foi enviada, mas a releitura da linha não confirmou todos os campos ou as fórmulas de Mês/Ano. Atualize CUSTOS ANO antes de tentar novamente.', 'AMBIGUOUS')
+}
+
 export function generateCostYearId(existingIds: Iterable<string>, randomBytes?: (buffer: Uint8Array) => Uint8Array) {
   const secureRandom = randomBytes ?? ((buffer: Uint8Array) => {
     if (!globalThis.crypto?.getRandomValues) throw new GoogleSheetsError('Este navegador não oferece geração segura de ID. Nenhuma linha foi adicionada.', 'CONFIG')
@@ -192,82 +272,89 @@ async function getSheetValues(spreadsheetId: string, token: string, fetcher: typ
   return { base, metadata, values: (response.values as unknown[][] | undefined) ?? [] }
 }
 
-/** Adds exactly one confirmed expense after locating the header row and checking existing records/IDs. */
+/** Adds exactly one confirmed expense into an explicitly selected free row; never delegates row choice to values.append. */
 export async function appendCostYearRecord(spreadsheetIdInput: string, accessToken: string, input: CostYearRecordInput, fetcher: typeof fetch = fetch, options: { randomBytes?: (buffer: Uint8Array) => Uint8Array } = {}): Promise<CostYearAppendResult> {
   const spreadsheetId = extractSpreadsheetId(spreadsheetIdInput)
   if (!input.description.trim() || normalizeDate(input.date) !== input.date || !Number.isInteger(input.amount) || input.amount <= 0 || !input.category.trim() || !COST_YEAR_PAYMENT_METHODS.some((method) => method === input.paymentMethod) || typeof input.isFixed !== 'boolean' || typeof input.isEssential !== 'boolean') {
     throw new GoogleSheetsError('Revise descrição, data, categoria, custo, forma de pagamento e opções de fixo/essencial antes de adicionar.', 'INTEGRITY')
   }
-  const snapshot = await getSheetValues(spreadsheetId, accessToken, fetcher)
+  let snapshot = await getSheetValues(spreadsheetId, accessToken, fetcher)
   if (!snapshot.values.length) throw new GoogleSheetsError('A CUSTOS ANO não possui cabeçalhos; nenhuma alteração foi feita.', 'HEADERS')
   const headers = snapshot.values[0].map((value) => String(value ?? '').trim())
   const indexes = costYearHeaderIndexes(headers)
-  const transactions = mapGoogleSheetValues(snapshot.values, { allowEmpty: true })
-  if (!transactions.some((transaction) => transaction.category === input.category.trim())) throw new GoogleSheetsError('A categoria escolhida não aparece entre as categorias já usadas em CUSTOS ANO. Nenhuma linha foi adicionada.', 'INTEGRITY')
-  const duplicates = transactions.filter((transaction) => matchesCostRecord(transaction, input))
-  if (duplicates.length > 1) throw new GoogleSheetsError('Já existem várias linhas iguais na CUSTOS ANO. Revise a planilha antes de adicionar outra.', 'DUPLICATE_RECORD')
-  if (duplicates.length === 1) return { spreadsheetId, spreadsheetTitle: (snapshot.metadata.properties as { title?: string } | undefined)?.title || 'Planilha Google', transactions, rowCount: transactions.length, transaction: duplicates[0], alreadyPresent: true }
+  let transactions: LedgerTransaction[] = []
+  let targetRow = 0
+  let title = 'Planilha Google'
 
-  let expectedAppendRow = 2
-  snapshot.values.slice(1).forEach((existingRow, index) => {
-    if ([indexes.description, indexes.date, indexes.amount, indexes.id].some((column) => String(existingRow[column] ?? '').trim())) expectedAppendRow = index + 3
-  })
+  // A competing AppSheet/manual write may occupy our candidate after the initial scan.
+  // Re-read the full ledger and recalculate, then re-read that exact row immediately before writing.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (!snapshot.values.length) throw new GoogleSheetsError('A CUSTOS ANO não possui cabeçalhos; nenhuma alteração foi feita.', 'HEADERS')
+    const currentHeaders = snapshot.values[0].map((value) => String(value ?? '').trim())
+    const currentIndexes = costYearHeaderIndexes(currentHeaders)
+    if (currentHeaders.some((value, index) => value !== headers[index])) throw new GoogleSheetsError('Os cabeçalhos de CUSTOS ANO mudaram durante a gravação. Atualize a planilha e tente novamente.', 'AMBIGUOUS')
+    transactions = mapGoogleSheetValues(snapshot.values, { allowEmpty: true })
+    if (!transactions.some((transaction) => transaction.category === input.category.trim())) throw new GoogleSheetsError('A categoria escolhida não aparece entre as categorias já usadas em CUSTOS ANO. Nenhuma linha foi adicionada.', 'INTEGRITY')
+    const duplicates = transactions.filter((transaction) => matchesCostRecord(transaction, input))
+    if (duplicates.length > 1) throw new GoogleSheetsError('Já existem várias linhas iguais na CUSTOS ANO. Revise a planilha antes de adicionar outra.', 'DUPLICATE_RECORD')
+    if (duplicates.length === 1) return { spreadsheetId, spreadsheetTitle: (snapshot.metadata.properties as { title?: string } | undefined)?.title || title, transactions, rowCount: transactions.length, transaction: duplicates[0], alreadyPresent: true }
 
-  const existingIds = transactions.map((transaction) => transaction.sheetRecordId)
-  const id = generateCostYearId(existingIds, options.randomBytes)
-  const booleanStart = Math.min(indexes.isFixed, indexes.isEssential)
-  const appendEnd = booleanStart - 1
-  const coreIndexes = [indexes.description, indexes.date, indexes.category, indexes.amount, indexes.paymentMethod]
-  if (appendEnd < 0 || coreIndexes.some((index) => index > appendEnd)) {
-    throw new GoogleSheetsError('A ordem das colunas não permite localizar uma área segura para append sem incluir checkboxes; nenhuma alteração foi feita.', 'HEADERS')
+    title = (snapshot.metadata.properties as { title?: string } | undefined)?.title || title
+    targetRow = nextSafeWriteRow(snapshot.values, currentIndexes)
+    const rowRange = encodeURIComponent(`'${SHEET_NAME}'!A${targetRow}:ZZ${targetRow}`)
+    const rowResult = await getJson(`${snapshot.base}/values/${rowRange}?valueRenderOption=FORMATTED_VALUE&majorDimension=ROWS`, accessToken, fetcher)
+    const currentRow = ((rowResult.values as unknown[][] | undefined) ?? [])[0] ?? []
+    if (!hasAnyWriteConflictEvidence(currentRow, currentIndexes)) break
+    if (attempt === 2) throw new GoogleSheetsError('A linha candidata mudou durante a gravação. Nenhum dado foi sobrescrito; atualize CUSTOS ANO e tente novamente.', 'AMBIGUOUS')
+    snapshot = await getSheetValues(spreadsheetId, accessToken, fetcher)
   }
-  const writeWidth = Math.max(...Object.values(indexes)) + 1
-  const row: unknown[] = Array(writeWidth).fill(null)
-  row[indexes.description] = input.description.trim()
-  const [year, month, day] = input.date.split('-')
-  row[indexes.date] = `${day}/${month}/${year}`
-  row[indexes.category] = input.category.trim()
-  row[indexes.amount] = input.amount / 100
-  row[indexes.paymentMethod] = input.paymentMethod.trim()
-  row[indexes.isFixed] = input.isFixed
-  row[indexes.isEssential] = input.isEssential
-  row[indexes.id] = id
-  // Mês/Ano and unknown auxiliary columns stay null so ARRAYFORMULA and other cells are untouched.
-  const searchRange = encodeURIComponent(`'${SHEET_NAME}'!A:${columnLetter(appendEnd)}`)
-  const appendUrl = `${snapshot.base}/values/${searchRange}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS&includeValuesInResponse=true`
+
+  const id = generateCostYearId(transactions.map((transaction) => transaction.sheetRecordId), options.randomBytes)
+  const data = writeRanges(targetRow, indexes, input, id)
+  const batchUrl = `${snapshot.base}/values:batchUpdate`
   let writeError: unknown
-  let reportedPositionMismatch = false
   try {
-    let response: Response
-    try { response = await fetcher(appendUrl, { method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ majorDimension: 'ROWS', values: [row] }) }) }
-    catch { throw new GoogleSheetsError('A conexão caiu durante o append; o resultado pode ser incerto. A planilha será relida antes de qualquer nova tentativa.', 'AMBIGUOUS') }
+    const response = await fetcher(batchUrl, { method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data }) })
     if (response.status === 401) throw new GoogleSheetsError('A autorização expirou. Reconecte o Google e verifique a CUSTOS ANO antes de tentar novamente.', 'AUTH')
     if (response.status === 403) throw new GoogleSheetsError('O Google recusou a escrita. Confirme que você tem permissão de edição na CUSTOS ANO.', 'ACCESS')
     if (!response.ok) throw new GoogleSheetsError(`O Google Sheets recusou a escrita (HTTP ${response.status}). Nenhuma nova tentativa automática será feita.`, 'API')
-    const appendResponse = await response.json() as { updates?: { updatedRange?: string } }
-    const appendedRow = appendResponse.updates?.updatedRange?.match(/!A\$?(\d+):/i)?.[1]
-    if (!appendedRow || Number(appendedRow) !== expectedAppendRow) {
-      reportedPositionMismatch = true
-      throw new GoogleSheetsError(`O Google informou append na linha ${appendedRow ?? 'desconhecida'}, mas a próxima posição lógica era ${expectedAppendRow}. A planilha foi relida; confira antes de tentar novamente.`, 'AMBIGUOUS')
-    }
-  } catch (error) { writeError = error }
+    await response.json()
+  } catch (error) {
+    writeError = error instanceof TypeError
+      ? new GoogleSheetsError('A conexão caiu durante a gravação. O resultado pode ser incerto; a linha será relida antes de informar o resultado.', 'AMBIGUOUS')
+      : error
+  }
 
-  // Always re-read after the request, including a network failure, to resolve ambiguous writes safely.
+  const exactRowRange = encodeURIComponent(`'${SHEET_NAME}'!A${targetRow}:ZZ${targetRow}`)
+  let writtenRow: unknown[]
+  try {
+    const rowResult = await getJson(`${snapshot.base}/values/${exactRowRange}?valueRenderOption=FORMATTED_VALUE&majorDimension=ROWS`, accessToken, fetcher)
+    writtenRow = ((rowResult.values as unknown[][] | undefined) ?? [])[0] ?? []
+  } catch {
+    if (writeError) throw writeError
+    throw new GoogleSheetsError('A gravação foi enviada, mas não foi possível reler a linha exata para confirmar os dados. Atualize CUSTOS ANO antes de tentar novamente.', 'AMBIGUOUS')
+  }
+  if (String(writtenRow[indexes.id] ?? '').trim() !== id) {
+    if (writeError) throw writeError
+    if (hasAnyWriteConflictEvidence(writtenRow, indexes)) throw new GoogleSheetsError('A linha foi ocupada por outra alteração antes da confirmação. Nenhum retry foi feito; atualize CUSTOS ANO para evitar duplicidade.', 'AMBIGUOUS')
+    throw new GoogleSheetsError('A gravação não foi confirmada na linha reservada. Nenhum retry automático foi feito.', 'AMBIGUOUS')
+  }
+  // One values.batchUpdate request carries all non-contiguous ranges; no blank/null is sent to Mês/Ano.
+  // Only report success after every field, generated ID, and derived month/year value is visible on readback.
+  verifyWrittenCostYearRow(writtenRow, indexes, input, id)
+  if (writeError) {
+    // A transport error is resolved only when the full row can be confirmed, as above.
+    writeError = undefined
+  }
+
   let updated: GoogleSheetReadResult
   try { updated = await readGoogleSheetLedger(spreadsheetId, accessToken, fetcher) }
-  catch (readError) {
-    if (writeError) throw writeError
-    throw new GoogleSheetsError('O append foi enviado, mas não foi possível confirmar o resultado relendo CUSTOS ANO. Não tente novamente até atualizar a planilha.', 'AMBIGUOUS')
+  catch {
+    throw new GoogleSheetsError('A linha foi gravada, mas não foi possível atualizar os dados da CUSTOS ANO. Atualize antes de tentar novamente; a linha confirmada não foi repetida.', 'AMBIGUOUS')
   }
   const written = updated.transactions.find((transaction) => transaction.sheetRecordId === id)
-  if (written) {
-    if (reportedPositionMismatch) throw writeError
-    return { ...updated, transaction: written, alreadyPresent: false }
-  }
-  const nowPresent = updated.transactions.filter((transaction) => matchesCostRecord(transaction, input))
-  if (nowPresent.length === 1) return { ...updated, transaction: nowPresent[0], alreadyPresent: true }
-  if (writeError) throw writeError
-  throw new GoogleSheetsError('O append não foi confirmado na releitura da CUSTOS ANO. Nenhum retry automático foi feito.', 'AMBIGUOUS')
+  if (!written) throw new GoogleSheetsError('A linha foi confirmada no endereço, mas não apareceu na releitura completa da CUSTOS ANO. Atualize antes de tentar novamente.', 'AMBIGUOUS')
+  return { ...updated, transaction: written, alreadyPresent: false }
 }
 
 async function getJson(url: string, accessToken: string, fetcher: typeof fetch): Promise<Record<string, unknown>> {
