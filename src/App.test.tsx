@@ -5,7 +5,7 @@ import type { CardStatement } from './domain/types'
 import { readCardStatementPdf } from './importers/cardStatement'
 import { appendCostYearRecord, GoogleSheetsError, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
-import { cardTransactionIdentity } from './domain/identity'
+import { stableFingerprint } from './domain/identity'
 import App from './App'
 
 const syntheticStatement: CardStatement = {
@@ -484,10 +484,14 @@ describe('fluxo completo no navegador', () => {
   it('invalida confirmação persistida de ausência quando a CUSTOS ANO atual contém a compra', async () => {
     const user = userEvent.setup()
     const statement: CardStatement = { ...structuredClone(syntheticStatement), statementIdentity: 'statement-kindle', dueDate: '2026-03-12', transactions: [{ ...syntheticStatement.transactions[0], id: 'kindle-card', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description: 'Amazon Kindle Unltd', originalDescription: 'Amazon Kindle Unltd', amount: 299 }] }
-    const identity = cardTransactionIdentity(statement, statement.transactions[0])
+    // Historical fingerprint from before the card identifier became part of the hash.
+    const item = statement.transactions[0]
+    const identity = `${statement.statementIdentity}:${stableFingerprint([item.date, item.originalDescription, item.amount, item.direction, item.installment, item.totalInstallments])}`
     const decision = { key: `CARD_MISSING_CONFIRMED:${JSON.stringify([identity])}`, schemaVersion: 1 as const, kind: 'CARD_MISSING_CONFIRMED', identities: [identity], selected: [], updatedAt: new Date().toISOString() }
     savedDecisionStore.set(decision.key, decision)
     const existing = { id: 'kindle-existing', source: 'SHEET' as const, sheetRecordId: 'kindle-existing', bankTransactionId: null, date: '2026-03-12', description: 'Assinatura Kindle unlimited (2 meses)', originalDescription: 'Assinatura Kindle unlimited (2 meses)', amount: 299, direction: 'DEBIT' as const, type: 'OTHER' as const, paymentMethod: 'Crédito_Bradesco', category: 'Assinaturas', month: '03 - Março', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const unrelatedBankDecision = { key: `MISSING_ADDED_TO_SHEET:${JSON.stringify([identity])}`, schemaVersion: 1 as const, kind: 'MISSING_ADDED_TO_SHEET', identities: [identity], selected: ['kindle-existing'], updatedAt: new Date().toISOString() }
+    savedDecisionStore.set(unrelatedBankDecision.key, unrelatedBankDecision)
     vi.mocked(readCardStatementPdf).mockResolvedValueOnce(statement)
     googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha atual', transactions: [existing], rowCount: 1 })
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha atual', lastUpdated: null, autoConnect: true })
@@ -496,6 +500,7 @@ describe('fluxo completo no navegador', () => {
     await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic'], 'kindle.pdf', { type: 'application/pdf' }))
     await screen.findByText(/PDF lido · 2 páginas/)
     await waitFor(() => expect(savedDecisionStore.has(decision.key)).toBe(false))
+    expect(savedDecisionStore.has(unrelatedBankDecision.key)).toBe(true)
     expect(decisionSyncMocks.tombstone).toHaveBeenCalledWith(decision)
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
@@ -599,7 +604,8 @@ describe('fluxo completo no navegador', () => {
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
     const missingRow = screen.getAllByText('COMPRA DE CARTÃO NÃO REGISTRADA')[0].closest('.statement-transaction') as HTMLElement
-    await user.click(within(missingRow).getByRole('button', { name: 'Confirmar ausência' }))
+    expect(within(missingRow).queryByRole('button', { name: /Confirmar ausência|Desfazer confirmação/ })).not.toBeInTheDocument()
+    await user.click(within(missingRow).getByRole('button', { name: 'Ignorar' }))
     await waitFor(() => expect(savedDecisionStore.size).toBe(1))
     const savedIdentity = [...savedDecisionStore.values()][0].identities[0]
 
@@ -611,7 +617,8 @@ describe('fluxo completo no navegador', () => {
     await screen.findByText('julho.pdf')
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
-    expect(screen.getAllByText('AUSÊNCIA CONFIRMADA')).toHaveLength(1)
+    expect(screen.getAllByText('COMPRA IGNORADA')).toHaveLength(1)
+    expect([...savedDecisionStore.values()][0].kind).toBe('CARD_PURCHASE_IGNORED')
     expect([...savedDecisionStore.values()][0].identities[0]).toBe(savedIdentity)
   })
 

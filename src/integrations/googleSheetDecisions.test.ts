@@ -90,6 +90,18 @@ describe('sincronização de decisões no Google Sheets', () => {
     expect(localStoreMocks.remove).toHaveBeenCalledWith(absence.key)
   })
 
+  it('aplica tombstone remoto depois de um registro local antigo e entrega somente decisões ativas após reload/sync', async () => {
+    const oldAbsence: PersistedDecision = { key: 'CARD_MISSING_CONFIRMED:["statement:legacy-kindle"]', schemaVersion: 1, kind: 'CARD_MISSING_CONFIRMED', identities: ['statement:legacy-kindle'], selected: [], updatedAt: '2026-01-02T00:00:00.000Z' }
+    const deleted = { ...oldAbsence, updatedAt: '2026-01-04T00:00:00.000Z' }
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(deleted, 'DELETED')] }))
+    const active = await syncGoogleSheetDecisions('spreadsheet-id-12345', 'token', [oldAbsence], {}, fetcher)
+    expect(active).toEqual([])
+    expect(localStoreMocks.remove).toHaveBeenCalledWith(oldAbsence.key)
+    expect(localStoreMocks.put).not.toHaveBeenCalled()
+  })
+
   it('falha sem alterar a aba de dados quando CUSTOS ANO não está presente', async () => {
     const fetcher = vi.fn().mockResolvedValue(response({ sheets: [{ properties: { title: 'Resumo' } }] }))
     await expect(syncGoogleSheetDecisions('spreadsheet-id-12345', 'token', [decision], {}, fetcher)).rejects.toThrow(/CUSTOS ANO não existe/)

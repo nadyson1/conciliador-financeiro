@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { BankTransaction, CardStatement, LedgerTransaction } from '../domain/types'
-import { identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
+import { findExistingCostYearCandidates, identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
 import { findDuplicateGroups, reconcile } from '../matching/reconcile'
 
 const syntheticPages = [
@@ -391,6 +391,45 @@ describe('PDF de fatura do cartão', () => {
     statement.transactions[0].totalInstallments = null
     expect(reconcileCardStatement(statement, [ledger('same-day', '2026-05-12', 'ASAAS OFICINA CR', 9450)]).matches[0].status).toBe('CARD_MATCHED')
     expect(reconcileCardStatement(statement, [ledger('old-date', '2026-02-12', 'ASAAS OFICINA CR', 9450)]).matches[0].status).toBe('CARD_MISSING')
+  })
+
+  it('aceita candidato único por valor, vencimento e Crédito_Bradesco mesmo com descrição humana diferente (PETZ)', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-05-12'
+    statement.transactions = [{ ...statement.transactions[0], id: 'petz-pdf', date: '2026-04-27', purchaseDate: '2026-04-27', invoiceDueDate: '2026-05-12', statementDueDate: '2026-05-12', originalDescription: 'PETZ DIGITAL', description: 'PETZ DIGITAL', amount: 28950, installment: null, totalInstallments: null }]
+    const petz = ledger('petz-sheet', '2026-05-12', 'Ração 10kg Buba + Maya', 28950)
+    const result = reconcileCardStatement(statement, [petz])
+    expect(findExistingCostYearCandidates(statement, statement.transactions[0], [petz])).toEqual([petz])
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: petz })
+    expect(result.matches[0].evidence).toContain('Candidato único por valor, vencimento e Crédito_Bradesco')
+  })
+
+  it('concilia o Kindle pelo vencimento da fatura apesar da descrição e data real diferentes', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-03-12'
+    statement.transactions = [{ ...statement.transactions[0], id: 'kindle-pdf', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', originalDescription: 'Amazon Kindle Unltd', description: 'Amazon Kindle Unltd', amount: 299, installment: null, totalInstallments: null }]
+    const kindle = ledger('kindle-sheet', '2026-03-12', 'Assinatura Kindle unlimited (2 meses)', 299)
+    expect(reconcileCardStatement(statement, [kindle]).matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: kindle })
+  })
+
+  it('mantém múltiplas linhas no conjunto plausível e exige revisão quando o valor e vencimento são ambíguos', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-05-12'
+    statement.transactions = [{ ...statement.transactions[0], date: '2026-04-27', purchaseDate: '2026-04-27', invoiceDueDate: '2026-05-12', amount: 28950, installment: null, totalInstallments: null }]
+    const candidates = [ledger('petz-a', '2026-05-12', 'Ração Buba', 28950), ledger('petz-b', '2026-05-12', 'Compra de animais', 28950)]
+    const result = reconcileCardStatement(statement, candidates)
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_REVIEW', candidates })
+  })
+
+  it('não reutiliza uma linha de vencimento em duas compras da mesma fatura', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-05-12'
+    statement.transactions = ['PETZ DIGITAL', 'LOJA QUALQUER'].map((description, index) => ({ ...statement.transactions[0], id: `same-row-${index}`, date: '2026-04-27', purchaseDate: '2026-04-27', invoiceDueDate: '2026-05-12', amount: 28950, originalDescription: description, description, installment: null, totalInstallments: null }))
+    const row = ledger('single-due-line', '2026-05-12', 'Gasto registrado', 28950)
+    const result = reconcileCardStatement(statement, [row])
+    expect(result.matches.every((match) => match.status === 'CARD_REVIEW')).toBe(true)
+    expect(result.matches.flatMap((match) => match.candidates).every((candidate) => candidate.id === row.id)).toBe(true)
+    expect(result.matches.some((match) => match.status === 'CARD_MATCHED')).toBe(false)
   })
 
   it('permite resolver candidatos da compra e concilia o pagamento agregado 1:N sem criar outra despesa', () => {

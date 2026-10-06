@@ -77,7 +77,7 @@ function toRow(decision: PersistedDecision, status: 'ACTIVE' | 'DELETED' = 'ACTI
 
 function fromRow(row: unknown[]): DecisionRow | null {
   const [decisionId, kind, subjectFingerprint, statusValue, relatedIds, metadata, createdAtValue, updatedAt, version] = row
-  const validKinds: DecisionKind[] = ['PAIR_CONFIRMED', 'PAIR_REJECTED', 'BANK_IGNORED', 'SHEET_IGNORED', 'COMPOSITION_CONFIRMED', 'STATEMENT_MATCH_CONFIRMED', 'CARD_MISSING_CONFIRMED', 'MISSING_ADDED_TO_SHEET']
+  const validKinds: DecisionKind[] = ['PAIR_CONFIRMED', 'PAIR_REJECTED', 'BANK_IGNORED', 'SHEET_IGNORED', 'COMPOSITION_CONFIRMED', 'STATEMENT_MATCH_CONFIRMED', 'CARD_MISSING_CONFIRMED', 'CARD_PURCHASE_IGNORED', 'MISSING_ADDED_TO_SHEET']
   if (typeof decisionId !== 'string' || typeof kind !== 'string' || !validKinds.includes(kind as DecisionKind)) return null
   if (Number(version) !== 1 || (statusValue !== 'ACTIVE' && statusValue !== DELETED_STATUS)) return null
   try {

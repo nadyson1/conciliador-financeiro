@@ -335,7 +335,8 @@ function hasInstallmentSequence(candidate: LedgerTransaction, rows: LedgerTransa
 }
 
 function isCardCostRow(item: LedgerTransaction) {
-  return normalizeDescription(item.paymentMethod) === 'credito bradesco'
+  return item.direction === 'DEBIT'
+    && normalizeDescription(item.paymentMethod) === 'credito bradesco'
     && !['INVESTMENT', 'INVESTMENT_INCOME', 'INCOME', 'TRANSFER', 'CARD_PAYMENT'].includes(item.type)
 }
 
@@ -354,9 +355,10 @@ export function findExistingCostYearCandidates(statement: CardStatement, transac
   }
   const nonInstallmentCandidate = (item: LedgerTransaction) => {
     if (isInstallment || item.amount !== transaction.amount) return false
-    if (!((invoiceDueDate && item.date === invoiceDueDate) || dayDistance(item.date, purchaseDate) <= 7)) return false
+    if (invoiceDueDate && item.date === invoiceDueDate) return true
+    if (dayDistance(item.date, purchaseDate) > 7) return false
     const similarity = descriptionSimilarity(transaction.originalDescription, item.originalDescription)
-    return similarity >= (item.date === invoiceDueDate ? 0.3 : 0.35)
+    return similarity >= 0.35
   }
   return eligible.filter(isInstallment ? installmentCandidate : nonInstallmentCandidate).sort((a, b) => isInstallment
     ? installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(b)?.description ?? b.originalDescription) - installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(a)?.description ?? a.originalDescription)
@@ -427,6 +429,7 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
       'Crédito_Bradesco',
       ...(descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35 ? ['Descrição compatível'] : []),
       ...(sorted[0].date === invoiceDueDate(transaction) ? ['Data da planilha igual ao vencimento da fatura'] : ['Data próxima à compra (registro histórico)']),
+      ...(sorted.length === 1 && sorted[0].date === invoiceDueDate(transaction) ? ['Candidato único por valor, vencimento e Crédito_Bradesco'] : []),
     ] : undefined
     if (group) return { transaction, status: 'CARD_GROUP_MATCHED', sheet: null, candidates: group, evidence: ['Valor exato', 'Crédito_Bradesco', 'Vencimento da fatura', 'Grupo conciliado pela mesma quantidade de lançamentos'] }
     if (confirmed) return { transaction, status: 'CARD_MATCHED', sheet: confirmed, candidates: [confirmed], evidence }
@@ -436,7 +439,8 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
       ? { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
       : { transaction, status: 'CARD_REVIEW', sheet: null, candidates: sorted, evidence }
     const dueDateMatch = Boolean(invoiceDueDate(transaction) && sorted[0].date === invoiceDueDate(transaction))
-    if (unique && (dueDateMatch || dayDistance(sorted[0].date, purchaseDate(transaction)) <= 3) && descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
+    if (unique && dueDateMatch) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
+    if (unique && dayDistance(sorted[0].date, purchaseDate(transaction)) <= 3 && descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
     return { transaction, status: 'CARD_REVIEW', sheet: null, candidates: sorted }
   })
   const matchedSheetIds = new Set(matches.flatMap((match) => match.status === 'CARD_MATCHED' && match.sheet ? [match.sheet.id] : match.status === 'CARD_GROUP_MATCHED' ? match.candidates.map((item) => item.id) : []))

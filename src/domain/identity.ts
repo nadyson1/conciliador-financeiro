@@ -16,3 +16,20 @@ export function stableFingerprint(parts: Array<string | number | null | undefine
 export const sheetIdentity = (item: LedgerTransaction) => item.sheetRecordId || `sheet:${stableFingerprint([item.date, item.originalDescription, item.amount, item.direction, item.installment, item.totalInstallments])}`
 export const bankIdentity = (item: BankTransaction) => item.bankTransactionId || `bank:${stableFingerprint([item.date, item.originalDescription, item.amount, item.direction, item.balanceAfter, item.type])}`
 export const cardTransactionIdentity = (statement: CardStatement | string, item: CardStatementTransaction) => `${typeof statement === 'string' ? statement : statement.statementIdentity}:${stableFingerprint([item.cardIdentifier, item.date, item.originalDescription, item.amount, item.direction, item.installment, item.totalInstallments])}`
+
+/**
+ * Identities used by older app builds are retained as aliases while decisions
+ * are migrated. In particular, the transaction date could be represented by
+ * either the purchase date or the invoice date, and early versions did not
+ * include the card suffix in the fingerprint.
+ */
+export function cardTransactionIdentityVariants(statement: CardStatement | string, item: CardStatementTransaction, legacyStatementIdentity?: string | null): string[] {
+  const prefixes = [...new Set([typeof statement === 'string' ? statement : statement.statementIdentity, legacyStatementIdentity].filter((value): value is string => Boolean(value)))]
+  const dates = [...new Set([item.date, item.purchaseDate, item.invoiceDueDate, item.statementDueDate].filter((value): value is string => Boolean(value)))]
+  const fingerprints = new Set<string>()
+  for (const date of dates) {
+    fingerprints.add(stableFingerprint([item.cardIdentifier, date, item.originalDescription, item.amount, item.direction, item.installment, item.totalInstallments]))
+    fingerprints.add(stableFingerprint([date, item.originalDescription, item.amount, item.direction, item.installment, item.totalInstallments]))
+  }
+  return prefixes.flatMap((prefix) => [...fingerprints].map((fingerprint) => `${prefix}:${fingerprint}`))
+}
