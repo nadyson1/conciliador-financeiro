@@ -97,6 +97,31 @@ describe('motor de conciliação', () => {
     expect(result.items.map((item) => item.status)).toEqual(['OUT_OF_SCOPE', 'CARD_DIVERGENCE'])
   })
 
+  it.each(['PIX ENVIADO', 'PIX QR CODE DINAMICO', 'PIX QR CODE ESTATICO'])('reconhece Transferência como alias histórico de Pix para %s', (description) => {
+    const historical = sheet('legacy', 'Transferencia para conta de destino')
+    historical.paymentMethod = 'Transferência'
+    historical.type = 'TRANSFER'
+    const result = reconcile([bank('pix', description)], [historical])
+    expect(result.items[0]).toMatchObject({ status: 'MATCHED', sheet: { id: 'legacy' } })
+    expect(result.items[0].reasonCode).toBe('LEGACY_PAYMENT_ALIAS')
+    expect(result.items[0].candidate?.reasons).toContain('Alias histórico de forma de pagamento: Pix ↔ Transferência')
+  })
+
+  it('prefere Pix exato ao alias legado e mantém revisão quando dois aliases são ambíguos', () => {
+    const exact = sheet('pix', 'Conta de destino')
+    exact.paymentMethod = 'Pix'
+    const historical = sheet('legacy', 'Transferencia para conta de destino')
+    historical.paymentMethod = 'Transferência'; historical.type = 'TRANSFER'
+    const preferred = reconcile([bank('pix-bank', 'PIX ENVIADO')], [exact, historical])
+    expect(preferred.items[0]).toMatchObject({ status: 'MATCHED', sheet: { id: 'pix' } })
+
+    const ambiguous = reconcile([bank('ambiguous', 'PIX ENVIADO')], [
+      { ...historical, id: 'legacy-a', sheetRecordId: 'legacy-a' },
+      { ...historical, id: 'legacy-b', sheetRecordId: 'legacy-b' },
+    ])
+    expect(ambiguous.items[0].status).toBe('REVIEW')
+  })
+
   it('mantém entradas bancárias fora da lista de despesas ausentes', () => {
     const incoming = bank('b-in', 'PIX RECEBIDO', '2026-01-08', 1200, 'CREDIT', 'INCOME')
     const result = reconcile([incoming], [sheet('s1', 'Mercado')])
@@ -125,6 +150,7 @@ describe('motor de conciliação', () => {
     expect(unique.items[0].status).toBe('MATCHED')
     expect(ambiguous.items[0].status).toBe('REVIEW')
     expect(superficial.items[0]).toMatchObject({ status: 'MISSING', candidate: null, sheet: null })
+    expect(superficial.items[0].reasonCode).toBe('MISSING_NO_CANDIDATE')
   })
 
   it('retira de REVIEW candidatos fora da janela, de natureza incompatível ou já confirmados', () => {

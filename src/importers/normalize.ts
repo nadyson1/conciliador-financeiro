@@ -88,16 +88,16 @@ export function descriptionSimilarity(left: string, right: string): number {
   return Math.max(dice, containment * 0.92)
 }
 
-export function transactionType(description: string, paymentMethod = ''): 'EXPENSE' | 'INVESTMENT' | 'INCOME' | 'TRANSFER' | 'CARD_PAYMENT' | 'OTHER' {
+export function transactionType(description: string, paymentMethod = ''): 'EXPENSE' | 'INVESTMENT' | 'INVESTMENT_INCOME' | 'INCOME' | 'TRANSFER' | 'CARD_PAYMENT' | 'OTHER' {
   const value = normalizeDescription(description)
   const payment = normalizeDescription(paymentMethod)
   if (/^gastos cartao de credito(?: |$)/.test(value)) return 'CARD_PAYMENT'
-  if (/^rentab invest facilcred(?: |$)/.test(value)) return 'INCOME'
+  if (/^rentab invest facilcred(?: |$)/.test(value)) return 'INVESTMENT_INCOME'
   if (/resg|resgate|venc(?:imento)? cdb|resg venc/.test(value)) return 'INVESTMENT'
   if (/aplicacao/.test(value) || payment === 'investimento') return 'INVESTMENT'
-  if (/transferencia|ted|\bdoc\b|movimentacao interna|entre contas|transf\b/.test(value)) return 'TRANSFER'
+  if (/transferencia|ted|\bdoc\b|movimentacao interna|entre contas|transf\b|pix (?:para|entre) contas proprias|pix para minha conta|pix para conta propria|pix enviado .{0,40}(?:conta propria|contas proprias|minha (?:outra )?conta|conta de minha titularidade|mesma titularidade)/.test(value)) return 'TRANSFER'
   if (/pix recebido|recebimento pix|credito pix/.test(value)) return 'INCOME'
-  if (/pix enviado|envio pix|compra|comp cartao|mercado|supermercado|farmacia|drogaria|posto de combustivel/.test(value)) return 'EXPENSE'
+  if (/pix enviado|envio pix|pix qr code (?:dinamico|estatico)|compra|comp cartao|seguro cart deb bradesco|conta de telefone|mercado|supermercado|farmacia|drogaria|posto de combustivel/.test(value)) return 'EXPENSE'
   return 'OTHER'
 }
 

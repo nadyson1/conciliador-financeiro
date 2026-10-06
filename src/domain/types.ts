@@ -1,8 +1,9 @@
 export type Source = 'SHEET' | 'BANK'
 export type Direction = 'DEBIT' | 'CREDIT'
-export type TransactionType = 'EXPENSE' | 'INVESTMENT' | 'INCOME' | 'TRANSFER' | 'CARD_PAYMENT' | 'OTHER'
+export type TransactionType = 'EXPENSE' | 'INVESTMENT' | 'INVESTMENT_INCOME' | 'INCOME' | 'TRANSFER' | 'CARD_PAYMENT' | 'OTHER'
 export type InvestmentAction = 'APPLICATION' | 'RESCUE' | null
 export type MatchStatus = 'MATCHED' | 'REVIEW' | 'CARD_DIVERGENCE' | 'CARD_PAYMENT_IDENTIFIED' | 'MISSING' | 'DUPLICATE' | 'UNMATCHED_SHEET' | 'IGNORED' | 'OUT_OF_SCOPE'
+export type ReconciliationReasonCode = 'MISSING_NO_CANDIDATE' | 'LEGACY_PAYMENT_ALIAS' | 'OUT_OF_SCOPE_TRANSFER' | 'OUT_OF_SCOPE_INVESTMENT' | 'NOT_EXPENSE'
 
 export interface LedgerTransaction {
   id: string
@@ -113,6 +114,7 @@ export interface ReconciliationItem {
   compositionOptions: CardCompositionOption[]
   compositionStatus: 'MATCHED' | 'REVIEW' | 'NO_MATCH' | 'LIMITED' | null
   cardSummary?: CardPaymentSummary | null
+  reasonCode?: ReconciliationReasonCode
 }
 
 export interface CardPaymentSummary {

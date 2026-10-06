@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, ReactNode } from 'react'
-import type { BankTransaction, CardStatement, CardStatementMatch, ColumnMap, CsvDocument, LedgerTransaction, ReconciliationItem, Transaction } from './domain/types'
+import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, ColumnMap, CsvDocument, LedgerTransaction, ReconciliationItem, Transaction } from './domain/types'
 import { readCsvFile, initialColumnMap } from './importers/csv'
 import { parseBankRows, parseLedgerRows } from './importers/transactions'
 import { identifyStatementPayments, readCardStatementPdf, reconcileCardStatement } from './importers/cardStatement'
 import { normalizeDate } from './importers/normalize'
-import { canonicalCompositionKey, pairKey, reconcile } from './matching/reconcile'
+import { canonicalCompositionKey, findPlausibleLedgerCandidates, pairKey, reconcile } from './matching/reconcile'
 import { exportCardPayments, exportDuplicates, exportMissing, exportOutOfScope, exportReviews, exportSummary } from './features/export'
 import { bankIdentity, cardTransactionIdentity, sheetIdentity } from './domain/identity'
 import { clearPersistedDecisions, decisionKey, deletePersistedDecision, listPersistedDecisions, savePersistedDecision } from './domain/localDecisions'
@@ -14,6 +14,7 @@ import { GoogleSheetsPanel } from './components/GoogleSheetsPanel'
 import type { GoogleSheetsConnectionInfo } from './components/GoogleSheetsPanel'
 import { PwaUpdateNotice } from './components/PwaUpdateNotice'
 import { AddCostYearDialog } from './components/AddCostYearDialog'
+import { canAddMissingToCostYear } from './features/missingEligibility'
 import { GoogleSheetsError, appendCostYearRecord, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { addDecisionTombstone, listDecisionTombstones, removeDecisionTombstone, syncGoogleSheetDecisions, syncOneGoogleSheetDecision, syncOneGoogleSheetDeletion } from './integrations/googleSheetDecisions'
 import { forgetGoogleSheetLink, GOOGLE_SHEET_TAB_NAME, loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
@@ -24,6 +25,7 @@ type SourceStatus = 'EMPTY' | 'LOADED' | 'VALIDATED' | 'ACCEPTED'
 type Dataset = { sheet: LedgerTransaction[]; bank: BankTransaction[] }
 type UploadState = { fileName: string; csv: CsvDocument; map: ColumnMap; valid: Transaction[]; issues: { row: number; message: string }[]; rowCount: number; ignoredRows: number } | null
 type CardPdfEntry = { key: string; fingerprint: string; fileName: string; status: 'PROCESSING' | 'PROCESSED' | 'DIVERGENCE' | 'ERROR'; statement: CardStatement | null; legacyStatementIdentity?: string; error?: string }
+type MissingWriteTarget = { kind: 'BANK'; bank: BankTransaction } | { kind: 'STATEMENT'; statement: CardStatement; transaction: CardStatementTransaction }
 const emptyData: Dataset = { sheet: [], bank: [] }
 const currency = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' })
 const dateLabel = (date: string) => {
@@ -103,7 +105,7 @@ export default function App() {
   const reconcileButtonRef = useRef<HTMLButtonElement | null>(null)
   const previousScreen = useRef(screen)
   const [showStickyReconcile, setShowStickyReconcile] = useState(false)
-  const [missingToAdd, setMissingToAdd] = useState<BankTransaction | null>(null)
+  const [missingToAdd, setMissingToAdd] = useState<MissingWriteTarget | null>(null)
   const [missingWriteError, setMissingWriteError] = useState('')
   const [missingWriteNotice, setMissingWriteNotice] = useState('')
   const [writingMissingId, setWritingMissingId] = useState('')
@@ -570,6 +572,27 @@ export default function App() {
     if (decision === 'reject' && item.sheet && item.candidate) void persistDecision('PAIR_REJECTED', [bankId, sheetIdentity(item.sheet)])
   }
 
+  function bankAddEligibility(item: ReconciliationItem) {
+    const bankKey = bankIdentity(item.bank)
+    const alreadyAdded = savedDecisions.some((record) => record.kind === 'MISSING_ADDED_TO_SHEET' && record.identities[0] === bankKey)
+      || Object.prototype.hasOwnProperty.call(locallyAddedMissingPairs, bankKey)
+    return canAddMissingToCostYear({ source: 'BANK', status: item.status, direction: item.bank.direction, type: item.bank.type, alreadyAdded, hasRequiredFields: Boolean(item.bank.date && item.bank.originalDescription && item.bank.amount > 0) })
+  }
+
+  function openBankMissing(item: ReconciliationItem) {
+    const current = result.items.find((entry) => entry.bank.id === item.bank.id)
+    if (!current || !bankAddEligibility(current).eligible) return
+    setMissingWriteError(''); setMissingWriteNotice(''); setMissingToAdd({ kind: 'BANK', bank: current.bank })
+  }
+
+  function openCardMissing(statement: CardStatement, match: CardStatementMatch) {
+    const identity = cardTransactionIdentity(statement, match.transaction)
+    const alreadyAdded = savedDecisions.some((record) => record.kind === 'STATEMENT_MATCH_CONFIRMED' && record.identities[0] === identity)
+    const eligible = canAddMissingToCostYear({ source: 'STATEMENT', status: match.status, direction: match.transaction.direction, type: match.transaction.type, alreadyAdded, hasRequiredFields: Boolean(match.transaction.date && match.transaction.originalDescription && match.transaction.amount > 0) })
+    if (!eligible.eligible) return
+    setMissingWriteError(''); setMissingWriteNotice(''); setMissingToAdd({ kind: 'STATEMENT', statement, transaction: match.transaction })
+  }
+
   async function reconnectGoogleForCostWrite() {
     if (!googleSheetLink) { setMissingWriteError('Vincule uma planilha Google antes de adicionar lançamentos. Cancele e conecte a planilha na tela inicial.'); return }
     setReconnectingForWrite(true); setMissingWriteError('')
@@ -587,13 +610,32 @@ export default function App() {
     finally { setReconnectingForWrite(false) }
   }
 
-  async function addMissingToCostYear(bank: BankTransaction, record: Parameters<typeof appendCostYearRecord>[2]) {
-    const bankKey = bankIdentity(bank)
-    if (writingMissingRef.current.has(bankKey)) return
+  async function addMissingToCostYear(target: MissingWriteTarget, record: Parameters<typeof appendCostYearRecord>[2]) {
+    const targetKey = target.kind === 'BANK' ? bankIdentity(target.bank) : cardTransactionIdentity(target.statement, target.transaction)
+    if (writingMissingRef.current.has(targetKey)) return
     if (!googleSheetLink) { setMissingWriteError('Vincule uma planilha Google para adicionar a nova linha.'); return }
     if (!googleAccessToken.current) { setMissingWriteError('Conecte o Google antes de adicionar. Seus dados preenchidos foram mantidos.'); return }
-    writingMissingRef.current.add(bankKey)
-    setWritingMissingId(bankKey); setMissingWriteError('')
+    if (target.kind === 'BANK') {
+      const current = result.items.find((item) => item.bank.id === target.bank.id)
+      if (!current || !bankAddEligibility(current).eligible) { setMissingWriteNotice('Este lançamento já não está elegível para inclusão; confira a conciliação atualizada.'); setMissingToAdd(null); return }
+      const googleCandidates = googleSheetRows?.length ? findPlausibleLedgerCandidates(target.bank, googleSheetRows) : []
+      if (googleCandidates.length) {
+        setData((currentData) => {
+          const existingIdentities = new Set(currentData.sheet.map(sheetIdentity))
+          return { ...currentData, sheet: [...currentData.sheet, ...googleCandidates.filter((sheet) => !existingIdentities.has(sheetIdentity(sheet)))] }
+        })
+        setMissingWriteNotice('Este lançamento já existe em CUSTOS ANO; a correspondência foi atualizada sem criar duplicata.')
+        setMissingToAdd(null)
+        return
+      }
+    } else {
+      const current = statementResults.find((entry) => entry.statement.statementIdentity === target.statement.statementIdentity)?.matches.find((match) => match.transaction.id === target.transaction.id)
+      if (!current || !canAddMissingToCostYear({ source: 'STATEMENT', status: current.status, direction: target.transaction.direction, type: target.transaction.type, alreadyAdded: savedDecisions.some((record) => record.kind === 'STATEMENT_MATCH_CONFIRMED' && record.identities[0] === targetKey) }).eligible) {
+        setMissingWriteNotice('Esta compra da fatura já não está elegível para inclusão; confira a conciliação atualizada.'); setMissingToAdd(null); return
+      }
+    }
+    writingMissingRef.current.add(targetKey)
+    setWritingMissingId(targetKey); setMissingWriteError('')
     try {
       const appended = await appendCostYearRecord(googleSheetLink.spreadsheetId, googleAccessToken.current, record)
       const nextLink: SavedGoogleSheetLink = { ...googleSheetLink, spreadsheetTitle: appended.spreadsheetTitle, sheetName: GOOGLE_SHEET_TAB_NAME, lastUpdated: new Date().toISOString(), autoConnect: true }
@@ -601,13 +643,20 @@ export default function App() {
       setGoogleSheetRows(appended.transactions)
       setGoogleSheetInfo({ ...nextLink, rowCount: appended.rowCount, connected: true })
       const selectedSheetKey = sheetIdentity(appended.transaction)
-      setLocallyAddedMissingPairs((current) => ({ ...current, [bankKey]: selectedSheetKey }))
-      if (selectedLedgerSource.current === 'google' || !ledgerSourceChangedByUser.current) {
-        setData((current) => ({ ...current, sheet: appended.transactions }))
+      if (target.kind === 'BANK') {
+        const bankKey = bankIdentity(target.bank)
+        setLocallyAddedMissingPairs((current) => ({ ...current, [bankKey]: selectedSheetKey }))
+        if (selectedLedgerSource.current === 'google' || !ledgerSourceChangedByUser.current) {
+          setData((current) => ({ ...current, sheet: appended.transactions }))
+          setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' }))
+        }
+        await persistDecision('MISSING_ADDED_TO_SHEET', [bankKey], [selectedSheetKey])
+      } else {
+        setData((current) => ({ ...current, sheet: current.sheet.some((sheet) => sheetIdentity(sheet) === selectedSheetKey) ? current.sheet : [...current.sheet, appended.transaction] }))
         setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' }))
+        await persistDecision('STATEMENT_MATCH_CONFIRMED', [targetKey], [selectedSheetKey])
       }
-      await persistDecision('MISSING_ADDED_TO_SHEET', [bankKey], [selectedSheetKey])
-      setMissingWriteNotice(appended.alreadyPresent ? 'Já havia uma linha igual em CUSTOS ANO; o vínculo foi confirmado sem criar duplicata.' : 'Lançamento adicionado à CUSTOS ANO e confirmado na conciliação.')
+      setMissingWriteNotice(appended.alreadyPresent ? 'Já havia uma linha igual em CUSTOS ANO; o vínculo foi confirmado sem criar duplicata.' : target.kind === 'STATEMENT' ? 'Compra da fatura adicionada à CUSTOS ANO e conciliada.' : 'Lançamento adicionado à CUSTOS ANO e confirmado na conciliação.')
       setMissingToAdd(null)
       setMissingWriteError('')
     } catch (error) {
@@ -617,7 +666,7 @@ export default function App() {
       }
       setMissingWriteError(error instanceof Error ? error.message : 'Não foi possível confirmar o append. Seus dados foram mantidos; atualize a planilha antes de tentar novamente.')
     } finally {
-      writingMissingRef.current.delete(bankKey)
+      writingMissingRef.current.delete(targetKey)
       setWritingMissingId('')
     }
   }
@@ -686,6 +735,7 @@ export default function App() {
           <section className="results-heading"><div><span className="eyebrow">CONCILIAÇÃO LOCAL</span><h1>Visão geral</h1><p>Compare o resultado, refine o período e revise os casos sinalizados.</p></div><button className="button button-outline" onClick={() => setScreen('home')}>← Voltar aos arquivos</button></section>
           <section className="results-sync-bar" aria-label="Sincronização das decisões"><div><strong role={googleDecisionStatus.startsWith('Decisões mantidas') ? 'alert' : 'status'} aria-live={googleDecisionStatus.startsWith('Decisões mantidas') ? 'assertive' : 'polite'}>{decisionSyncSummary}</strong><small>{googleSheetLink ? 'As decisões ficam neste dispositivo e sincronizam pela planilha vinculada.' : 'As decisões ficam salvas neste dispositivo.'}</small></div>{googleSheetInfo?.connected ? <button className="button button-outline" disabled={googleDecisionStatus === 'Sincronizando decisões…'} onClick={syncDecisionsManually}>{googleDecisionStatus === 'Sincronizando decisões…' ? 'Sincronizando…' : 'Sincronizar decisões'}</button> : googleSheetLink ? <button className="button button-outline" onClick={() => setScreen('home')}>Reconectar Google</button> : null}</section>
           <FilterBar years={years} year={filterYear} month={filterMonth} fromDate={fromDate} toDate={toDate} onYear={setFilterYear} onMonth={setFilterMonth} onFrom={setFromDate} onTo={setToDate}/>
+          {missingWriteNotice && <p className="cost-write-notice" role="status">{missingWriteNotice}</p>}
           <div className="stat-grid">
             <Metric label="Conciliadas" value={filteredItems.filter((item) => item.status === 'MATCHED').length} tone="green" icon="✓" onClick={() => setTab('overview')}/>
             <Metric label="Para revisar" value={shownReview.length} tone="amber" icon="!" onClick={() => setTab('review')}/>
@@ -705,9 +755,9 @@ export default function App() {
             {filteredItems.some((item) => item.compositionStatus === 'MATCHED') && <section className="review-list"><PanelTitle title="Pagamentos de cartão conciliados" note="Uma saída bancária pode corresponder a vários lançamentos Crédito_Bradesco"/>{filteredItems.filter((item) => item.compositionStatus === 'MATCHED').map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}</section>}
           </>}
           {tab === 'review' && <div className="review-list">{shownReview.map((item) => item.bank.type === 'CARD_PAYMENT' ? <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/> : <ReviewCard key={item.bank.id} item={item} onConfirm={() => decide(item, 'confirm')} onReject={() => decide(item, 'reject')} onIgnore={() => decide(item, 'ignore')}/>)}{!shownReview.length && <EmptyState title="Nenhum item para revisar" copy="A conciliação não encontrou itens pendentes neste período."/>}</div>}
-          {tab === 'missing' && <div className="review-list">{missingWriteNotice && <p className="cost-write-notice" role="status">{missingWriteNotice}</p>}{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')} onAddToSheet={() => { setMissingWriteError(''); setMissingWriteNotice(''); setMissingToAdd(item.bank) }} canAddToSheet={item.bank.direction === 'DEBIT' && item.bank.type === 'EXPENSE'} />)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
+          {tab === 'missing' && <div className="review-list">{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')} onAddToSheet={() => openBankMissing(item)} canAddToSheet={bankAddEligibility(item).eligible} />)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
           {tab === 'card' && <div className="review-list">{shownCardDivergences.map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}{!shownCardDivergences.length && <EmptyState title="Nenhuma divergência de cartão" copy="Todas as faturas têm uma composição confirmada ou não há pagamentos de cartão neste período."/>}</div>}
-          {tab === 'statement' && statementResults.map((item) => <CardStatementResults key={item.entry.key} statement={item.statement} payment={item.payment} matches={item.matches} extractedTotal={item.extractedTotal} matchedTotal={item.matchedTotal} difference={item.difference} confirmations={item.confirmations} confirmedMissing={item.confirmedMissing} onConfirm={(transactionId, sheetId) => confirmStatementMatch(item.statement, transactionId, sheetId)} onConfirmMissing={(transactionId) => confirmCardMissing(item.statement, transactionId)} onUndo={(kind, identities) => { void undoStatementDecision(kind, item.statement, identities) }}/>)}
+          {tab === 'statement' && statementResults.map((item) => <CardStatementResults key={item.entry.key} statement={item.statement} payment={item.payment} matches={item.matches} extractedTotal={item.extractedTotal} matchedTotal={item.matchedTotal} difference={item.difference} confirmations={item.confirmations} confirmedMissing={item.confirmedMissing} onConfirm={(transactionId, sheetId) => confirmStatementMatch(item.statement, transactionId, sheetId)} onConfirmMissing={(transactionId) => confirmCardMissing(item.statement, transactionId)} onAddMissing={(match) => openCardMissing(item.statement, match)} onUndo={(kind, identities) => { void undoStatementDecision(kind, item.statement, identities) }}/>)}
           {tab === 'outofscope' && <div className="issue-columns"><section className="panel"><PanelTitle title="Movimentações fora da conciliação de despesas" note="Entradas, investimentos, transferências e tipos sem natureza confirmada"/>{shownOutOfScope.length ? <>{investFacilYields.length > 0 && <details className="investment-yield-group"><summary><strong>Rendimentos Invest Fácil</strong><span>{investFacilYields.length} créditos · total {formatCents(investFacilYields.reduce((sum, item) => sum + item.bank.amount, 0))}</span><small>Créditos de rendimento agrupados; não são lançados em CUSTOS ANO.</small></summary><div>{investFacilYields.map((item) => <p key={item.bank.id}>{dateLabel(item.bank.date)} · {item.bank.originalDescription} · {formatCents(item.bank.amount)}</p>)}</div></details>}{otherOutOfScope.map((item) => <div className="issue-row" key={item.bank.id}><span className="status-icon blue">ℹ</span><div><strong>{item.bank.originalDescription}</strong><p>{dateLabel(item.bank.date)} · {item.bank.directionKnown === false ? 'Direção não identificada' : item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} · {formatCents(item.bank.amount)}</p><small>{item.sheet ? `Correspondência de investimento: ${item.sheet.originalDescription} · ${formatCents(item.sheet.amount)}` : outOfScopeReason(item.bank.type)}</small></div></div>)}</> : <EmptyState title="Nenhuma movimentação fora do escopo" copy="Todas as movimentações deste período estão em outras seções."/>}</section></div>}
           {tab === 'duplicates' && <section className="panel"><PanelTitle title="Possíveis duplicidades na CUSTOS ANO" note="Sugestões baseadas em lançamentos da planilha; nada é removido automaticamente"/>{filteredDuplicates.length ? filteredDuplicates.map((group, index) => <div className="issue-row duplicate-group" key={`${group.source}-${index}`}><span className="status-icon orange">Ⅱ</span><div><strong>Confira este grupo · {group.transactionIds.length} lançamentos</strong>{group.transactionIds.map((id) => { const sheet = data.sheet.find((entry) => entry.id === id); return sheet ? <p className="duplicate-entry" key={id}>{dateLabel(sheet.date)} · {sheet.originalDescription} · {formatCents(sheet.amount)}{sheet.paymentMethod ? ` · ${sheet.paymentMethod}` : ''}</p> : null })}<small>Possíveis duplicidades precisam de confirmação manual.</small></div></div>) : <EmptyState title="Nenhuma duplicidade sugerida" copy="Nenhuma linha da CUSTOS ANO com data, valor e descrição parecida foi encontrada."/>}</section>}
           {tab === 'flags' && <section className="panel"><PanelTitle title="Lançamentos da planilha não encontrados no extrato" note="Podem pertencer a outra conta, período ou meio de pagamento"/>{unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).length ? unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).map((sheet) => <div className="issue-row" key={sheet.id}><span className="status-icon blue">↗</span><div><strong>{sheet.originalDescription}</strong><p>{dateLabel(sheet.date)} · {formatCents(sheet.amount)} · {sheet.category || 'Sem categoria'}</p><small>Não encontrado no extrato importado.</small><button className="text-button" onClick={() => ignoreSheet(sheet.id)}>Ignorar este lançamento</button></div></div>) : <EmptyState title="Sem sinalizações" copy="Não há lançamentos da planilha pendentes neste período."/>}</section>}
@@ -717,7 +767,7 @@ export default function App() {
       </main>
       {screen === 'home' && showStickyReconcile && <div className="sticky-reconcile" aria-label="Ação de conciliação"><button className="button button-primary button-launch" aria-label="Conciliar agora" onClick={runReconciliation} disabled={!canReconcile || !decisionsReady}>Conciliar agora <span aria-hidden="true">↗</span></button></div>}
       <PwaUpdateNotice />
-      {screen === 'results' && missingToAdd && <AddCostYearDialog transaction={missingToAdd} categories={costCategories} connected={Boolean(googleSheetInfo?.connected && googleAccessToken.current)} saving={writingMissingId === bankIdentity(missingToAdd) || reconnectingForWrite} error={missingWriteError} onCancel={() => { if (!writingMissingId) { setMissingToAdd(null); setMissingWriteError('') } }} onReconnect={() => void reconnectGoogleForCostWrite()} onSubmit={(record) => void addMissingToCostYear(missingToAdd, record)} />}
+      {screen === 'results' && missingToAdd && <AddCostYearDialog transaction={missingToAdd.kind === 'BANK' ? missingToAdd.bank : undefined} initial={missingToAdd.kind === 'STATEMENT' ? { description: missingToAdd.transaction.installment != null && missingToAdd.transaction.totalInstallments != null ? '(' + missingToAdd.transaction.installment + '/' + missingToAdd.transaction.totalInstallments + ') ' + missingToAdd.transaction.originalDescription : missingToAdd.transaction.originalDescription, date: missingToAdd.transaction.date, amount: missingToAdd.transaction.amount, paymentSource: 'STATEMENT' } : undefined} categories={costCategories} connected={Boolean(googleSheetInfo?.connected && googleAccessToken.current)} saving={writingMissingId === (missingToAdd.kind === 'BANK' ? bankIdentity(missingToAdd.bank) : cardTransactionIdentity(missingToAdd.statement, missingToAdd.transaction)) || reconnectingForWrite} error={missingWriteError} onCancel={() => { if (!writingMissingId) { setMissingToAdd(null); setMissingWriteError('') } }} onReconnect={() => void reconnectGoogleForCostWrite()} onSubmit={(record) => void addMissingToCostYear(missingToAdd, record)} />}
       <footer className="site-footer"><span>Conciliador Financeiro <span>·</span> Extratos e PDFs permanecem no dispositivo.</span><span>Aplicação local · CSV, Google Sheets e fatura PDF</span><span>Build de teste PWA</span></footer>
     </div>
   )
@@ -782,7 +832,7 @@ function CardStatementUpload({ entries, notice, onSelect, onRemove }: { entries:
   </section>
 }
 
-function CardStatementResults({ statement, payment, matches, extractedTotal, matchedTotal, difference, confirmations, confirmedMissing, onConfirm, onConfirmMissing, onUndo }: { statement: CardStatement; payment: BankTransaction | null; matches: CardStatementMatch[]; extractedTotal: number; matchedTotal: number; difference: number; confirmations: Map<string, string>; confirmedMissing: Set<string>; onConfirm: (transactionId: string, sheetId: string) => void; onConfirmMissing: (transactionId: string) => void; onUndo: (kind: DecisionKind, identities: string[]) => void }) {
+function CardStatementResults({ statement, payment, matches, extractedTotal, matchedTotal, difference, confirmations, confirmedMissing, onConfirm, onConfirmMissing, onAddMissing, onUndo }: { statement: CardStatement; payment: BankTransaction | null; matches: CardStatementMatch[]; extractedTotal: number; matchedTotal: number; difference: number; confirmations: Map<string, string>; confirmedMissing: Set<string>; onConfirm: (transactionId: string, sheetId: string) => void; onConfirmMissing: (transactionId: string) => void; onAddMissing: (match: CardStatementMatch) => void; onUndo: (kind: DecisionKind, identities: string[]) => void }) {
   const cardIds = [...new Set(statement.transactions.map((item) => item.cardIdentifier))]
   const refunds = statement.transactions.filter((item) => item.type === 'REFUND')
   const purchasesTotal = statement.transactions.filter((item) => item.type === 'PURCHASE').reduce((sum, item) => sum + item.amount, 0)
@@ -798,18 +848,19 @@ function CardStatementResults({ statement, payment, matches, extractedTotal, mat
     </section>
       {cardIds.map((cardIdentifier) => {
         const subtotal = statement.cardSubtotals.find((item) => item.cardIdentifier === cardIdentifier)?.amount
-        return <section className="panel statement-card-group" key={cardIdentifier}><PanelTitle title={`Cartão final ${cardIdentifier.slice(-4)}`} note={cardIdentifier}/>{matches.filter((match) => match.transaction.cardIdentifier === cardIdentifier).map((match) => <CardStatementRow key={match.transaction.id} match={match} statementIdentity={statement.statementIdentity} confirmedPreviously={confirmations.has(match.transaction.id)} missingConfirmed={confirmedMissing.has(cardTransactionIdentity(statement, match.transaction))} onConfirm={onConfirm} onConfirmMissing={onConfirmMissing} onUndo={onUndo}/>)}<div className="amount-row amount-strong"><span>Subtotal informado</span><strong>{subtotal == null ? 'Não disponível' : formatCents(subtotal)}</strong></div></section>
+        return <section className="panel statement-card-group" key={cardIdentifier}><PanelTitle title={`Cartão final ${cardIdentifier.slice(-4)}`} note={cardIdentifier}/>{matches.filter((match) => match.transaction.cardIdentifier === cardIdentifier).map((match) => <CardStatementRow key={match.transaction.id} match={match} statementIdentity={statement.statementIdentity} confirmedPreviously={confirmations.has(match.transaction.id)} missingConfirmed={confirmedMissing.has(cardTransactionIdentity(statement, match.transaction))} onConfirm={onConfirm} onConfirmMissing={onConfirmMissing} onAddMissing={onAddMissing} onUndo={onUndo}/>)}<div className="amount-row amount-strong"><span>Subtotal informado</span><strong>{subtotal == null ? 'Não disponível' : formatCents(subtotal)}</strong></div></section>
       })}
       {refunds.length > 0 && <section className="panel statement-card-group"><PanelTitle title="Créditos/estornos" note="Itens informativos; não entram na lista de compras do cartão ausentes."/>{refunds.map((transaction) => <article className="statement-transaction" key={transaction.id}><span className="status-icon green">↩</span><div className="statement-transaction-main"><strong>{dateLabel(transaction.date)} · {transaction.originalDescription}</strong><span className="statement-status green">CRÉDITO/ESTORNO</span></div><strong className="activity-amount">{formatCents(-transaction.amount)}</strong></article>)}</section>}
   </div>
 }
 
-function CardStatementRow({ match, statementIdentity, confirmedPreviously, missingConfirmed, onConfirm, onConfirmMissing, onUndo }: { match: CardStatementMatch; statementIdentity: string; confirmedPreviously: boolean; missingConfirmed: boolean; onConfirm: (transactionId: string, sheetId: string) => void; onConfirmMissing: (transactionId: string) => void; onUndo: (kind: DecisionKind, identities: string[]) => void }) {
+function CardStatementRow({ match, statementIdentity, confirmedPreviously, missingConfirmed, onConfirm, onConfirmMissing, onAddMissing, onUndo }: { match: CardStatementMatch; statementIdentity: string; confirmedPreviously: boolean; missingConfirmed: boolean; onConfirm: (transactionId: string, sheetId: string) => void; onConfirmMissing: (transactionId: string) => void; onAddMissing: (match: CardStatementMatch) => void; onUndo: (kind: DecisionKind, identities: string[]) => void }) {
   const { transaction, status, candidates } = match
   const identity = cardTransactionIdentity(statementIdentity, transaction)
   const label = status === 'CARD_REFUNDED' ? 'ESTORNADA · NÃO É COMPRA AUSENTE' : status === 'CARD_MATCHED' ? confirmedPreviously ? 'CONCILIADO ANTERIORMENTE' : 'MATCHED · Crédito_Bradesco' : status === 'CARD_MISSING' && missingConfirmed ? 'AUSÊNCIA CONFIRMADA' : status === 'CARD_MISSING' ? 'COMPRA DE CARTÃO NÃO REGISTRADA' : 'REVISAR CORRESPONDÊNCIA'
   const tone = status === 'CARD_MATCHED' || status === 'CARD_REFUNDED' ? 'green' : status === 'CARD_MISSING' ? 'red' : 'amber'
-  return <article className="statement-transaction"><span className={`status-icon ${tone}`}>{status === 'CARD_MATCHED' || status === 'CARD_REFUNDED' ? '✓' : status === 'CARD_MISSING' ? '⌕' : '!'}</span><div className="statement-transaction-main"><strong>{dateLabel(transaction.date)} · {transaction.originalDescription}</strong><p>{transaction.city || 'Cidade não informada'}{transaction.installment != null ? ` · Parcela ${transaction.installment}/${transaction.totalInstallments}` : ''}</p>{status === 'CARD_MATCHED' && match.sheet && <small>Planilha: {dateLabel(match.sheet.date)} · {match.sheet.originalDescription} · {formatCents(match.sheet.amount)}</small>}{status === 'CARD_REVIEW' && candidates.map((candidate) => <div className="statement-candidate" key={candidate.id}><small>CUSTOS ANO: {dateLabel(candidate.date)} · {candidate.originalDescription} · {formatCents(candidate.amount)}</small><button className="text-button" onClick={() => onConfirm(transaction.id, candidate.id)}>Confirmar este lançamento</button></div>)}{match.evidence && <div className="statement-match-evidence" aria-label="Evidências do matching">{match.evidence.map((item) => <small key={item}>✓ {item}</small>)}</div>}<span className={`statement-status ${tone}`}>{label}</span>{status === 'CARD_MISSING' && !missingConfirmed && <button className="text-button" onClick={() => onConfirmMissing(transaction.id)}>Confirmar ausência</button>}{confirmedPreviously && match.sheet && <button className="text-button" onClick={() => onUndo('STATEMENT_MATCH_CONFIRMED', [identity])}>Desfazer confirmação</button>}{missingConfirmed && <button className="text-button" onClick={() => onUndo('CARD_MISSING_CONFIRMED', [identity])}>Desfazer decisão</button>}</div><strong className="activity-amount">{formatCents(transaction.direction === 'CREDIT' ? -transaction.amount : transaction.amount)}</strong></article>
+  const addDecision = canAddMissingToCostYear({ source: 'STATEMENT', status, direction: transaction.direction, type: transaction.type })
+  return <article className="statement-transaction"><span className={`status-icon ${tone}`}>{status === 'CARD_MATCHED' || status === 'CARD_REFUNDED' ? '✓' : status === 'CARD_MISSING' ? '⌕' : '!'}</span><div className="statement-transaction-main"><strong>{dateLabel(transaction.date)} · {transaction.originalDescription}</strong><p>{transaction.city || 'Cidade não informada'}{transaction.installment != null ? ` · Parcela ${transaction.installment}/${transaction.totalInstallments}` : ''}</p>{status === 'CARD_MATCHED' && match.sheet && <small>Planilha: {dateLabel(match.sheet.date)} · {match.sheet.originalDescription} · {formatCents(match.sheet.amount)}</small>}{status === 'CARD_REVIEW' && candidates.map((candidate) => <div className="statement-candidate" key={candidate.id}><small>CUSTOS ANO: {dateLabel(candidate.date)} · {candidate.originalDescription} · {formatCents(candidate.amount)}</small><button className="text-button" onClick={() => onConfirm(transaction.id, candidate.id)}>Confirmar este lançamento</button></div>)}{match.evidence && <div className="statement-match-evidence" aria-label="Evidências do matching">{match.evidence.map((item) => <small key={item}>✓ {item}</small>)}</div>}<span className={`statement-status ${tone}`}>{label}</span>{addDecision.eligible && <button className="text-button" onClick={() => onAddMissing(match)}>Adicionar à CUSTOS ANO</button>}{status === 'CARD_MISSING' && !missingConfirmed && <button className="text-button" onClick={() => onConfirmMissing(transaction.id)}>Confirmar ausência</button>}{confirmedPreviously && match.sheet && <button className="text-button" onClick={() => onUndo('STATEMENT_MATCH_CONFIRMED', [identity])}>Desfazer confirmação</button>}{missingConfirmed && <button className="text-button" onClick={() => onUndo('CARD_MISSING_CONFIRMED', [identity])}>Desfazer decisão</button>}</div><strong className="activity-amount">{formatCents(transaction.direction === 'CREDIT' ? -transaction.amount : transaction.amount)}</strong></article>
 }
 
 function HowCard({ number, title, copy }: { number: string; title: string; copy: string }) { return <article className="how-card"><span>{number}</span><div><strong>{title}</strong><p>{copy}</p></div></article> }
@@ -854,7 +905,7 @@ function CardSummaryNotice({ item }: { item: ReconciliationItem }) {
     {difference < 0 && <p>O total elegível excede o pagamento. Algumas compras podem pertencer a outro ciclo, ou pode haver crédito, estorno ou diferença de datas; isso não é classificado automaticamente como erro.</p>}
   </section>
 }
-function outOfScopeReason(type: BankTransaction['type']) { return ({ INCOME: 'Entrada identificada; não é uma despesa ausente.', INVESTMENT: 'Movimentação de investimento, como aplicação ou resgate.', TRANSFER: 'Transferência entre contas.', OTHER: 'Natureza não confirmada; não foi presumida como despesa.', EXPENSE: 'Despesa fora da lista principal.', CARD_PAYMENT: 'Pagamento de fatura, tratado pela composição do cartão.' } as const)[type] }
+function outOfScopeReason(type: BankTransaction['type']) { return ({ INCOME: 'Entrada identificada; não é uma despesa ausente.', INVESTMENT: 'Movimentação de investimento, como aplicação ou resgate.', INVESTMENT_INCOME: 'Rendimento de investimento; não é uma despesa ausente.', TRANSFER: 'Transferência entre contas.', OTHER: 'Natureza não confirmada; não foi presumida como despesa.', EXPENSE: 'Despesa fora da lista principal.', CARD_PAYMENT: 'Pagamento de fatura, tratado pela composição do cartão.' } as const)[type] }
 function TransactionBox({ label, transaction }: { label: string; transaction: BankTransaction | LedgerTransaction | null }) { return <div className="transaction-box"><span className="step-label">{label}</span>{transaction ? <><strong className="transaction-date">{dateLabel(transaction.date)}</strong><strong className="transaction-description">{transaction.originalDescription}</strong><strong className="transaction-amount">{formatCents(transaction.amount)}</strong><span className="transaction-meta">{transaction.source === 'BANK' && transaction.directionKnown === false ? 'Direção não identificada no arquivo' : transaction.direction === 'DEBIT' ? 'Saída' : 'Entrada'}{transaction.paymentMethod ? ` · Forma de pagamento: ${transaction.paymentMethod}` : ''}{transaction.source === 'SHEET' && transaction.category ? ` · ${transaction.category}` : ''}</span></> : <span className="no-candidate">Nenhum lançamento sugerido para comparar.</span>}</div> }
 function MissingCard({ item, onIgnore, onAddToSheet, canAddToSheet }: { item: ReconciliationItem; onIgnore: () => void; onAddToSheet: () => void; canAddToSheet: boolean }) { return <article className="missing-card"><span className="status-icon red">⌕</span><div className="missing-content"><span className="step-label">POSSÍVEL LANÇAMENTO AUSENTE</span><h2>{item.bank.originalDescription}</h2><p>{dateLabel(item.bank.date)} · Saída{item.bank.paymentMethod ? ` · Forma de pagamento: ${item.bank.paymentMethod}` : ''}</p><strong className="transaction-amount">{formatCents(item.bank.amount)}</strong><small>Nenhum lançamento correspondente foi encontrado na CUSTOS ANO.</small></div>{canAddToSheet && <button className="button button-primary" onClick={onAddToSheet}>Adicionar à CUSTOS ANO</button>}<button className="button button-outline" onClick={onIgnore}>Ignorar</button></article> }
 function FilterBar({ years, year, month, fromDate, toDate, onYear, onMonth, onFrom, onTo }: { years: string[]; year: string; month: string; fromDate: string; toDate: string; onYear: (value: string) => void; onMonth: (value: string) => void; onFrom: (value: string) => void; onTo: (value: string) => void }) {

@@ -92,13 +92,13 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap): P
     const describedType = transactionType(originalDescription)
     const action = investmentAction(originalDescription)
     const explicitTextDirection = /credit|credito|entrada|receb|debit|debito|saida|pag/.test(directionValue)
-    const directionKnown = Boolean(splitColumns && (debitPresent || creditPresent)) || explicitTextDirection || describedType === 'INCOME' || (describedType === 'EXPENSE' && /pix enviado|compra|mercado|supermercado|farmacia|drogaria|posto de combustivel/.test(originalDescription.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase())) || (describedType === 'INVESTMENT' && action != null) || describedType === 'CARD_PAYMENT'
+    const directionKnown = Boolean(splitColumns && (debitPresent || creditPresent)) || explicitTextDirection || describedType === 'INCOME' || describedType === 'INVESTMENT_INCOME' || (describedType === 'EXPENSE' && /pix enviado|pix qr code|compra|seguro cart deb bradesco|conta de telefone|mercado|supermercado|farmacia|drogaria|posto de combustivel/.test(originalDescription.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase())) || (describedType === 'INVESTMENT' && action != null) || describedType === 'CARD_PAYMENT'
     let direction: 'DEBIT' | 'CREDIT'
     if (splitColumns && (debitPresent || creditPresent)) direction = debitPresent ? 'DEBIT' : 'CREDIT'
     else if (/credit|credito|entrada|receb/.test(directionValue)) direction = 'CREDIT'
     else if (/debit|debito|saida|pag/.test(directionValue)) direction = 'DEBIT'
     else {
-      direction = describedType === 'INCOME' || (describedType === 'INVESTMENT' && investmentAction(originalDescription) === 'RESCUE') ? 'CREDIT' : 'DEBIT'
+      direction = describedType === 'INCOME' || describedType === 'INVESTMENT_INCOME' || (describedType === 'INVESTMENT' && investmentAction(originalDescription) === 'RESCUE') ? 'CREDIT' : 'DEBIT'
     }
     const paymentMethod = cell(row, map.paymentMethod)
     const classifiedType = transactionType(originalDescription, paymentMethod)

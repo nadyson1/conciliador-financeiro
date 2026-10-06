@@ -26,14 +26,18 @@ function dayNumber(date: string) { const [year, month, day] = date.split('-').ma
 function dateDistance(a: string, b: string) { return Math.abs(dayNumber(a) - dayNumber(b)) }
 const isInvestmentSheet = (sheet: LedgerTransaction) => sheet.type === 'INVESTMENT' || normalizeDescription(sheet.paymentMethod) === 'investimento'
 const cardPaymentMethod = (sheet: LedgerTransaction) => normalizeDescription(sheet.paymentMethod) === 'credito bradesco'
+const isPixPaymentDescription = (description: string) => /^(?:pix enviado|pix qr code dinamico|pix qr code estatico|envio pix)(?: |$)/.test(normalizeDescription(description))
+const isLegacyTransferAlias = (bank: BankTransaction, sheet: LedgerTransaction) => isPixPaymentDescription(bank.originalDescription)
+  && normalizeDescription(sheet.paymentMethod) === 'transferencia' && sheet.type === 'TRANSFER'
 
 function candidate(bank: BankTransaction, sheet: LedgerTransaction): MatchCandidate | null {
   if (bank.direction !== 'DEBIT' || sheet.direction !== 'DEBIT' || bank.amount !== sheet.amount) return null
-  if (bank.type === 'TRANSFER' || bank.type === 'CARD_PAYMENT' || bank.type === 'INCOME' || sheet.type === 'TRANSFER' || sheet.type === 'CARD_PAYMENT') return null
+  const legacyAlias = isLegacyTransferAlias(bank, sheet)
+  if (bank.type === 'TRANSFER' || bank.type === 'CARD_PAYMENT' || bank.type === 'INCOME' || bank.type === 'INVESTMENT_INCOME' || (sheet.type === 'TRANSFER' && !legacyAlias) || sheet.type === 'CARD_PAYMENT') return null
   const investmentPair = bank.type === 'INVESTMENT' && isInvestmentSheet(sheet)
   if (bank.type === 'INVESTMENT' && !investmentPair) return null
   if (sheet.type === 'INVESTMENT' && !investmentPair) return null
-  if (!investmentPair && sheet.type !== 'EXPENSE') return null
+  if (!investmentPair && sheet.type !== 'EXPENSE' && !legacyAlias) return null
   if (bank.type !== 'EXPENSE' && bank.type !== 'OTHER' && !investmentPair) return null
   const distance = dateDistance(bank.date, sheet.date)
   if (!investmentPair && distance > 3) return null
@@ -47,16 +51,24 @@ function candidate(bank: BankTransaction, sheet: LedgerTransaction): MatchCandid
   if (bank.directionKnown === false) reasons.push('Direção não confirmada no arquivo')
   else reasons.push('Direção compatível')
   if (genericDescription) reasons.push('Descrição bancária genérica; não usada para reduzir a compatibilidade')
+  if (legacyAlias) reasons.push('Alias histórico de forma de pagamento: Pix ↔ Transferência')
   if (similarity >= 0.999) { score += MATCHING_CONFIG.points.description[0]; reasons.push('Descrição exata após normalização') }
   else if (similarity >= 0.72) { score += MATCHING_CONFIG.points.description[1]; reasons.push('Descrição altamente semelhante') }
   else if (similarity >= 0.45) { score += MATCHING_CONFIG.points.description[2]; reasons.push('Descrição parcialmente semelhante') }
   else if (similarity > 0) { score += MATCHING_CONFIG.points.description[3]; reasons.push('Descrição com poucos termos em comum') }
   if (investmentPair) { score += MATCHING_CONFIG.points.paymentMethod; reasons.push('Forma de pagamento Investimento') }
-  if (bank.paymentMethod && sheet.paymentMethod && normalizeDescription(bank.paymentMethod) === normalizeDescription(sheet.paymentMethod)) { score += MATCHING_CONFIG.points.paymentMethod; reasons.push('Forma de pagamento compatível') }
+  else if (legacyAlias) reasons.push('Forma de pagamento Transferência reconhecida como alias histórico')
+  if (isPixPaymentDescription(bank.originalDescription) && normalizeDescription(sheet.paymentMethod) === 'pix') { score += MATCHING_CONFIG.points.paymentMethod; reasons.push('Forma de pagamento Pix compatível') }
+  else if (bank.paymentMethod && sheet.paymentMethod && normalizeDescription(bank.paymentMethod) === normalizeDescription(sheet.paymentMethod)) { score += MATCHING_CONFIG.points.paymentMethod; reasons.push('Forma de pagamento compatível') }
   if (score < MATCHING_CONFIG.minimumCandidateScore) return null
   const dateConfidence = distance === 0 ? 30 : distance === 1 ? 24 : distance === 2 ? 18 : distance === 3 ? 11 : 0
   const confidence = Math.min(94, 45 + (bank.directionKnown === false ? 0 : 15) + dateConfidence + Math.round(similarity * 8))
   return { bankId: bank.id, sheetId: sheet.id, score, confidence, reasons, dateDistance: distance, descriptionSimilarity: similarity, matchMethod: 'SCORED' }
+}
+
+/** Returns only rows that pass the same minimum plausibility rules used by reconciliation. */
+export function findPlausibleLedgerCandidates(bank: BankTransaction, sheets: LedgerTransaction[]) {
+  return sheets.filter((sheet) => candidate(bank, sheet) != null)
 }
 
 function structuralCandidate(candidateItem: MatchCandidate, bank: BankTransaction, locallyUnique: boolean): MatchCandidate {
@@ -72,6 +84,7 @@ function structuralCandidate(candidateItem: MatchCandidate, bank: BankTransactio
       'Direção compatível',
       locallyUnique ? 'Única candidata plausível' : 'Correspondência 1:1 escolhida globalmente',
       genericDescription ? 'Descrição bancária genérica; não penalizada' : candidateItem.descriptionSimilarity < 0.45 ? 'Descrição com baixa similaridade; evidência estrutural prevaleceu' : 'Descrição compatível',
+      ...(candidateItem.reasons.includes('Alias histórico de forma de pagamento: Pix ↔ Transferência') ? ['Alias histórico de forma de pagamento: Pix ↔ Transferência'] : []),
     ],
   }
 }
@@ -138,8 +151,8 @@ function searchCompositions(bank: BankTransaction, sheets: LedgerTransaction[]):
   return { options, limited, candidateCount: candidates.length, candidateTotal }
 }
 
-function emptyItem(bank: BankTransaction, status: ReconciliationItem['status']): ReconciliationItem {
-  return { bank, sheet: null, status, candidate: null, composition: [], compositionOptions: [], compositionStatus: null, cardSummary: null }
+function emptyItem(bank: BankTransaction, status: ReconciliationItem['status'], reasonCode?: ReconciliationItem['reasonCode']): ReconciliationItem {
+  return { bank, sheet: null, status, candidate: null, composition: [], compositionOptions: [], compositionStatus: null, cardSummary: null, ...(reasonCode ? { reasonCode } : {}) }
 }
 
 export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[], decisions: ReviewDecisions = {}): ReconciliationResult {
@@ -167,13 +180,19 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
       if (!bank) continue
       const alternative = solveAssignment(component, pairKey(selected.bankId, selected.sheetId))
       const globalMargin = optimum.score - alternative.score
-      const locallyUniqueSameDay = selected.dateDistance === 0 && componentByBank.get(selected.bankId)?.length === 1 && componentBySheet.get(selected.sheetId)?.length === 1
       const componentBanks = new Set(component.map((item) => item.bankId)), componentSheets = new Set(component.map((item) => item.sheetId))
+      const bankCandidates = componentByBank.get(selected.bankId) ?? []
+      const selectedSheet = sheets.find((entry) => entry.id === selected.sheetId)
+      const exactPixPreferred = componentBanks.size === 1 && selected.dateDistance === 0 && isPixPaymentDescription(bank.originalDescription) && selectedSheet != null
+        && normalizeDescription(selectedSheet.paymentMethod) === 'pix'
+        && bankCandidates.filter((item) => normalizeDescription(sheets.find((entry) => entry.id === item.sheetId)?.paymentMethod ?? '') === 'pix').length === 1
+        && bankCandidates.filter((item) => item.sheetId !== selected.sheetId && normalizeDescription(sheets.find((entry) => entry.id === item.sheetId)?.paymentMethod ?? '') === 'transferencia').length === bankCandidates.length - 1
+      const locallyUniqueSameDay = selected.dateDistance === 0 && (bankCandidates.length === 1 || exactPixPreferred) && componentBySheet.get(selected.sheetId)?.length === 1
       const completeAssignment = componentBanks.size === componentSheets.size && optimum.pairs.length === componentBanks.size
       const onlySameDayOptionForBank = (componentByBank.get(selected.bankId) ?? []).filter((item) => item.dateDistance === 0).length === 1
       const globalSameDayResolution = selected.dateDistance === 0 && completeAssignment && onlySameDayOptionForBank
       const structuralSameDay = locallyUniqueSameDay || globalSameDayResolution
-      const globallyAmbiguous = globalMargin < MATCHING_CONFIG.globalAmbiguityMargin && !globalSameDayResolution
+      const globallyAmbiguous = globalMargin < MATCHING_CONFIG.globalAmbiguityMargin && !globalSameDayResolution && !exactPixPreferred
       const plannedCandidate = {
         ...selected,
         reasons: [...selected.reasons, ...(globallyAmbiguous ? ['Mais de uma candidata plausível; revisão necessária', `Há soluções globais próximas (diferença de ${globalMargin} pontos)`] : globalSameDayResolution && globalMargin < MATCHING_CONFIG.globalAmbiguityMargin ? ['Solução global completa; par de mesma data priorizado'] : [`Combinação global supera a alternativa por ${globalMargin} pontos`])],
@@ -229,11 +248,13 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
     }
     if (bank.type === 'INVESTMENT') {
       const matchedInvestment = matches.get(bank.id)
-      return { ...emptyItem(bank, 'OUT_OF_SCOPE'), sheet: matchedInvestment ? sheets.find((sheet) => sheet.id === matchedInvestment.sheetId) ?? null : null, candidate: matchedInvestment ?? null }
+      return { ...emptyItem(bank, 'OUT_OF_SCOPE', 'OUT_OF_SCOPE_INVESTMENT'), sheet: matchedInvestment ? sheets.find((sheet) => sheet.id === matchedInvestment.sheetId) ?? null : null, candidate: matchedInvestment ?? null }
     }
-    if (bank.type === 'TRANSFER' || bank.direction === 'CREDIT') return emptyItem(bank, 'OUT_OF_SCOPE')
+    if (bank.type === 'INVESTMENT_INCOME') return emptyItem(bank, 'OUT_OF_SCOPE', 'OUT_OF_SCOPE_INVESTMENT')
+    if (bank.type === 'TRANSFER') return emptyItem(bank, 'OUT_OF_SCOPE', 'OUT_OF_SCOPE_TRANSFER')
+    if (bank.direction === 'CREDIT' || bank.type === 'INCOME') return emptyItem(bank, 'OUT_OF_SCOPE', 'NOT_EXPENSE')
     const matched = matches.get(bank.id)
-    if (matched) return { ...emptyItem(bank, 'MATCHED'), sheet: sheets.find((sheet) => sheet.id === matched.sheetId) ?? null, candidate: matched }
+    if (matched) return { ...emptyItem(bank, 'MATCHED', matched.reasons.includes('Alias histórico de forma de pagamento: Pix ↔ Transferência') ? 'LEGACY_PAYMENT_ALIAS' : undefined), sheet: sheets.find((sheet) => sheet.id === matched.sheetId) ?? null, candidate: matched }
     const assigned = planned.get(bank.id)
     if (assigned) return { ...emptyItem(bank, 'REVIEW'), sheet: sheets.find((sheet) => sheet.id === assigned.sheetId) ?? null, candidate: assigned }
     const plausible = (byBank.get(bank.id) ?? []).filter((item) => !usedSheets.has(item.sheetId))
@@ -242,7 +263,7 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
     if (best) return { ...emptyItem(bank, 'REVIEW'), sheet: sheets.find((sheet) => sheet.id === best.sheetId) ?? null, candidate: best }
     if (plausible.length) return emptyItem(bank, 'REVIEW')
     if (bank.directionKnown === false) return emptyItem(bank, 'REVIEW')
-    return emptyItem(bank, 'MISSING')
+    return emptyItem(bank, 'MISSING', 'MISSING_NO_CANDIDATE')
   })
   const matchedSheetIds = new Set([...matches.values()].map((item) => item.sheetId))
   for (const composition of compositionByBank.values()) composition.forEach((sheet) => matchedSheetIds.add(sheet.id))

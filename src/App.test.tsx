@@ -133,6 +133,59 @@ describe('fluxo completo no navegador', () => {
     expect(screen.queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
   })
 
+  it('mostra Adicionar à CUSTOS ANO para todas as despesas bancárias MISSING cobertas por regras determinísticas', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo\nEscola,01/01/2026,"90,00"'], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    const bankCsv = [
+      'Data,Histórico,Valor,Tipo',
+      '08/01/2026,PIX ENVIADO,"5,01",Débito',
+      '08/01/2026,PIX QR CODE DINAMICO,"5,02",Débito',
+      '08/01/2026,PIX QR CODE ESTATICO,"5,03",Débito',
+      '08/01/2026,COMPRA CARTAO VISA,"5,04",Débito',
+      '08/01/2026,SEGURO CART DEB BRADESCO,"5,05",Débito',
+      '08/01/2026,CONTA DE TELEFONE,"5,06",Débito',
+    ].join('\n')
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], new File([bankCsv], 'extrato.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 6 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    expect(screen.getAllByRole('button', { name: 'Adicionar à CUSTOS ANO' })).toHaveLength(6)
+  })
+
+  it('não mostra PIX legado como ausente quando Transferência histórica existe na CUSTOS ANO', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo,Forma de pagamento\nTransferencia para CC Nubank,08/01/2026,"60,00",Transferência'], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], new File(['Data,Histórico,Valor,Tipo\n08/01/2026,PIX ENVIADO,"60,00",Débito'], 'extrato.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    expect(screen.getByRole('button', { name: /Conciliadas/ })).toHaveTextContent('1')
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    expect(screen.getByText('Nenhuma despesa ausente')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
+  })
+
+  it('abre inclusão de despesa com forma desconhecida vazia e exige escolha antes de gravar', async () => {
+    const user = userEvent.setup()
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [{ id: 'category-row', source: 'SHEET', sheetRecordId: 'category-row', bankTransactionId: null, date: '2026-01-01', description: 'Escola', originalDescription: 'Escola', amount: 9000, direction: 'DEBIT', type: 'EXPENSE', paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }], rowCount: 1 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,COMPRA DE SERVICO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    await user.click(await screen.findByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(screen.getByLabelText('Forma de pagamento')).toHaveValue('')
+    await user.selectOptions(screen.getByLabelText('Categoria'), 'Casa')
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(await screen.findByText('Selecione uma forma de pagamento válida.')).toBeInTheDocument()
+    expect(appendCostYearRecord).not.toHaveBeenCalled()
+  })
+
   it('mantém o ausente e os campos preenchidos após falha de token e permite reconectar', async () => {
     const user = userEvent.setup()
     const existing = { id: 'sheet-old', source: 'SHEET' as const, sheetRecordId: 'sheet-old', bankTransactionId: null, date: '2026-01-05', description: 'Escola', originalDescription: 'Escola', amount: 9900, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
@@ -363,6 +416,32 @@ describe('fluxo completo no navegador', () => {
     expect(screen.getByText('COMPRA DE CARTÃO NÃO REGISTRADA')).toBeInTheDocument()
     expect(screen.getByText(/Pagamento anterior identificado: R\$\s*50,00 · excluído das compras da fatura/)).toBeInTheDocument()
     expect(screen.getByText(/Nenhum pagamento bancário com o total da fatura foi identificado perto do vencimento/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Adicionar à CUSTOS ANO' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(screen.getByLabelText('Forma de pagamento')).toHaveValue('Crédito_Bradesco')
+  })
+
+  it('adiciona compra ausente de PDF como Crédito_Bradesco e persiste vínculo com a transação da fatura', async () => {
+    const user = userEvent.setup()
+    const category = { id: 'category-row', source: 'SHEET' as const, sheetRecordId: 'category-row', bankTransactionId: null, date: '2026-01-01', description: 'Escola', originalDescription: 'Escola', amount: 9000, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const added = { ...category, id: 'added-card-row', sheetRecordId: 'added-card-row', date: '2025-06-10', description: 'LOJA TESTE', originalDescription: 'LOJA TESTE', amount: 4000, paymentMethod: 'Crédito_Bradesco' }
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [category], rowCount: 1 })
+    googleSheetsMocks.append.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [category, added], rowCount: 2, transaction: added, alreadyPresent: false })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic'], 'fatura.pdf', { type: 'application/pdf' }))
+    await screen.findByText(/PDF lido · 2 páginas · 2 cartões · 2 compras/)
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    const cardRow = screen.getByText(/LOJA TESTE/).closest('article')!
+    await user.click(within(cardRow).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(screen.getByLabelText('Forma de pagamento')).toHaveValue('Crédito_Bradesco')
+    await user.selectOptions(screen.getByLabelText('Categoria'), 'Casa')
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(await screen.findByText('Compra da fatura adicionada à CUSTOS ANO e conciliada.')).toBeInTheDocument()
+    expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED' && decision.identities[0].startsWith('statement-example-') && decision.selected[0] === 'added-card-row')).toBe(true)
+    expect(screen.queryAllByText('COMPRA DE CARTÃO NÃO REGISTRADA')).toHaveLength(1)
   })
 
   it('adiciona e remove PDFs individualmente, permite seleção múltipla e rejeita duplicatas na sessão', async () => {

@@ -4,8 +4,9 @@ import type { CostYearRecordInput } from '../integrations/googleSheets'
 import { COST_YEAR_PAYMENT_METHODS, inferCostPaymentMethod } from '../features/costYearRecord'
 import { normalizeDate } from '../importers/normalize'
 
-export function AddCostYearDialog({ transaction, categories, connected, saving, error, onCancel, onReconnect, onSubmit }: {
-  transaction: BankTransaction
+export function AddCostYearDialog({ transaction, initial, categories, connected, saving, error, onCancel, onReconnect, onSubmit }: {
+  transaction?: BankTransaction
+  initial?: { description: string; date: string; amount: number; paymentSource?: 'BANK' | 'STATEMENT' }
   categories: string[]
   connected: boolean
   saving: boolean
@@ -14,11 +15,11 @@ export function AddCostYearDialog({ transaction, categories, connected, saving, 
   onReconnect: () => void
   onSubmit: (record: CostYearRecordInput) => void
 }) {
-  const [description, setDescription] = useState(transaction.originalDescription)
-  const [date, setDate] = useState(transaction.date)
+  const [description, setDescription] = useState(initial?.description ?? transaction?.originalDescription ?? '')
+  const [date, setDate] = useState(initial?.date ?? transaction?.date ?? '')
   const [category, setCategory] = useState('')
-  const [amount, setAmount] = useState((transaction.amount / 100).toFixed(2))
-  const [paymentMethod, setPaymentMethod] = useState(inferCostPaymentMethod(transaction.originalDescription))
+  const [amount, setAmount] = useState(((initial?.amount ?? transaction?.amount ?? 0) / 100).toFixed(2))
+  const [paymentMethod, setPaymentMethod] = useState(inferCostPaymentMethod(initial?.description ?? transaction?.originalDescription ?? '', initial?.paymentSource ?? 'BANK'))
   const [isFixed, setIsFixed] = useState(false)
   const [isEssential, setIsEssential] = useState(false)
   const [submitted, setSubmitted] = useState(false)
