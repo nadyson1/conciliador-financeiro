@@ -59,7 +59,7 @@ function ledger(id: string, date: string, description: string, amount: number, p
 }
 function installmentStatement(date = '2025-10-30', description = 'ASAAS*OFICINA CR', installment = 6, total = 6): CardStatement {
   const statement = parseCardStatementPages(syntheticPages)
-  const transaction = { ...statement.transactions[0], date, description, originalDescription: description, amount: 9450, installment, totalInstallments: total }
+  const transaction = { ...statement.transactions[0], purchaseDate: date, date, description, originalDescription: description, amount: 9450, installment, totalInstallments: total }
   return { ...statement, transactions: [transaction] }
 }
 function installmentLedger(id: string, date: string, installment: number, description = 'Oficina Criativa Renovação'): LedgerTransaction {
@@ -79,6 +79,7 @@ describe('PDF de fatura do cartão', () => {
       '4321 XXXX XXXX 1111', '4321 XXXX XXXX 1111', '4321 XXXX XXXX 1111', '4321 XXXX XXXX 2222', '4321 XXXX XXXX 2222',
     ])
     expect(statement.transactions[0]).toMatchObject({ date: '2025-06-02', amount: 1000, city: 'CIDADE A', installment: 2, totalInstallments: 2 })
+    expect(statement.transactions[0]).toMatchObject({ purchaseDate: '2025-06-02', invoiceDueDate: '2025-07-12', statementDueDate: '2025-07-12' })
     expect(statement.transactions[1]).toMatchObject({ date: '2025-06-06', amount: 2000, city: 'CIDADE B', installment: 2, totalInstallments: 4 })
     expect(statement.transactions[2]).toMatchObject({ date: '2025-06-12', city: 'CIDADE C', installment: null, totalInstallments: null })
     expect(statement.cardSubtotals).toEqual([{ cardIdentifier: '4321 XXXX XXXX 1111', amount: 6000 }, { cardIdentifier: '4321 XXXX XXXX 2222', amount: 4000 }])
@@ -90,6 +91,18 @@ describe('PDF de fatura do cartão', () => {
     expect(statement.errors).toEqual([])
     expect(reimported.statementIdentity).toBe(statement.statementIdentity)
     expect(reimported.transactions.map((item) => item.id)).toEqual(statement.transactions.map((item) => item.id))
+  })
+
+  it('preserva a data de compra e o vencimento como campos separados e não infere vencimento pelo fechamento', () => {
+    const statement = parseCardStatementPages([
+      ['Total da fatura', 'Cliente Exemplo R$ 10,00', 'Previsão de fechamento da próxima fatura: 30/03/2026'],
+      ['Lançamentos', 'Número do Cartão 4321 XXXX XXXX 1111', '02/02/2026 | COMPRA SINTETICA | CIDADE A | | | 10,00', 'Total da fatura em real 10,00'],
+    ])
+    expect(statement.dueDate).toBeNull()
+    expect(statement.nextClosingDate).toBe('2026-03-30')
+    expect(statement.transactions[0]).toMatchObject({
+      date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: null, statementDueDate: null,
+    })
   })
 
   it('registra pagamento anterior como informação separada sem incluí-lo como compra', () => {
@@ -132,6 +145,28 @@ describe('PDF de fatura do cartão', () => {
     expect(result.statementTotal).toBe(10000)
     expect(result.matches).toHaveLength(5)
     expect(result.matches.filter((match) => match.status === 'CARD_MISSING')).toHaveLength(5)
+  })
+
+  it('usa o vencimento da fatura como data forte sem alterar a data real da compra', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    const purchase = { ...statement.transactions[0], installment: null, totalInstallments: null }
+    expect(purchase.purchaseDate).toBe('2025-06-02')
+    expect(purchase.date).toBe(purchase.purchaseDate)
+    expect(purchase.invoiceDueDate).toBe('2025-07-12')
+    const dueDateStatement = { ...statement, transactions: [purchase, ...statement.transactions.slice(1)] }
+    const result = reconcileCardStatement(dueDateStatement, [ledger('due-date-row', '2025-07-12', 'Mercado Exemplo', 1000)])
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: { date: '2025-07-12' } })
+    expect(result.matches[0].transaction.purchaseDate).toBe('2025-06-02')
+    expect(result.matches[0].evidence).toContain('Data da planilha igual ao vencimento da fatura')
+  })
+
+  it('aceita datas históricas próximas à compra quando a planilha não usa vencimento', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    const purchase = { ...statement.transactions[0], installment: null, totalInstallments: null }
+    const historicalStatement = { ...statement, transactions: [purchase, ...statement.transactions.slice(1)] }
+    const result = reconcileCardStatement(historicalStatement, [ledger('legacy-date-row', '2025-06-05', 'Mercado Exemplo', 1000)])
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: { date: '2025-06-05' } })
+    expect(result.matches[0].evidence).toContain('Data próxima à compra (registro histórico)')
   })
 
   it('identifica crédito com hífen depois do valor, separa contagens e valida a equação da fatura', () => {
@@ -177,6 +212,18 @@ describe('PDF de fatura do cartão', () => {
     expect(identifyStatementPayment(statement, [bank])).toBe(bank)
     expect(statement.cardSubtotals.reduce((sum, card) => sum + card.amount, 0)).toBe(statement.reportedTotal)
     expect(statement.cardSubtotals).toHaveLength(2)
+  })
+
+  it('mantém pagamento agregado ligado ao total/vencimento sem converter compras em pagamento ou despesa individual', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    const payment = cardBank('invoice-payment', '2025-07-12', 10000)
+    const identified = identifyStatementPayment(statement, [payment])
+    expect(identified).toBe(payment)
+    expect(statement.transactions.every((transaction) => transaction.type === 'PURCHASE' && transaction.amount < statement.reportedTotal!)).toBe(true)
+    expect(reconcileCardStatement(statement, []).matches).toHaveLength(statement.transactions.length)
+    const bankResult = reconcile([payment], [], { identifiedCardPaymentIds: new Set([payment.id]) })
+    expect(bankResult.items[0]).toMatchObject({ status: 'CARD_PAYMENT_IDENTIFIED', bank: { type: 'CARD_PAYMENT', amount: 10000 } })
+    expect(bankResult.items[0].composition).toEqual([])
   })
 
   it('associa pagamentos distintos a faturas distintas e nunca reutiliza o mesmo pagamento', () => {

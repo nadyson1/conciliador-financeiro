@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { CardStatement } from './domain/types'
 import { readCardStatementPdf } from './importers/cardStatement'
@@ -10,9 +10,9 @@ import App from './App'
 const syntheticStatement: CardStatement = {
   fileName: 'fatura-exemplo.pdf', pageCount: 2, statementIdentity: 'statement-example',
   transactions: [
-    { id: 'card-a', date: '2025-06-02', description: 'MERCADO EXEMPLO', originalDescription: 'MERCADO EXEMPLO', amount: 6000, direction: 'DEBIT', type: 'PURCHASE', financialStatus: 'ACTIVE', cardIdentifier: '4321 XXXX XXXX 1111', installment: null, totalInstallments: null, city: 'CIDADE A', currency: 'BRL', exchangeRate: null, statementDueDate: '2025-07-12', statementTotal: 10000 },
-    { id: 'card-b', date: '2025-06-10', description: 'LOJA TESTE', originalDescription: 'LOJA TESTE', amount: 4000, direction: 'DEBIT', type: 'PURCHASE', financialStatus: 'ACTIVE', cardIdentifier: '4321 XXXX XXXX 2222', installment: null, totalInstallments: null, city: 'CIDADE B', currency: 'BRL', exchangeRate: null, statementDueDate: '2025-07-12', statementTotal: 10000 },
-    { id: 'card-c', date: '2025-06-12', description: 'ESTORNO MODELO', originalDescription: 'ESTORNO MODELO', amount: 900, direction: 'CREDIT', type: 'REFUND', financialStatus: 'ACTIVE', cardIdentifier: '4321 XXXX XXXX 1111', installment: null, totalInstallments: null, city: 'CIDADE A', currency: 'BRL', exchangeRate: null, statementDueDate: '2025-07-12', statementTotal: 10000 },
+    { id: 'card-a', purchaseDate: '2025-06-02', invoiceDueDate: '2025-07-12', date: '2025-06-02', description: 'MERCADO EXEMPLO', originalDescription: 'MERCADO EXEMPLO', amount: 6000, direction: 'DEBIT', type: 'PURCHASE', financialStatus: 'ACTIVE', cardIdentifier: '4321 XXXX XXXX 1111', installment: null, totalInstallments: null, city: 'CIDADE A', currency: 'BRL', exchangeRate: null, statementDueDate: '2025-07-12', statementTotal: 10000 },
+    { id: 'card-b', purchaseDate: '2025-06-10', invoiceDueDate: '2025-07-12', date: '2025-06-10', description: 'LOJA TESTE', originalDescription: 'LOJA TESTE', amount: 4000, direction: 'DEBIT', type: 'PURCHASE', financialStatus: 'ACTIVE', cardIdentifier: '4321 XXXX XXXX 2222', installment: null, totalInstallments: null, city: 'CIDADE B', currency: 'BRL', exchangeRate: null, statementDueDate: '2025-07-12', statementTotal: 10000 },
+    { id: 'card-c', purchaseDate: '2025-06-12', invoiceDueDate: '2025-07-12', date: '2025-06-12', description: 'ESTORNO MODELO', originalDescription: 'ESTORNO MODELO', amount: 900, direction: 'CREDIT', type: 'REFUND', financialStatus: 'ACTIVE', cardIdentifier: '4321 XXXX XXXX 1111', installment: null, totalInstallments: null, city: 'CIDADE A', currency: 'BRL', exchangeRate: null, statementDueDate: '2025-07-12', statementTotal: 10000 },
   ],
   cardSubtotals: [{ cardIdentifier: '4321 XXXX XXXX 1111', amount: 6000 }, { cardIdentifier: '4321 XXXX XXXX 2222', amount: 4000 }],
   reportedTotal: 10000, purchasesDebitsTotal: 10000, creditsPaymentsTotal: null, previousBalance: null, previousPayment: 5000, accountingDifference: null,
@@ -425,7 +425,7 @@ describe('fluxo completo no navegador', () => {
   it('adiciona compra ausente de PDF como Crédito_Bradesco e persiste vínculo com a transação da fatura', async () => {
     const user = userEvent.setup()
     const category = { id: 'category-row', source: 'SHEET' as const, sheetRecordId: 'category-row', bankTransactionId: null, date: '2026-01-01', description: 'Escola', originalDescription: 'Escola', amount: 9000, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
-    const added = { ...category, id: 'added-card-row', sheetRecordId: 'added-card-row', date: '2025-06-10', description: 'LOJA TESTE', originalDescription: 'LOJA TESTE', amount: 4000, paymentMethod: 'Crédito_Bradesco' }
+    const added = { ...category, id: 'added-card-row', sheetRecordId: 'added-card-row', date: '2025-06-11', description: 'LOJA TESTE', originalDescription: 'LOJA TESTE', amount: 4000, paymentMethod: 'Crédito_Bradesco' }
     googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [category], rowCount: 1 })
     googleSheetsMocks.append.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [category, added], rowCount: 2, transaction: added, alreadyPresent: false })
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
@@ -436,13 +436,41 @@ describe('fluxo completo no navegador', () => {
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
     const cardRow = screen.getByText(/LOJA TESTE/).closest('article')!
+    expect(within(cardRow).getByText(/Data real da compra/)).toBeInTheDocument()
+    expect(within(cardRow).getByText(/Vencimento da fatura: 12\/07\/2025 · data sugerida para CUSTOS ANO/)).toBeInTheDocument()
+    expect(within(cardRow).getByText(/Próximo fechamento previsto: 30\/07\/2025/)).toBeInTheDocument()
     await user.click(within(cardRow).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(screen.getByLabelText('Data')).toHaveValue('2025-07-12')
+    fireEvent.change(screen.getByLabelText('Data'), { target: { value: '2025-06-11' } })
     expect(screen.getByLabelText('Forma de pagamento')).toHaveValue('Crédito_Bradesco')
     await user.selectOptions(screen.getByLabelText('Categoria'), 'Casa')
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
     expect(await screen.findByText('Compra da fatura adicionada à CUSTOS ANO e conciliada.')).toBeInTheDocument()
+    expect(appendCostYearRecord).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', expect.objectContaining({ date: '2025-06-11', paymentMethod: 'Crédito_Bradesco' }))
     expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED' && decision.identities[0].startsWith('statement-example-') && decision.selected[0] === 'added-card-row')).toBe(true)
     expect(screen.queryAllByText('COMPRA DE CARTÃO NÃO REGISTRADA')).toHaveLength(1)
+  })
+
+  it('usa a data real da compra como fallback quando falta vencimento, sem usar fechamento', async () => {
+    const fallbackStatement: CardStatement = {
+      ...structuredClone(syntheticStatement), dueDate: null, nextClosingDate: '2025-07-30',
+      transactions: structuredClone(syntheticStatement.transactions).map((transaction) => ({ ...transaction, invoiceDueDate: null, statementDueDate: null })),
+    }
+    vi.mocked(readCardStatementPdf).mockResolvedValueOnce(fallbackStatement)
+    const user = userEvent.setup()
+    render(<App />)
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo,Categoria\nEscola,01/01/2025,90,Casa'], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['fallback statement'], 'fatura-sem-vencimento.pdf', { type: 'application/pdf' }))
+    await screen.findByText(/PDF lido · 2 páginas/)
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    const firstMissing = screen.getAllByText('COMPRA DE CARTÃO NÃO REGISTRADA')[0].closest('article')!
+    expect(within(firstMissing).getByText(/Vencimento não identificado/)).toBeInTheDocument()
+    expect(within(firstMissing).getByText(/Próximo fechamento previsto: 30\/07\/2025/)).toBeInTheDocument()
+    await user.click(within(firstMissing).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(screen.getByLabelText('Data')).toHaveValue('2025-06-02')
+    expect(screen.getByText(/Vencimento não identificado; a data da compra foi preenchida como alternativa/)).toBeInTheDocument()
   })
 
   it('adiciona e remove PDFs individualmente, permite seleção múltipla e rejeita duplicatas na sessão', async () => {
@@ -480,7 +508,7 @@ describe('fluxo completo no navegador', () => {
     ])
     expect(await screen.findByText('corrompido.pdf')).toBeInTheDocument()
     expect(screen.getByText('⚠ Erro de parsing')).toBeInTheDocument()
-    expect(screen.getByText('valido.pdf')).toBeInTheDocument()
+    expect(await screen.findByText('valido.pdf')).toBeInTheDocument()
     expect(screen.getByText(/✓ Processado · PDF lido/)).toBeInTheDocument()
   })
 

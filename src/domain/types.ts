@@ -126,6 +126,10 @@ export interface CardPaymentSummary {
 
 export interface CardStatementTransaction {
   id: string
+  /** Real purchase date from the statement. `date` remains its compatibility alias. */
+  purchaseDate: string
+  /** Invoice due date from the statement; distinct from the purchase date. */
+  invoiceDueDate: string | null
   date: string
   description: string
   originalDescription: string

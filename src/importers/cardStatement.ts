@@ -106,7 +106,8 @@ function parsePurchaseRow(line: string, cardIdentifier: string, dueDate: string 
   const dateTime = dateColumn.match(/\d{2}\/\d{2}(?:\/\d{4})?/)
   if (!history) return null
   return {
-    id: `card-${id}`, date: dateTime ? statementDate(dateTime[0], dueDate) ?? date : date,
+    id: `card-${id}`, purchaseDate: dateTime ? statementDate(dateTime[0], dueDate) ?? date : date,
+    invoiceDueDate: dueDate, date: dateTime ? statementDate(dateTime[0], dueDate) ?? date : date,
     description: history, originalDescription: history, amount,
     direction: signedAmount < 0 ? 'CREDIT' : 'DEBIT', type: signedAmount < 0 ? 'REFUND' : 'PURCHASE', ...(signedAmount > 0 ? { financialStatus: 'ACTIVE' as const } : {}), cardIdentifier,
     installment: installment.installment, totalInstallments: installment.totalInstallments,
@@ -337,6 +338,12 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
   const purchases = statement.transactions.filter((transaction) => transaction.type === 'PURCHASE' && transaction.financialStatus !== 'REFUNDED')
   const eligible = sheet.filter((item) => normalizeDescription(item.paymentMethod) === 'credito bradesco' && item.type === 'EXPENSE')
   const isInstallment = (transaction: CardStatementTransaction) => transaction.installment != null && transaction.totalInstallments != null
+  const purchaseDate = (transaction: CardStatementTransaction) => transaction.purchaseDate || transaction.date
+  const invoiceDueDate = (transaction: CardStatementTransaction) => transaction.invoiceDueDate ?? transaction.statementDueDate ?? statement.dueDate
+  const hasValidNonInstallmentDate = (transaction: CardStatementTransaction, item: LedgerTransaction) => {
+    const dueDate = invoiceDueDate(transaction)
+    return Boolean((dueDate && item.date === dueDate) || dayDistance(item.date, purchaseDate(transaction)) <= 7)
+  }
   const installmentCandidate = (transaction: CardStatementTransaction, item: LedgerTransaction) => {
     if (!isInstallment(transaction) || item.amount !== transaction.amount) return false
     const info = installmentInfo(item)
@@ -349,18 +356,19 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
     const sheetId = confirmedMatches.get(transaction.id)
     const match = eligible.find((item) => item.id === sheetId && (isInstallment(transaction)
       ? installmentCandidate(transaction, item)
-      : item.amount === transaction.amount && dayDistance(item.date, transaction.date) <= 7))
+      : item.amount === transaction.amount && hasValidNonInstallmentDate(transaction, item)))
     if (match && !confirmedSheetIds.has(match.id)) { validConfirmed.set(transaction.id, match); confirmedSheetIds.add(match.id) }
   }
   const candidateSets = purchases.map((transaction) => {
     const available = eligible.filter((item) => !confirmedSheetIds.has(item.id) || validConfirmed.get(transaction.id)?.id === item.id)
     const plausible = isInstallment(transaction)
       ? available.filter((item) => installmentCandidate(transaction, item))
-      : available.filter((item) => item.amount === transaction.amount && dayDistance(item.date, transaction.date) <= 7)
+      : available.filter((item) => item.amount === transaction.amount && hasValidNonInstallmentDate(transaction, item))
     const sorted = [...plausible].sort((a, b) => isInstallment(transaction)
       ? installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(b)?.description ?? b.originalDescription) - installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(a)?.description ?? a.originalDescription)
         || Number(hasInstallmentSequence(b, eligible)) - Number(hasInstallmentSequence(a, eligible))
-      : dayDistance(a.date, transaction.date) - dayDistance(b.date, transaction.date)
+      : Number(b.date === invoiceDueDate(transaction)) - Number(a.date === invoiceDueDate(transaction))
+        || dayDistance(a.date, purchaseDate(transaction)) - dayDistance(b.date, purchaseDate(transaction))
         || descriptionSimilarity(transaction.originalDescription, b.originalDescription) - descriptionSimilarity(transaction.originalDescription, a.originalDescription))
     return { transaction, sorted, sequenceFound: isInstallment(transaction) && sorted.some((item) => hasInstallmentSequence(item, eligible)) }
   })
@@ -376,6 +384,11 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
       'Crédito_Bradesco',
       'Descrição compatível',
       ...(sequenceFound ? ['Sequência de parcelas encontrada'] : []),
+    ] : sorted.length ? [
+      'Valor exato',
+      'Crédito_Bradesco',
+      ...(descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35 ? ['Descrição compatível'] : []),
+      ...(sorted[0].date === invoiceDueDate(transaction) ? ['Data da planilha igual ao vencimento da fatura'] : ['Data próxima à compra (registro histórico)']),
     ] : undefined
     if (confirmed) return { transaction, status: 'CARD_MATCHED', sheet: confirmed, candidates: [confirmed], evidence }
     if (!sorted.length) return { transaction, status: 'CARD_MISSING', sheet: null, candidates: [] }
@@ -383,7 +396,8 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
     if (isInstallment(transaction)) return unique
       ? { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
       : { transaction, status: 'CARD_REVIEW', sheet: null, candidates: sorted, evidence }
-    if (unique && dayDistance(sorted[0].date, transaction.date) <= 3 && descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted }
+    const dueDateMatch = Boolean(invoiceDueDate(transaction) && sorted[0].date === invoiceDueDate(transaction))
+    if (unique && (dueDateMatch || dayDistance(sorted[0].date, purchaseDate(transaction)) <= 3) && descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
     return { transaction, status: 'CARD_REVIEW', sheet: null, candidates: sorted }
   })
   const matchedSheetIds = new Set(matches.flatMap((match) => match.status === 'CARD_MATCHED' && match.sheet ? [match.sheet.id] : []))
