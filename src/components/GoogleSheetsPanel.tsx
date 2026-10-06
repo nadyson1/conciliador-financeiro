@@ -30,7 +30,7 @@ export function GoogleSheetsPanel({ configured, info, loading, error, decisionSt
   const formattedUpdate = info?.lastUpdated ? new Date(info.lastUpdated).toLocaleString('pt-BR') : null
 
   return <section className="panel google-sheets-panel" aria-labelledby="google-sheets-heading">
-    <div className="panel-heading"><div><h2 id="google-sheets-heading">Google Sheets</h2><p>Fonte opcional para os lançamentos da aba CUSTOS ANO.</p></div><span className={`google-connection-badge ${info?.connected ? 'connected' : ''}`}>{linked ? `✓ Planilha vinculada${info.connected ? ' · Google conectado' : ''}` : 'Opcional'}</span></div>
+    <div className="panel-heading"><div><h2 id="google-sheets-heading">Google Sheets</h2><p>Conexão para ler CUSTOS ANO e sincronizar decisões; a fonte dos lançamentos é escolhida abaixo.</p></div><span className={`google-connection-badge ${info?.connected ? 'connected' : ''}`}>{linked ? `✓ Planilha vinculada${info.connected ? ' · Google conectado' : ''}` : 'Opcional'}</span></div>
     {linked && !canEditLink && <div className="google-sheets-info"><strong>{info.spreadsheetTitle}</strong><small>Aba: {info.sheetName}</small><small>{formattedUpdate ? `Última atualização: ${formattedUpdate}` : 'Aguardando conexão para atualizar os dados.'}</small>{!info.connected && error && <small className="google-sheets-warning">Reconecte para atualizar a planilha. Os dados locais atuais foram mantidos.</small>}</div>}
     {canEditLink && <label className="google-sheet-input">URL ou ID da planilha<input value={spreadsheetInput} onChange={(event) => setSpreadsheetInput(event.target.value)} placeholder="https://docs.google.com/spreadsheets/d/..." autoComplete="off" /></label>}
     <div className="google-sheets-actions">

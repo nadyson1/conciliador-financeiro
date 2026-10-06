@@ -12,6 +12,7 @@ import { clearPersistedDecisions, decisionKey, deletePersistedDecision, listPers
 import type { DecisionKind, PersistedDecision } from './domain/localDecisions'
 import { GoogleSheetsPanel } from './components/GoogleSheetsPanel'
 import type { GoogleSheetsConnectionInfo } from './components/GoogleSheetsPanel'
+import { PwaUpdateNotice } from './components/PwaUpdateNotice'
 import { GoogleSheetsError, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { addDecisionTombstone, listDecisionTombstones, removeDecisionTombstone, syncGoogleSheetDecisions, syncOneGoogleSheetDecision, syncOneGoogleSheetDeletion } from './integrations/googleSheetDecisions'
 import { forgetGoogleSheetLink, GOOGLE_SHEET_TAB_NAME, loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
@@ -70,7 +71,9 @@ export default function App() {
     const saved = loadGoogleSheetLink()
     return saved ? { ...saved, rowCount: 0, connected: false } : null
   })
-  const [sheetSource, setSheetSource] = useState<'csv' | 'google'>(() => loadGoogleSheetLink() ? 'google' : 'csv')
+  const [sheetSource, setSheetSource] = useState<'csv' | 'google'>('csv')
+  const ledgerSourceChangedByUser = useRef(false)
+  const selectedLedgerSource = useRef<'csv' | 'google'>('csv')
   const [csvSheetAccepted, setCsvSheetAccepted] = useState(false)
   const [googleSheetRows, setGoogleSheetRows] = useState<LedgerTransaction[] | null>(null)
   const [googleLinkEditing, setGoogleLinkEditing] = useState(false)
@@ -85,6 +88,7 @@ export default function App() {
   const pdfSessionGeneration = useRef(0)
   const [cardPdfNotice, setCardPdfNotice] = useState('')
   const [savedDecisions, setSavedDecisions] = useState<PersistedDecision[]>([])
+  const [pendingDecisionIds, setPendingDecisionIds] = useState<Set<string>>(() => new Set())
   const [decisionsReady, setDecisionsReady] = useState(false)
   const decisionStateRevision = useRef(0)
   const [screen, setScreen] = useState<'home' | 'results'>('home')
@@ -95,13 +99,45 @@ export default function App() {
   const [toDate, setToDate] = useState('')
   const [error, setError] = useState('')
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null)
+  const reconcileButtonRef = useRef<HTMLButtonElement | null>(null)
+  const previousScreen = useRef(screen)
+  const [showStickyReconcile, setShowStickyReconcile] = useState(false)
 
   useEffect(() => {
     let active = true
     const revision = decisionStateRevision.current
-    listPersistedDecisions().then((items) => { if (active && decisionStateRevision.current === revision) setSavedDecisions(items) }).catch(() => { if (active) setError('Não foi possível acessar as decisões salvas neste dispositivo.') }).finally(() => { if (active) setDecisionsReady(true) })
+    listPersistedDecisions().then((items) => {
+      if (active && decisionStateRevision.current === revision) {
+        setSavedDecisions(items)
+        if (googleSheetLink) setPendingDecisionIds(new Set([...items.map((item) => item.key), ...Object.keys(listDecisionTombstones())]))
+      }
+    }).catch(() => { if (active) setError('Não foi possível acessar as decisões salvas neste dispositivo.') }).finally(() => { if (active) setDecisionsReady(true) })
     return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    if (previousScreen.current === 'home' && screen === 'results') window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+    previousScreen.current = screen
+  }, [screen])
+
+  useEffect(() => {
+    if (screen !== 'home' || !reconcileButtonRef.current || typeof IntersectionObserver === 'undefined') {
+      setShowStickyReconcile(false)
+      return
+    }
+    const observer = new IntersectionObserver(([entry]) => setShowStickyReconcile(!entry.isIntersecting), { threshold: 0.01 })
+    observer.observe(reconcileButtonRef.current)
+    return () => observer.disconnect()
+  }, [screen])
+
+  function markDecisionPending(key: string, pending: boolean) {
+    setPendingDecisionIds((current) => {
+      const next = new Set(current)
+      if (pending) next.add(key)
+      else next.delete(key)
+      return next
+    })
+  }
 
   useEffect(() => {
     const captureInstall = (event: Event) => {
@@ -126,9 +162,12 @@ export default function App() {
       decisionStateRevision.current += 1
       setSavedDecisions(await listPersistedDecisions())
       setError('')
-      if (googleAccessToken.current && googleSheetLink?.spreadsheetId) {
-        try { await syncOneGoogleSheetDecision(googleSheetLink.spreadsheetId, googleAccessToken.current, record); setGoogleDecisionStatus('Decisão sincronizada com Google Sheets.') }
-        catch { setGoogleDecisionStatus('Decisão salva neste dispositivo; sincronização pendente.') }
+      if (googleSheetLink?.spreadsheetId) {
+        markDecisionPending(key, true)
+        if (googleAccessToken.current) {
+          try { await syncOneGoogleSheetDecision(googleSheetLink.spreadsheetId, googleAccessToken.current, record); markDecisionPending(key, false); setGoogleDecisionStatus('Decisões sincronizadas.') }
+          catch { setGoogleDecisionStatus('Decisões mantidas neste dispositivo; falha de sincronização.') }
+        }
       }
     } catch {
       setError('Não foi possível salvar esta decisão neste dispositivo. Ela continuará disponível apenas nesta sessão.')
@@ -143,9 +182,12 @@ export default function App() {
       await deletePersistedDecision(key)
       decisionStateRevision.current += 1
       setSavedDecisions(await listPersistedDecisions())
-      if (decision && googleAccessToken.current && googleSheetLink?.spreadsheetId) {
-        try { await syncOneGoogleSheetDeletion(googleSheetLink.spreadsheetId, googleAccessToken.current, decision, listDecisionTombstones()[key].updatedAt); removeDecisionTombstone(key); setGoogleDecisionStatus('Remoção sincronizada com Google Sheets.') }
-        catch { setGoogleDecisionStatus('Remoção salva neste dispositivo; sincronização pendente.') }
+      if (decision && googleSheetLink?.spreadsheetId) {
+        markDecisionPending(key, true)
+        if (googleAccessToken.current) {
+          try { await syncOneGoogleSheetDeletion(googleSheetLink.spreadsheetId, googleAccessToken.current, decision, listDecisionTombstones()[key].updatedAt); removeDecisionTombstone(key); markDecisionPending(key, false); setGoogleDecisionStatus('Decisões sincronizadas.') }
+          catch { setGoogleDecisionStatus('Decisões mantidas neste dispositivo; falha de sincronização.') }
+        }
       }
     } catch {
       setError('Não foi possível atualizar as decisões salvas neste dispositivo.')
@@ -161,8 +203,9 @@ export default function App() {
       decisionStateRevision.current += 1
       setSavedDecisions([])
       if (googleAccessToken.current && googleSheetLink?.spreadsheetId) {
+        existing.forEach((decision) => markDecisionPending(decision.key, true))
         for (const decision of existing) {
-          try { await syncOneGoogleSheetDeletion(googleSheetLink.spreadsheetId, googleAccessToken.current, decision, listDecisionTombstones()[decision.key].updatedAt); removeDecisionTombstone(decision.key) }
+          try { await syncOneGoogleSheetDeletion(googleSheetLink.spreadsheetId, googleAccessToken.current, decision, listDecisionTombstones()[decision.key].updatedAt); removeDecisionTombstone(decision.key); markDecisionPending(decision.key, false) }
           catch { setGoogleDecisionStatus('Limpeza salva neste dispositivo; sincronização pendente.'); break }
         }
       }
@@ -183,6 +226,12 @@ export default function App() {
         setSavedDecisions(merged)
       }
       Object.keys(tombstones).forEach((key) => removeDecisionTombstone(key))
+      setPendingDecisionIds((current) => {
+        const next = new Set(current)
+        local.forEach((decision) => next.delete(decision.key))
+        Object.keys(tombstones).forEach((key) => next.delete(key))
+        return next
+      })
       setGoogleDecisionStatus('Decisões sincronizadas entre dispositivos.')
     } catch (error) {
       setGoogleDecisionStatus(error instanceof Error ? `Decisões mantidas neste dispositivo. ${error.message}` : 'Decisões mantidas neste dispositivo; não foi possível sincronizar.')
@@ -192,6 +241,14 @@ export default function App() {
   async function syncDecisionsManually() {
     if (googleAccessToken.current && googleSheetLink?.spreadsheetId) await synchronizeSavedDecisions(googleSheetLink.spreadsheetId, googleAccessToken.current)
   }
+
+  const decisionSyncSummary = googleDecisionStatus.startsWith('Decisões mantidas')
+    ? googleDecisionStatus
+    : googleSheetLink
+      ? !googleSheetInfo?.connected
+        ? `Google desconectado${pendingDecisionIds.size ? ` · ${pendingDecisionIds.size} decisão(ões) pendente(s)` : ''}`
+        : pendingDecisionIds.size === 1 ? '1 decisão pendente' : pendingDecisionIds.size > 1 ? `${pendingDecisionIds.size} decisões pendentes` : 'Decisões sincronizadas'
+      : 'Decisões salvas neste dispositivo'
 
   function clearSession() {
     pdfSessionGeneration.current += 1; seenPdfFingerprints.current.clear()
@@ -213,8 +270,13 @@ export default function App() {
       setGoogleSheetRows(sheet.transactions)
       setGoogleSheetInfo({ ...nextLink, rowCount: sheet.rowCount, connected: true })
       setGoogleLinkEditing(false)
-      setData((current) => ({ ...current, sheet: sheet.transactions }))
-      setSheetSource('google'); setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' }))
+      const useGoogleLedger = !ledgerSourceChangedByUser.current || selectedLedgerSource.current === 'google'
+      if (useGoogleLedger) {
+        selectedLedgerSource.current = 'google'
+        setData((current) => ({ ...current, sheet: sheet.transactions }))
+        setSheetSource('google')
+        setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' }))
+      }
       setGoogleError(persistenceWarning)
       await synchronizeSavedDecisions(sheet.spreadsheetId, token)
     } catch (error) {
@@ -249,8 +311,13 @@ export default function App() {
       setGoogleSheetRows(sheet.transactions)
       setGoogleSheetInfo({ ...nextLink, rowCount: sheet.rowCount, connected: true })
       setGoogleLinkEditing(false)
-      setSheetSource('google'); setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' }))
-      setData((current) => ({ ...current, sheet: sheet.transactions }))
+      const useGoogleLedger = !ledgerSourceChangedByUser.current || selectedLedgerSource.current === 'google'
+      if (useGoogleLedger) {
+        selectedLedgerSource.current = 'google'
+        setSheetSource('google')
+        setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' }))
+        setData((current) => ({ ...current, sheet: sheet.transactions }))
+      }
       setGoogleError(persistenceWarning)
       await synchronizeSavedDecisions(sheet.spreadsheetId, token)
     } catch (error) {
@@ -295,6 +362,8 @@ export default function App() {
     try { forgetGoogleSheetLink() } catch { setGoogleError('Não foi possível remover o vínculo salvo neste dispositivo.'); return }
     setGoogleSheetLink(null); setGoogleSheetInfo(null); setGoogleSheetRows(null); setGoogleLinkEditing(false); setGoogleError('')
     if (sheetSource === 'google') {
+      ledgerSourceChangedByUser.current = true
+      selectedLedgerSource.current = 'csv'
       if (csvSheetAccepted && uploads.sheet) { setSheetSource('csv'); setData((current) => ({ ...current, sheet: uploads.sheet!.valid as LedgerTransaction[] })); setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' })) }
       else { setSheetSource('csv'); setData((current) => ({ ...current, sheet: [] })); setSourceStatus((current) => ({ ...current, sheet: 'EMPTY' })) }
     }
@@ -303,6 +372,8 @@ export default function App() {
   function toggleGoogleLinkEditing() { setGoogleLinkEditing((editing) => !editing) }
 
   function selectSheetSource(source: 'csv' | 'google') {
+    ledgerSourceChangedByUser.current = true
+    selectedLedgerSource.current = source
     setSheetSource(source)
     if (source === 'google') {
       if (googleSheetRows?.length) { setData((current) => ({ ...current, sheet: googleSheetRows })); setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' })) }
@@ -508,7 +579,7 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${screen === 'home' && showStickyReconcile ? 'app-shell-sticky' : ''}`}>
       <header className="topbar">
         <a className="brand" href="#inicio" onClick={(event) => { event.preventDefault(); setScreen('home') }} aria-label="Conciliador Financeiro, início">
           <span className="brand-mark" aria-hidden="true">↔</span><span>Conciliador<span className="brand-light"> Financeiro</span></span>
@@ -523,19 +594,22 @@ export default function App() {
             <div className="hero-orbit" aria-hidden="true"><div className="orbit-card orbit-card-sheet"><span className="orbit-icon">▤</span><strong>Planilha</strong><small>CUSTOS ANO</small></div><span className="orbit-link">⟷</span><div className="orbit-card orbit-card-bank"><span className="orbit-icon">◈</span><strong>Extrato</strong><small>Banco / cartão</small></div><span className="orbit-dot dot-one"/><span className="orbit-dot dot-two"/></div>
           </section>
           {error && <div className="alert alert-error" role="alert">{error}</div>}
-          <section className="import-section"><div className="section-heading"><div><span className="step-label">01 / IMPORTAÇÃO</span><h2>Adicione seus arquivos</h2></div><span className="local-tag">◉&nbsp; Seus dados não saem daqui</span></div>
-            <GoogleSheetsPanel configured={Boolean(googleClientId)} info={googleSheetInfo} loading={googleLoading} error={googleError} decisionStatus={googleDecisionStatus} editing={googleLinkEditing} onConnect={(input) => { void connectGoogleSheet(input) }} onRefresh={() => { void refreshGoogleSheet() }} onSyncDecisions={() => { void syncDecisionsManually() }} onDisconnect={disconnectGoogleSheet} onChangeSheet={toggleGoogleLinkEditing} onForgetLink={forgetGoogleSheet}/>
-            <fieldset className="ledger-source-choice"><legend>LANÇAMENTOS</legend><label><input type="radio" name="ledger-source" checked={sheetSource === 'google'} disabled={!googleSheetInfo} onChange={() => selectSheetSource('google')}/>Google Sheets{googleSheetInfo?.connected ? ' conectado' : googleSheetInfo ? ' · planilha vinculada' : ' · opcional'}</label><label><input type="radio" name="ledger-source" checked={sheetSource === 'csv'} onChange={() => selectSheetSource('csv')}/>Importar CSV</label></fieldset>
-            <div className="import-grid">
-              <UploadCard title="Importar lançamentos" subtitle="CSV da tabela CUSTOS ANO" mode="sheet" status={sourceStatus.sheet} upload={uploads.sheet} onSelect={selectFile} onMapChange={changeMap} onAccept={() => acceptUpload('sheet')} onClear={() => removeUpload('sheet')} />
-              <UploadCard title="Importar extrato" subtitle="CSV do banco ou cartão" mode="bank" status={sourceStatus.bank} upload={uploads.bank} onSelect={selectFile} onMapChange={changeMap} onAccept={() => acceptUpload('bank')} onClear={() => removeUpload('bank')} />
+          <section className="import-section"><div className="section-heading"><div><span className="step-label">01 / DADOS DE LANÇAMENTOS</span><h2>Dados para conciliação</h2></div><span className="local-tag">◉&nbsp; Seus dados não saem daqui</span></div>
+            <GoogleSheetsPanel configured={Boolean(googleClientId)} info={googleSheetInfo} loading={googleLoading} error={googleError} decisionStatus={decisionSyncSummary} editing={googleLinkEditing} onConnect={(input) => { void connectGoogleSheet(input) }} onRefresh={() => { void refreshGoogleSheet() }} onSyncDecisions={() => { void syncDecisionsManually() }} onDisconnect={disconnectGoogleSheet} onChangeSheet={toggleGoogleLinkEditing} onForgetLink={forgetGoogleSheet}/>
+            <fieldset className="ledger-source-choice"><legend>FONTE DOS LANÇAMENTOS</legend><label><input type="radio" name="ledger-source" checked={sheetSource === 'google'} disabled={!googleSheetRows?.length} onChange={() => selectSheetSource('google')}/>Google Sheets{googleSheetInfo?.connected ? ' · conectado' : googleSheetRows?.length ? ' · disponível neste dispositivo' : ' · conecte e carregue os dados'}</label><label><input type="radio" name="ledger-source" checked={sheetSource === 'csv'} onChange={() => selectSheetSource('csv')}/>Importar CSV</label></fieldset>
+            {sheetSource === 'google' && googleSheetRows?.length ? <div className="ledger-source-summary" role="status"><span aria-hidden="true">✓</span><div><strong>Lançamentos carregados do Google Sheets</strong><small>{googleSheetInfo?.spreadsheetTitle ?? 'Planilha vinculada'} · CUSTOS ANO · {googleSheetRows.length} linhas</small></div><button className="text-button" onClick={() => selectSheetSource('csv')}>Trocar para CSV</button></div> : null}
+            <div className={`import-grid ${sheetSource === 'google' ? 'import-grid-google' : ''}`}>
+              {sheetSource === 'csv' && <div className="import-step"><span className="step-label">01 / CUSTOS ANO · CSV</span><UploadCard title="Importar lançamentos" subtitle="CSV da tabela CUSTOS ANO" mode="sheet" status={sourceStatus.sheet} upload={uploads.sheet} onSelect={selectFile} onMapChange={changeMap} onAccept={() => acceptUpload('sheet')} onClear={() => removeUpload('sheet')} /></div>}
+              <div className="import-step"><span className="step-label">02 / EXTRATO</span><UploadCard title="Importar extrato" subtitle="CSV do banco ou cartão" mode="bank" status={sourceStatus.bank} upload={uploads.bank} onSelect={selectFile} onMapChange={changeMap} onAccept={() => acceptUpload('bank')} onClear={() => removeUpload('bank')} /></div>
             </div>
+            <div className="card-import-heading"><span className="step-label">03 / CARTÃO DE CRÉDITO</span><h3>Faturas do cartão</h3></div>
             <CardStatementUpload entries={cardPdfs} notice={cardPdfNotice} onSelect={selectCardPdfs} onRemove={removeCardPdf}/>
-            <div className="launch-row"><div className="privacy-detail"><span className="lock-icon">⌑</span><span><strong>Processamento local</strong><small>PDF e CSV são processados neste dispositivo. As decisões ficam salvas localmente e podem sincronizar entre dispositivos.</small></span></div><div className="launch-action"><small>{!decisionsReady ? 'Carregando decisões locais…' : canReconcile ? 'Arquivos aceitos; conciliação pronta.' : sourceStatus.sheet === 'ACCEPTED' ? 'Falta aceitar as linhas válidas do extrato bancário.' : sourceStatus.bank === 'ACCEPTED' ? 'Falta aceitar as linhas válidas da CUSTOS ANO.' : 'Aceite a CUSTOS ANO e o extrato, ou importe a fatura PDF.'}</small><button className="button button-primary button-launch" onClick={runReconciliation} disabled={!canReconcile || !decisionsReady}>Conciliar agora <span aria-hidden="true">↗</span></button></div></div>
+            <div className="launch-row"><div className="privacy-detail"><span className="lock-icon">⌑</span><span><strong>Processamento local</strong><small>PDF e CSV são processados neste dispositivo. As decisões ficam salvas localmente e podem sincronizar entre dispositivos.</small></span></div><div className="launch-action"><small>{!decisionsReady ? 'Carregando decisões locais…' : canReconcile ? 'Arquivos aceitos; conciliação pronta.' : sourceStatus.sheet === 'ACCEPTED' ? 'Falta aceitar as linhas válidas do extrato bancário.' : sourceStatus.bank === 'ACCEPTED' ? 'Falta aceitar as linhas válidas da CUSTOS ANO.' : 'Aceite a CUSTOS ANO e o extrato, ou importe a fatura PDF.'}</small><button ref={reconcileButtonRef} className="button button-primary button-launch" aria-hidden={showStickyReconcile} tabIndex={showStickyReconcile ? -1 : undefined} onClick={runReconciliation} disabled={!canReconcile || !decisionsReady}>Conciliar agora <span aria-hidden="true">↗</span></button></div></div>
           </section>
           <section className="how-section"><span className="step-label">02 / O QUE ACONTECE</span><div className="how-grid"><HowCard number="01" title="Validar" copy="Confira cabeçalhos, linhas válidas e possíveis problemas."/><HowCard number="02" title="Comparar" copy="Valores, datas e descrições formam candidatos explicáveis."/><HowCard number="03" title="Revisar" copy="Você confirma ou ignora cada caso incerto."/></div></section>
         </> : <>
           <section className="results-heading"><div><span className="eyebrow">CONCILIAÇÃO LOCAL</span><h1>Visão geral</h1><p>Compare o resultado, refine o período e revise os casos sinalizados.</p></div><button className="button button-outline" onClick={() => setScreen('home')}>← Voltar aos arquivos</button></section>
+          <section className="results-sync-bar" aria-label="Sincronização das decisões"><div><strong role={googleDecisionStatus.startsWith('Decisões mantidas') ? 'alert' : 'status'} aria-live={googleDecisionStatus.startsWith('Decisões mantidas') ? 'assertive' : 'polite'}>{decisionSyncSummary}</strong><small>{googleSheetLink ? 'As decisões ficam neste dispositivo e sincronizam pela planilha vinculada.' : 'As decisões ficam salvas neste dispositivo.'}</small></div>{googleSheetInfo?.connected ? <button className="button button-outline" disabled={googleDecisionStatus === 'Sincronizando decisões…'} onClick={syncDecisionsManually}>{googleDecisionStatus === 'Sincronizando decisões…' ? 'Sincronizando…' : 'Sincronizar decisões'}</button> : googleSheetLink ? <button className="button button-outline" onClick={() => setScreen('home')}>Reconectar Google</button> : null}</section>
           <FilterBar years={years} year={filterYear} month={filterMonth} fromDate={fromDate} toDate={toDate} onYear={setFilterYear} onMonth={setFilterMonth} onFrom={setFromDate} onTo={setToDate}/>
           <div className="stat-grid">
             <Metric label="Conciliadas" value={filteredItems.filter((item) => item.status === 'MATCHED').length} tone="green" icon="✓" onClick={() => setTab('overview')}/>
@@ -563,9 +637,11 @@ export default function App() {
           {tab === 'duplicates' && <section className="panel"><PanelTitle title="Possíveis duplicidades na CUSTOS ANO" note="Sugestões baseadas em lançamentos da planilha; nada é removido automaticamente"/>{filteredDuplicates.length ? filteredDuplicates.map((group, index) => <div className="issue-row duplicate-group" key={`${group.source}-${index}`}><span className="status-icon orange">Ⅱ</span><div><strong>Confira este grupo · {group.transactionIds.length} lançamentos</strong>{group.transactionIds.map((id) => { const sheet = data.sheet.find((entry) => entry.id === id); return sheet ? <p className="duplicate-entry" key={id}>{dateLabel(sheet.date)} · {sheet.originalDescription} · {formatCents(sheet.amount)}{sheet.paymentMethod ? ` · ${sheet.paymentMethod}` : ''}</p> : null })}<small>Possíveis duplicidades precisam de confirmação manual.</small></div></div>) : <EmptyState title="Nenhuma duplicidade sugerida" copy="Nenhuma linha da CUSTOS ANO com data, valor e descrição parecida foi encontrada."/>}</section>}
           {tab === 'flags' && <section className="panel"><PanelTitle title="Lançamentos da planilha não encontrados no extrato" note="Podem pertencer a outra conta, período ou meio de pagamento"/>{unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).length ? unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).map((sheet) => <div className="issue-row" key={sheet.id}><span className="status-icon blue">↗</span><div><strong>{sheet.originalDescription}</strong><p>{dateLabel(sheet.date)} · {formatCents(sheet.amount)} · {sheet.category || 'Sem categoria'}</p><small>Não encontrado no extrato importado.</small><button className="text-button" onClick={() => ignoreSheet(sheet.id)}>Ignorar este lançamento</button></div></div>) : <EmptyState title="Sem sinalizações" copy="Não há lançamentos da planilha pendentes neste período."/>}</section>}
           <ExportBar result={{ ...result, duplicateGroups: filteredDuplicates }} items={filteredItems} banks={data.bank} sheets={data.sheet}/>
-          <footer className="results-footer"><span>▣ Confirmações salvas somente neste dispositivo.</span><button className="text-button" onClick={clearSession}>Limpar dados desta sessão</button><button className="text-button" onClick={() => void clearSavedDecisions()}>Limpar confirmações salvas</button></footer>
+          <footer className="results-footer"><span>▣ Confirmações salvas neste dispositivo{googleSheetLink ? ' e sincronizadas quando Google está conectado.' : '.'}</span><button className="text-button" onClick={clearSession}>Limpar dados desta sessão</button><button className="text-button" onClick={() => void clearSavedDecisions()}>Limpar confirmações salvas</button></footer>
         </>}
       </main>
+      {screen === 'home' && showStickyReconcile && <div className="sticky-reconcile" aria-label="Ação de conciliação"><button className="button button-primary button-launch" aria-label="Conciliar agora" onClick={runReconciliation} disabled={!canReconcile || !decisionsReady}>Conciliar agora <span aria-hidden="true">↗</span></button></div>}
+      <PwaUpdateNotice />
       <footer className="site-footer"><span>Conciliador Financeiro <span>·</span> Extratos e PDFs permanecem no dispositivo.</span><span>Aplicação local · CSV, Google Sheets e fatura PDF</span></footer>
     </div>
   )

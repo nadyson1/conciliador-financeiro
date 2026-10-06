@@ -15,6 +15,7 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: 'prompt',
+      injectRegister: false,
       includeAssets: ['favicon.svg'],
       manifest: {
         name: 'Conciliador Financeiro',
@@ -31,6 +32,9 @@ export default defineConfig({
         ]
       },
       workbox: {
+        clientsClaim: true,
+        skipWaiting: false,
+        cleanupOutdatedCaches: true,
         globPatterns: ['**/*.{js,mjs,css,html,svg,png,ico,woff2}'],
         navigateFallback: 'index.html',
         runtimeCaching: []
