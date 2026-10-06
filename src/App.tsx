@@ -642,7 +642,7 @@ export default function App() {
       </main>
       {screen === 'home' && showStickyReconcile && <div className="sticky-reconcile" aria-label="Ação de conciliação"><button className="button button-primary button-launch" aria-label="Conciliar agora" onClick={runReconciliation} disabled={!canReconcile || !decisionsReady}>Conciliar agora <span aria-hidden="true">↗</span></button></div>}
       <PwaUpdateNotice />
-      <footer className="site-footer"><span>Conciliador Financeiro <span>·</span> Extratos e PDFs permanecem no dispositivo.</span><span>Aplicação local · CSV, Google Sheets e fatura PDF</span></footer>
+      <footer className="site-footer"><span>Conciliador Financeiro <span>·</span> Extratos e PDFs permanecem no dispositivo.</span><span>Aplicação local · CSV, Google Sheets e fatura PDF</span><span>Build de teste PWA</span></footer>
     </div>
   )
 }
