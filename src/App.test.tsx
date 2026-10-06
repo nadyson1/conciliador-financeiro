@@ -21,7 +21,7 @@ const syntheticStatement: CardStatement = {
 
 const savedDecisionStore = vi.hoisted(() => new Map<string, { key: string; schemaVersion: 1; kind: string; identities: string[]; selected: string[]; updatedAt: string }>())
 const googleSheetsMocks = vi.hoisted(() => ({ read: vi.fn(), append: vi.fn(), requestToken: vi.fn(), revoke: vi.fn() }))
-const decisionSyncMocks = vi.hoisted(() => ({ sync: vi.fn(), save: vi.fn(), deletion: vi.fn() }))
+const decisionSyncMocks = vi.hoisted(() => ({ sync: vi.fn(), save: vi.fn(), deletion: vi.fn(), tombstone: vi.fn() }))
 
 vi.mock('./domain/localDecisions', () => ({
   decisionKey: (kind: string, identities: string[]) => `${kind}:${JSON.stringify(identities)}`,
@@ -32,7 +32,7 @@ vi.mock('./domain/localDecisions', () => ({
 }))
 
 vi.mock('./integrations/googleSheetDecisions', () => ({
-  addDecisionTombstone: vi.fn(), listDecisionTombstones: () => ({}), removeDecisionTombstone: vi.fn(),
+  addDecisionTombstone: decisionSyncMocks.tombstone, listDecisionTombstones: () => ({}), removeDecisionTombstone: vi.fn(),
   syncGoogleSheetDecisions: decisionSyncMocks.sync, syncOneGoogleSheetDecision: decisionSyncMocks.save, syncOneGoogleSheetDeletion: decisionSyncMocks.deletion,
 }))
 
@@ -61,6 +61,7 @@ beforeEach(() => {
   decisionSyncMocks.sync.mockReset().mockImplementation(async (_id: string, _token: string, local: unknown[]) => local)
   decisionSyncMocks.save.mockReset()
   decisionSyncMocks.deletion.mockReset()
+  decisionSyncMocks.tombstone.mockReset()
   vi.mocked(readCardStatementPdf).mockReset()
   vi.mocked(readCardStatementPdf).mockImplementation(async () => syntheticStatement)
   vi.mocked(requestGoogleSheetsAccessToken).mockResolvedValue('test-access-token')
@@ -449,6 +450,53 @@ describe('fluxo completo no navegador', () => {
     expect(appendCostYearRecord).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', expect.objectContaining({ date: '2025-06-11', paymentMethod: 'Crédito_Bradesco' }))
     expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED' && decision.identities[0].startsWith('statement-example-') && decision.selected[0] === 'added-card-row')).toBe(true)
     expect(screen.queryAllByText('COMPRA DE CARTÃO NÃO REGISTRADA')).toHaveLength(1)
+  })
+
+  it('bloqueia o append se a releitura encontrar um lançamento provável que surgiu após a conciliação', async () => {
+    const user = userEvent.setup()
+    const category = { id: 'category-row', source: 'SHEET' as const, sheetRecordId: 'category-row', bankTransactionId: null, date: '2026-01-01', description: 'Escola', originalDescription: 'Escola', amount: 9000, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const candidate = { ...category, id: 'kindle-existing', sheetRecordId: 'kindle-existing', date: '2025-07-12', description: 'Assinatura Kindle unlimited (2 meses)', originalDescription: 'Assinatura Kindle unlimited (2 meses)', amount: 299, paymentMethod: 'Crédito_Bradesco', type: 'OTHER' as const }
+    const statement: CardStatement = { ...structuredClone(syntheticStatement), transactions: [{ ...syntheticStatement.transactions[0], id: 'kindle-card', date: '2025-06-02', purchaseDate: '2025-06-02', invoiceDueDate: '2025-07-12', statementDueDate: '2025-07-12', description: 'Amazon Kindle Unltd', originalDescription: 'Amazon Kindle Unltd', amount: 299 }] }
+    vi.mocked(readCardStatementPdf).mockResolvedValueOnce(statement)
+    googleSheetsMocks.read.mockResolvedValueOnce({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [category], rowCount: 1 })
+      .mockResolvedValueOnce({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [category, candidate], rowCount: 2 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic'], 'kindle.pdf', { type: 'application/pdf' }))
+    await screen.findByText(/PDF lido · 2 páginas/)
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    const cardRow = screen.getByText(/Amazon Kindle Unltd/).closest('article')!
+    await user.click(within(cardRow).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    await user.selectOptions(screen.getByLabelText('Categoria'), 'Casa')
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(await screen.findByText(/Já existe um lançamento provável na CUSTOS ANO/)).toBeInTheDocument()
+    expect(appendCostYearRecord).not.toHaveBeenCalled()
+    expect(await screen.findByText(/CUSTOS ANO: 12\/07\/2025 · Assinatura Kindle unlimited/)).toBeInTheDocument()
+    const refreshedCard = screen.getByText(/Amazon Kindle Unltd/).closest('article')!
+    expect(within(refreshedCard).getByRole('button', { name: 'Confirmar este lançamento' })).toBeInTheDocument()
+    await user.click(within(refreshedCard).getByRole('button', { name: 'Confirmar este lançamento' }))
+    await waitFor(() => expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED' && decision.selected[0] === 'kindle-existing')).toBe(true))
+  })
+
+  it('remove confirmação MISSING_ADDED_TO_SHEET órfã quando a linha já não existe na CUSTOS ANO', async () => {
+    const user = userEvent.setup()
+    const orphan = { key: 'MISSING_ADDED_TO_SHEET:["doc:orphan-bank"]', schemaVersion: 1 as const, kind: 'MISSING_ADDED_TO_SHEET', identities: ['doc:orphan-bank'], selected: ['deleted-sheet-row'], updatedAt: new Date().toISOString() }
+    savedDecisionStore.set(orphan.key, orphan)
+    const category = { id: 'category-row', source: 'SHEET' as const, sheetRecordId: 'category-row', bankTransactionId: null, date: '2026-01-01', description: 'Escola', originalDescription: 'Escola', amount: 9000, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha com linha removida', transactions: [category], rowCount: 1 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha com linha removida', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await waitFor(() => expect(savedDecisionStore.has(orphan.key)).toBe(false))
+    expect(decisionSyncMocks.tombstone).toHaveBeenCalledWith(orphan)
+    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo,ID\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito,orphan-bank'], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    expect(screen.getByText('PIX ENVIADO MERCADO')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Adicionar à CUSTOS ANO' })).toBeInTheDocument()
   })
 
   it('usa a data real da compra como fallback quando falta vencimento, sem usar fechamento', async () => {

@@ -42,6 +42,13 @@ describe('CSV local e formatos brasileiros', () => {
     expect(descriptionSimilarity('MERCADO CENTRAL', 'ESCOLA INFANTIL')).toBeLessThan(0.2)
   })
 
+  it('compara abreviações, tokens concatenados e palavras extras de descrições humanas sem marcas específicas', () => {
+    expect(descriptionSimilarity('Amazon Kindle Unltd', 'Assinatura Kindle unlimited (2 meses)')).toBeGreaterThan(0.35)
+    expect(descriptionSimilarity('SELFITHOMEROCASTELOBRA', 'Mensalidade Selfit')).toBeGreaterThan(0.4)
+    expect(descriptionSimilarity('ASAAS*OFICINA CR', 'Oficina Criativa Renovação')).toBeGreaterThan(0.3)
+    expect(descriptionSimilarity('Restaurante Central', 'Escola Infantil')).toBeLessThan(0.2)
+  })
+
   it('detecta títulos variados sem depender de acentos ou caixa', () => {
     const headers = ['DESCRIÇÃO', 'Data lançamento', 'CUSTO', 'Mês', 'ANO', 'Forma de pagamento', 'É fixo?', 'É essencial?', 'ID']
     const map = initialColumnMap(headers, 'sheet')

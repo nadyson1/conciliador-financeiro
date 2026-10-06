@@ -87,6 +87,7 @@ export default function App() {
   const googleAutoReadAttempted = useRef(false)
   const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID ?? ''
   const [cardPdfs, setCardPdfs] = useState<CardPdfEntry[]>([])
+  const [cardReviewOverrides, setCardReviewOverrides] = useState<Record<string, LedgerTransaction[]>>({})
   const seenPdfFingerprints = useRef(new Set<string>())
   const pdfSessionGeneration = useRef(0)
   const [cardPdfNotice, setCardPdfNotice] = useState('')
@@ -203,6 +204,24 @@ export default function App() {
       setError('Não foi possível atualizar as decisões salvas neste dispositivo.')
     }
   }
+
+  const orphanDecisionCleanup = useRef(new Set<string>())
+  useEffect(() => {
+    if (!decisionsReady || sourceStatus.sheet !== 'ACCEPTED' || (sheetSource !== 'google' && googleSheetRows === null)) return
+    const truthRows = googleSheetRows ?? data.sheet
+    const liveSheetIdentities = new Set(truthRows.map(sheetIdentity))
+    const liveBankIdentities = new Set(data.bank.map(bankIdentity))
+    const orphans = savedDecisions.filter((decision) => decision.kind === 'MISSING_ADDED_TO_SHEET'
+      && decision.selected[0]
+      && !liveSheetIdentities.has(decision.selected[0])
+      && !orphanDecisionCleanup.current.has(decision.key))
+    for (const decision of orphans) {
+      orphanDecisionCleanup.current.add(decision.key)
+      void removeDecision('MISSING_ADDED_TO_SHEET', decision.identities).finally(() => orphanDecisionCleanup.current.delete(decision.key))
+    }
+    setLocallyAddedMissingPairs((current) => Object.fromEntries(Object.entries(current).filter(([bankKey, sheetKey]) =>
+      liveBankIdentities.has(bankKey) && liveSheetIdentities.has(sheetKey))))
+  }, [decisionsReady, sourceStatus.sheet, sheetSource, googleSheetRows, data, savedDecisions])
 
   async function clearSavedDecisions() {
     if (!window.confirm('Apagar as confirmações e decisões salvas neste dispositivo e sincronizar a remoção com os outros dispositivos quando houver conexão? Esta ação não pode ser desfeita.')) return
@@ -412,7 +431,6 @@ export default function App() {
         const bank = data.bank.find((item) => bankIdentity(item) === record.identities[0])
         const sheet = data.sheet.find((item) => sheetIdentity(item) === record.selected[0])
         if (bank && sheet) confirmedPairs.set(bank.id, sheet.id)
-        else if (bank) ignoredBankIds.add(bank.id)
       }
       if (record.kind === 'COMPOSITION_CONFIRMED' && (record.identities[1] === 'no-statement' || cardPdfs.some((entry) => entry.statement && (entry.statement.statementIdentity === record.identities[1] || entry.legacyStatementIdentity === record.identities[1])))) {
         const bank = data.bank.find((item) => bankIdentity(item) === record.identities[0])
@@ -424,7 +442,6 @@ export default function App() {
       const bank = data.bank.find((item) => bankIdentity(item) === bankKey)
       const sheet = data.sheet.find((item) => sheetIdentity(item) === sheetKey)
       if (bank && sheet) confirmedPairs.set(bank.id, sheet.id)
-      else if (bank) ignoredBankIds.add(bank.id)
     }
     return { ignoredBankIds, ignoredSheetIdentities, rejectedPairKeys, confirmedPairs, confirmedCompositions, cardMissingConfirmed }
   }, [savedDecisions, data, cardPdfs, locallyAddedMissingPairs])
@@ -452,10 +469,18 @@ export default function App() {
         if (transaction) confirmedMissing.add(cardTransactionIdentity(entry.statement, transaction))
       }
       const result = reconcileCardStatement(entry.statement, data.sheet.filter((sheet) => !usedSheetIds.has(sheet.id)), confirmations)
-      result.matches.filter((match) => match.status === 'CARD_MATCHED' && match.sheet).forEach((match) => usedSheetIds.add(match.sheet!.id))
-      return { entry, statement: entry.statement, payment: statementPayments.get(entry.statement) ?? null, matches: result.matches, confirmations, confirmedMissing, extractedTotal: entry.statement.purchasesDebitsTotal ?? entry.statement.transactions.filter((transaction) => transaction.type === 'PURCHASE').reduce((sum, transaction) => sum + transaction.amount, 0), matchedTotal: result.eligibleSheetTotal, difference: result.difference }
+      const matches = result.matches.map((match) => {
+        const candidates = cardReviewOverrides[cardTransactionIdentity(entry.statement, match.transaction)]
+        return candidates?.length && !confirmations.has(match.transaction.id)
+          ? { ...match, status: 'CARD_REVIEW' as const, sheet: null, candidates }
+          : match
+      })
+      matches.filter((match) => match.status === 'CARD_MATCHED' && match.sheet).forEach((match) => usedSheetIds.add(match.sheet!.id))
+      const matchedTotal = matches.filter((match) => match.status === 'CARD_MATCHED' && match.sheet).reduce((sum, match) => sum + match.sheet!.amount, 0)
+      const extractedTotal = entry.statement.purchasesDebitsTotal ?? entry.statement.transactions.filter((transaction) => transaction.type === 'PURCHASE').reduce((sum, transaction) => sum + transaction.amount, 0)
+      return { entry, statement: entry.statement, payment: statementPayments.get(entry.statement) ?? null, matches, confirmations, confirmedMissing, extractedTotal, matchedTotal, difference: extractedTotal - matchedTotal }
     })
-  }, [cardPdfs, data.sheet, savedDecisions, statementPayments])
+  }, [cardPdfs, data.sheet, savedDecisions, statementPayments, cardReviewOverrides])
   const years = useMemo(() => [...new Set([...data.bank.map((item) => item.year), ...data.sheet.map((item) => item.year)].filter(Boolean))].sort().reverse(), [data])
   const filteredItems = useMemo(() => result.items.filter(({ bank }) => inPeriod(bank, filterYear, filterMonth, fromDate, toDate)), [result.items, filterYear, filterMonth, fromDate, toDate])
   const filteredDuplicates = useMemo(() => result.duplicateGroups.filter((group) => inDatePeriod(group.date, filterYear, filterMonth, fromDate, toDate)), [result.duplicateGroups, filterYear, filterMonth, fromDate, toDate])
@@ -637,6 +662,36 @@ export default function App() {
     writingMissingRef.current.add(targetKey)
     setWritingMissingId(targetKey); setMissingWriteError('')
     try {
+      if (target.kind === 'STATEMENT') {
+        const latest = await readGoogleSheetLedger(googleSheetLink.spreadsheetId, googleAccessToken.current)
+        const confirmedStatementMatches = savedDecisions.filter((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED')
+        const orderedEntries = cardPdfs.filter((entry): entry is CardPdfEntry & { statement: CardStatement } => entry.statement != null)
+          .sort((a, b) => (a.statement.dueDate ?? '').localeCompare(b.statement.dueDate ?? '') || a.key.localeCompare(b.key))
+        const usedSheetIds = new Set<string>()
+        let latestTargetMatch: CardStatementMatch | undefined
+        for (const entry of orderedEntries) {
+          const confirmations = new Map<string, string>()
+          for (const decision of confirmedStatementMatches) {
+            const transaction = entry.statement.transactions.find((item) => cardTransactionIdentity(entry.statement!, item) === decision.identities[0]
+              || (entry.legacyStatementIdentity && cardTransactionIdentity(entry.legacyStatementIdentity, item) === decision.identities[0]))
+            const row = latest.transactions.find((item) => sheetIdentity(item) === decision.selected[0])
+            if (transaction && row) confirmations.set(transaction.id, row.id)
+          }
+          const freshResult = reconcileCardStatement(entry.statement, latest.transactions.filter((row) => !usedSheetIds.has(row.id)), confirmations)
+          freshResult.matches.filter((match) => match.status === 'CARD_MATCHED' && match.sheet).forEach((match) => usedSheetIds.add(match.sheet!.id))
+          if (entry.statement.statementIdentity === target.statement.statementIdentity) latestTargetMatch = freshResult.matches.find((match) => match.transaction.id === target.transaction.id)
+        }
+        if (latestTargetMatch && ['CARD_MATCHED', 'CARD_REVIEW'].includes(latestTargetMatch.status)) {
+          const candidateRows = latestTargetMatch.sheet ? [latestTargetMatch.sheet] : latestTargetMatch.candidates
+          setCardReviewOverrides((current) => ({ ...current, [targetKey]: candidateRows }))
+          setGoogleSheetRows(latest.transactions)
+          setData((currentData) => ({ ...currentData, sheet: latest.transactions }))
+          setSourceStatus((currentStatus) => ({ ...currentStatus, sheet: 'ACCEPTED' }))
+          setMissingWriteNotice('Já existe um lançamento provável na CUSTOS ANO. A inclusão foi bloqueada; confira e vincule o candidato encontrado.')
+          setMissingToAdd(null)
+          return
+        }
+      }
       const appended = await appendCostYearRecord(googleSheetLink.spreadsheetId, googleAccessToken.current, record)
       const nextLink: SavedGoogleSheetLink = { ...googleSheetLink, spreadsheetTitle: appended.spreadsheetTitle, sheetName: GOOGLE_SHEET_TAB_NAME, lastUpdated: new Date().toISOString(), autoConnect: true }
       setGoogleSheetLink(nextLink); saveGoogleSheetLink(nextLink)
@@ -678,7 +733,11 @@ export default function App() {
 
   function confirmStatementMatch(statement: CardStatement, transactionId: string, sheetId: string) {
     const transaction = statement.transactions.find((item) => item.id === transactionId), sheet = data.sheet.find((item) => item.id === sheetId)
-    if (transaction && sheet) void persistDecision('STATEMENT_MATCH_CONFIRMED', [cardTransactionIdentity(statement, transaction)], [sheetIdentity(sheet)])
+    if (transaction && sheet) {
+      const identity = cardTransactionIdentity(statement, transaction)
+      setCardReviewOverrides((current) => { const next = { ...current }; delete next[identity]; return next })
+      void persistDecision('STATEMENT_MATCH_CONFIRMED', [identity], [sheetIdentity(sheet)])
+    }
   }
 
   function confirmCardMissing(statement: CardStatement, transactionId: string) {

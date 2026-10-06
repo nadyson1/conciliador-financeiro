@@ -79,12 +79,37 @@ export function descriptionSimilarity(left: string, right: string): number {
   const b = normalizeDescription(right)
   if (!a || !b) return 0
   if (a === b) return 1
-  const ta = new Set(a.split(' ').filter((token) => token.length > 1))
-  const tb = new Set(b.split(' ').filter((token) => token.length > 1))
-  if (!ta.size || !tb.size) return 0
-  const intersection = [...ta].filter((token) => tb.has(token)).length
-  const dice = (2 * intersection) / (ta.size + tb.size)
-  const containment = intersection / Math.min(ta.size, tb.size)
+  const ta = a.split(' ').filter((token) => token.length > 1)
+  const tb = b.split(' ').filter((token) => token.length > 1)
+  if (!ta.length || !tb.length) return 0
+  const compatible = (leftToken: string, rightToken: string) => {
+    if (leftToken === rightToken) return 1
+    const shorter = leftToken.length <= rightToken.length ? leftToken : rightToken
+    const longer = leftToken.length <= rightToken.length ? rightToken : leftToken
+    // Bank exports often concatenate merchant/store names into a single token.
+    if (shorter.length >= 5 && longer.includes(shorter)) return 0.85
+    // Prefixes and compact abbreviations are useful evidence, but only for meaningful tokens.
+    if (shorter.length >= 2 && longer.startsWith(shorter)) return shorter.length >= 4 ? 0.8 : 0.55
+    if (shorter.length >= 4 && shorter.length / longer.length >= 0.5) {
+      let position = 0
+      for (const character of longer) if (character === shorter[position]) position += 1
+      if (position === shorter.length) return 0.72
+    }
+    return 0
+  }
+  // One-to-one token assignment prevents repeated words from inflating the score.
+  const pairs = ta.flatMap((leftToken, leftIndex) => tb.map((rightToken, rightIndex) => ({ leftIndex, rightIndex, score: compatible(leftToken, rightToken) })))
+    .filter((pair) => pair.score > 0).sort((leftPair, rightPair) => rightPair.score - leftPair.score)
+  const matchedLeft = new Set<number>(), matchedRight = new Set<number>()
+  let intersection = 0
+  for (const pair of pairs) {
+    if (matchedLeft.has(pair.leftIndex) || matchedRight.has(pair.rightIndex)) continue
+    matchedLeft.add(pair.leftIndex)
+    matchedRight.add(pair.rightIndex)
+    intersection += pair.score
+  }
+  const dice = (2 * intersection) / (ta.length + tb.length)
+  const containment = intersection / Math.min(ta.length, tb.length)
   return Math.max(dice, containment * 0.92)
 }
 

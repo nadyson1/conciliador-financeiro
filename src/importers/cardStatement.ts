@@ -336,13 +336,24 @@ function hasInstallmentSequence(candidate: LedgerTransaction, rows: LedgerTransa
 
 export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTransaction[], confirmedMatches: Map<string, string> = new Map()): CardStatementReconciliation {
   const purchases = statement.transactions.filter((transaction) => transaction.type === 'PURCHASE' && transaction.financialStatus !== 'REFUNDED')
-  const eligible = sheet.filter((item) => normalizeDescription(item.paymentMethod) === 'credito bradesco' && item.type === 'EXPENSE')
+  // Google Sheets descriptions are user-authored and may not have been classified
+  // as EXPENSE by the bank-oriented classifier. Keep the payment method as the
+  // primary scope, while explicitly excluding natures that cannot be purchases.
+  const eligible = sheet.filter((item) => normalizeDescription(item.paymentMethod) === 'credito bradesco'
+    && !['INVESTMENT', 'INVESTMENT_INCOME', 'INCOME', 'TRANSFER', 'CARD_PAYMENT'].includes(item.type))
   const isInstallment = (transaction: CardStatementTransaction) => transaction.installment != null && transaction.totalInstallments != null
   const purchaseDate = (transaction: CardStatementTransaction) => transaction.purchaseDate || transaction.date
   const invoiceDueDate = (transaction: CardStatementTransaction) => transaction.invoiceDueDate ?? transaction.statementDueDate ?? statement.dueDate
   const hasValidNonInstallmentDate = (transaction: CardStatementTransaction, item: LedgerTransaction) => {
     const dueDate = invoiceDueDate(transaction)
     return Boolean((dueDate && item.date === dueDate) || dayDistance(item.date, purchaseDate(transaction)) <= 7)
+  }
+  const nonInstallmentPlausible = (transaction: CardStatementTransaction, item: LedgerTransaction) => {
+    if (item.amount !== transaction.amount || !hasValidNonInstallmentDate(transaction, item)) return false
+    const similarity = descriptionSimilarity(transaction.originalDescription, item.originalDescription)
+    // The due date is a strong semantic anchor. A modest shared description signal
+    // is enough to prevent false MISSING, while weak candidates remain REVIEW.
+    return similarity >= 0.35
   }
   const installmentCandidate = (transaction: CardStatementTransaction, item: LedgerTransaction) => {
     if (!isInstallment(transaction) || item.amount !== transaction.amount) return false
@@ -356,14 +367,14 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
     const sheetId = confirmedMatches.get(transaction.id)
     const match = eligible.find((item) => item.id === sheetId && (isInstallment(transaction)
       ? installmentCandidate(transaction, item)
-      : item.amount === transaction.amount && hasValidNonInstallmentDate(transaction, item)))
+      : nonInstallmentPlausible(transaction, item)))
     if (match && !confirmedSheetIds.has(match.id)) { validConfirmed.set(transaction.id, match); confirmedSheetIds.add(match.id) }
   }
   const candidateSets = purchases.map((transaction) => {
     const available = eligible.filter((item) => !confirmedSheetIds.has(item.id) || validConfirmed.get(transaction.id)?.id === item.id)
     const plausible = isInstallment(transaction)
       ? available.filter((item) => installmentCandidate(transaction, item))
-      : available.filter((item) => item.amount === transaction.amount && hasValidNonInstallmentDate(transaction, item))
+      : available.filter((item) => nonInstallmentPlausible(transaction, item))
     const sorted = [...plausible].sort((a, b) => isInstallment(transaction)
       ? installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(b)?.description ?? b.originalDescription) - installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(a)?.description ?? a.originalDescription)
         || Number(hasInstallmentSequence(b, eligible)) - Number(hasInstallmentSequence(a, eligible))

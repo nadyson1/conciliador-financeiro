@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { BankTransaction, CardStatement, LedgerTransaction } from '../domain/types'
 import { identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
-import { reconcile } from '../matching/reconcile'
+import { findDuplicateGroups, reconcile } from '../matching/reconcile'
 
 const syntheticPages = [
   [
@@ -158,6 +158,51 @@ describe('PDF de fatura do cartão', () => {
     expect(result.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: { date: '2025-07-12' } })
     expect(result.matches[0].transaction.purchaseDate).toBe('2025-06-02')
     expect(result.matches[0].evidence).toContain('Data da planilha igual ao vencimento da fatura')
+  })
+
+  it('reconhece Kindle com descrição humana diferente na data de vencimento e não o classifica como ausente', () => {
+    const base = parseCardStatementPages(syntheticPages)
+    const purchase = { ...base.transactions[0], id: 'kindle-pdf', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description: 'Amazon Kindle Unltd', originalDescription: 'Amazon Kindle Unltd', amount: 299, installment: null, totalInstallments: null }
+    const statement = { ...base, dueDate: '2026-03-12', transactions: [purchase] }
+    const existing = { ...ledger('kindle-sheet', '2026-03-12', 'Assinatura Kindle unlimited (2 meses)', 299), type: 'OTHER' as const }
+    const result = reconcileCardStatement(statement, [existing])
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: { id: 'kindle-sheet' } })
+    expect(result.matches[0].candidates.map((item) => item.id)).toEqual(['kindle-sheet'])
+    expect(result.matches.some((match) => match.status === 'CARD_MISSING')).toBe(false)
+    expect(findDuplicateGroups([existing, ledger('kindle-duplicate', '2026-03-12', 'Assinatura Kindle', 299)])).toHaveLength(1)
+  })
+
+  it('reconhece descrições concatenadas e abreviadas sem regras específicas de marca', () => {
+    const base = parseCardStatementPages(syntheticPages)
+    const source = base.transactions[0]
+    const pairs = [
+      ['SELFITHOMEROCASTELOBRA', 'Mensalidade Selfit'],
+      ['ASAAS*OFICINA CR', 'Oficina Criativa Renovação'],
+    ]
+    for (const [pdfDescription, sheetDescription] of pairs) {
+      const purchase = { ...source, id: pdfDescription, date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', description: pdfDescription, originalDescription: pdfDescription, amount: 1000, installment: null, totalInstallments: null }
+      const statement = { ...base, dueDate: '2026-03-12', transactions: [purchase] }
+      const row = ledger(`row-${pdfDescription}`, '2026-03-12', sheetDescription, 1000)
+      expect(reconcileCardStatement(statement, [row]).matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: { id: row.id } })
+    }
+  })
+
+  it('mantém ambiguidade com dois candidatos compatíveis de mesmo valor e vencimento', () => {
+    const base = parseCardStatementPages(syntheticPages)
+    const purchase = { ...base.transactions[0], id: 'kindle-pdf', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description: 'Amazon Kindle Unltd', originalDescription: 'Amazon Kindle Unltd', amount: 299, installment: null, totalInstallments: null }
+    const statement = { ...base, dueDate: '2026-03-12', transactions: [purchase] }
+    const rows = [ledger('kindle-a', '2026-03-12', 'Assinatura Kindle unlimited (2 meses)', 299), ledger('kindle-b', '2026-03-12', 'Kindle Unlimited mensal', 299)]
+    expect(reconcileCardStatement(statement, rows).matches[0]).toMatchObject({ status: 'CARD_REVIEW', sheet: null })
+  })
+
+  it('não reutiliza a mesma linha para duas compras iguais da mesma fatura', () => {
+    const base = parseCardStatementPages(syntheticPages)
+    const first = { ...base.transactions[0], id: 'amazon-1', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', description: 'Amazon Kindle Unltd', originalDescription: 'Amazon Kindle Unltd', amount: 990, installment: null, totalInstallments: null }
+    const second = { ...first, id: 'amazon-2' }
+    const statement = { ...base, dueDate: '2026-03-12', transactions: [first, second] }
+    const result = reconcileCardStatement(statement, [ledger('one-kindle-row', '2026-03-12', 'Assinatura Kindle unlimited', 990)])
+    expect(result.matches.map((match) => match.status)).toEqual(['CARD_REVIEW', 'CARD_REVIEW'])
+    expect(result.matches.every((match) => match.sheet == null)).toBe(true)
   })
 
   it('aceita datas históricas próximas à compra quando a planilha não usa vencimento', () => {
