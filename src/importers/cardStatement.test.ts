@@ -205,6 +205,41 @@ describe('PDF de fatura do cartão', () => {
     expect(result.matches.every((match) => match.sheet == null)).toBe(true)
   })
 
+  it('concilia duas compras indistinguíveis contra exatamente duas linhas pelo grupo, sem inventar vínculos individuais', () => {
+    const base = parseCardStatementPages(syntheticPages)
+    const makePurchase = (id: string) => ({ ...base.transactions[0], id, date: '2026-02-09', purchaseDate: '2026-02-09', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description: 'Amazon Digital BR', originalDescription: 'Amazon Digital BR', amount: 990, installment: null, totalInstallments: null })
+    const statement = { ...base, dueDate: '2026-03-12', transactions: [makePurchase('amazon-digital-1'), makePurchase('amazon-digital-2')] }
+    const rows = [ledger('book-a', '2026-03-12', 'Livro Imparaveis Amazon', 990), ledger('book-b', '2026-03-12', 'Livro Manual do imparavel Amazon', 990)]
+    const result = reconcileCardStatement(statement, rows)
+    expect(result.matches.map((match) => match.status)).toEqual(['CARD_GROUP_MATCHED', 'CARD_GROUP_MATCHED'])
+    expect(result.matches.every((match) => match.sheet === null && match.candidates.length === 2)).toBe(true)
+    expect(result.eligibleSheetTotal).toBe(1980)
+    expect(result.difference).toBe(0)
+  })
+
+  it('não usa matching por multiplicidade quando as quantidades diferem ou há candidatos extras', () => {
+    const base = parseCardStatementPages(syntheticPages)
+    const makePurchase = (id: string) => ({ ...base.transactions[0], id, date: '2026-02-09', purchaseDate: '2026-02-09', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description: 'Amazon Digital BR', originalDescription: 'Amazon Digital BR', amount: 990, installment: null, totalInstallments: null })
+    const purchases = [makePurchase('amazon-digital-1'), makePurchase('amazon-digital-2')]
+    const statement = { ...base, dueDate: '2026-03-12', transactions: purchases }
+    const twoRows = [ledger('book-a', '2026-03-12', 'Livro Imparaveis Amazon', 990), ledger('book-b', '2026-03-12', 'Livro Manual do imparavel Amazon', 990)]
+    expect(reconcileCardStatement({ ...statement, transactions: [purchases[0]] }, twoRows).matches[0].status).toBe('CARD_REVIEW')
+    const threeRows = [...twoRows, ledger('book-c', '2026-03-12', 'Outro livro Amazon', 990)]
+    expect(reconcileCardStatement(statement, threeRows).matches.map((match) => match.status)).toEqual(['CARD_REVIEW', 'CARD_REVIEW'])
+  })
+
+  it('não inclui no grupo uma linha consumida por uma correspondência forte confirmada', () => {
+    const base = parseCardStatementPages(syntheticPages)
+    const makePurchase = (id: string, description = 'Amazon Digital BR') => ({ ...base.transactions[0], id, date: '2026-02-09', purchaseDate: '2026-02-09', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description, originalDescription: description, amount: 990, installment: null, totalInstallments: null })
+    const purchases = [makePurchase('amazon-1'), makePurchase('amazon-2'), makePurchase('book-specific', 'Livro Imparaveis Amazon Digital BR')]
+    const statement = { ...base, dueDate: '2026-03-12', transactions: purchases }
+    const rows = [ledger('book-a', '2026-03-12', 'Livro Imparaveis Amazon', 990), ledger('book-b', '2026-03-12', 'Livro Manual do imparavel Amazon', 990)]
+    const result = reconcileCardStatement(statement, rows, new Map([['book-specific', 'book-a']]))
+    expect(result.matches.find((match) => match.transaction.id === 'book-specific')?.status).toBe('CARD_MATCHED')
+    expect(result.matches.filter((match) => match.transaction.id !== 'book-specific').map((match) => match.status)).toEqual(['CARD_REVIEW', 'CARD_REVIEW'])
+    expect(result.matches.some((match) => match.status === 'CARD_GROUP_MATCHED')).toBe(false)
+  })
+
   it('aceita datas históricas próximas à compra quando a planilha não usa vencimento', () => {
     const statement = parseCardStatementPages(syntheticPages)
     const purchase = { ...statement.transactions[0], installment: null, totalInstallments: null }

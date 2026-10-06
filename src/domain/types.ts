@@ -166,7 +166,7 @@ export interface CardStatement {
 
 export interface CardStatementMatch {
   transaction: CardStatementTransaction
-  status: 'CARD_MATCHED' | 'CARD_REVIEW' | 'CARD_MISSING' | 'CARD_MISSING_CONFIRMED' | 'CARD_REFUNDED'
+  status: 'CARD_MATCHED' | 'CARD_GROUP_MATCHED' | 'CARD_REVIEW' | 'CARD_MISSING' | 'CARD_MISSING_CONFIRMED' | 'CARD_REFUNDED'
   sheet: LedgerTransaction | null
   candidates: LedgerTransaction[]
   evidence?: string[]

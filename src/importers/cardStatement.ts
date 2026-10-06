@@ -334,60 +334,87 @@ function hasInstallmentSequence(candidate: LedgerTransaction, rows: LedgerTransa
   })
 }
 
+function isCardCostRow(item: LedgerTransaction) {
+  return normalizeDescription(item.paymentMethod) === 'credito bradesco'
+    && !['INVESTMENT', 'INVESTMENT_INCOME', 'INCOME', 'TRANSFER', 'CARD_PAYMENT'].includes(item.type)
+}
+
+/** Shared candidate search used by reconciliation and the pre-write guard. */
+export function findExistingCostYearCandidates(statement: CardStatement, transaction: CardStatementTransaction, sheet: LedgerTransaction[]): LedgerTransaction[] {
+  if (transaction.type !== 'PURCHASE' || transaction.financialStatus === 'REFUNDED') return []
+  const eligible = sheet.filter(isCardCostRow)
+  const isInstallment = transaction.installment != null && transaction.totalInstallments != null
+  const purchaseDate = transaction.purchaseDate || transaction.date
+  const invoiceDueDate = transaction.invoiceDueDate ?? transaction.statementDueDate ?? statement.dueDate
+  const installmentCandidate = (item: LedgerTransaction) => {
+    if (!isInstallment || item.amount !== transaction.amount) return false
+    const info = installmentInfo(item)
+    return Boolean(info && info.installment === transaction.installment && info.total === transaction.totalInstallments
+      && installmentDescriptionSimilarity(transaction.originalDescription, info.description) >= 0.35)
+  }
+  const nonInstallmentCandidate = (item: LedgerTransaction) => {
+    if (isInstallment || item.amount !== transaction.amount) return false
+    if (!((invoiceDueDate && item.date === invoiceDueDate) || dayDistance(item.date, purchaseDate) <= 7)) return false
+    const similarity = descriptionSimilarity(transaction.originalDescription, item.originalDescription)
+    return similarity >= (item.date === invoiceDueDate ? 0.3 : 0.35)
+  }
+  return eligible.filter(isInstallment ? installmentCandidate : nonInstallmentCandidate).sort((a, b) => isInstallment
+    ? installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(b)?.description ?? b.originalDescription) - installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(a)?.description ?? a.originalDescription)
+      || Number(hasInstallmentSequence(b, eligible)) - Number(hasInstallmentSequence(a, eligible))
+    : Number(b.date === invoiceDueDate) - Number(a.date === invoiceDueDate)
+      || dayDistance(a.date, purchaseDate) - dayDistance(b.date, purchaseDate)
+      || descriptionSimilarity(transaction.originalDescription, b.originalDescription) - descriptionSimilarity(transaction.originalDescription, a.originalDescription))
+}
+
 export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTransaction[], confirmedMatches: Map<string, string> = new Map()): CardStatementReconciliation {
   const purchases = statement.transactions.filter((transaction) => transaction.type === 'PURCHASE' && transaction.financialStatus !== 'REFUNDED')
   // Google Sheets descriptions are user-authored and may not have been classified
   // as EXPENSE by the bank-oriented classifier. Keep the payment method as the
   // primary scope, while explicitly excluding natures that cannot be purchases.
-  const eligible = sheet.filter((item) => normalizeDescription(item.paymentMethod) === 'credito bradesco'
-    && !['INVESTMENT', 'INVESTMENT_INCOME', 'INCOME', 'TRANSFER', 'CARD_PAYMENT'].includes(item.type))
+  const eligible = sheet.filter(isCardCostRow)
   const isInstallment = (transaction: CardStatementTransaction) => transaction.installment != null && transaction.totalInstallments != null
-  const purchaseDate = (transaction: CardStatementTransaction) => transaction.purchaseDate || transaction.date
   const invoiceDueDate = (transaction: CardStatementTransaction) => transaction.invoiceDueDate ?? transaction.statementDueDate ?? statement.dueDate
-  const hasValidNonInstallmentDate = (transaction: CardStatementTransaction, item: LedgerTransaction) => {
-    const dueDate = invoiceDueDate(transaction)
-    return Boolean((dueDate && item.date === dueDate) || dayDistance(item.date, purchaseDate(transaction)) <= 7)
-  }
-  const nonInstallmentPlausible = (transaction: CardStatementTransaction, item: LedgerTransaction) => {
-    if (item.amount !== transaction.amount || !hasValidNonInstallmentDate(transaction, item)) return false
-    const similarity = descriptionSimilarity(transaction.originalDescription, item.originalDescription)
-    // The due date is a strong semantic anchor. A modest shared description signal
-    // is enough to prevent false MISSING, while weak candidates remain REVIEW.
-    return similarity >= 0.35
-  }
-  const installmentCandidate = (transaction: CardStatementTransaction, item: LedgerTransaction) => {
-    if (!isInstallment(transaction) || item.amount !== transaction.amount) return false
-    const info = installmentInfo(item)
-    return Boolean(info && info.installment === transaction.installment && info.total === transaction.totalInstallments
-      && installmentDescriptionSimilarity(transaction.originalDescription, info.description) >= 0.35)
-  }
+  const purchaseDate = (transaction: CardStatementTransaction) => transaction.purchaseDate || transaction.date
+  const candidateSearch = (transaction: CardStatementTransaction, rows: LedgerTransaction[]) => findExistingCostYearCandidates(statement, transaction, rows)
   const confirmedSheetIds = new Set<string>()
   const validConfirmed = new Map<string, LedgerTransaction>()
   for (const transaction of purchases) {
     const sheetId = confirmedMatches.get(transaction.id)
-    const match = eligible.find((item) => item.id === sheetId && (isInstallment(transaction)
-      ? installmentCandidate(transaction, item)
-      : nonInstallmentPlausible(transaction, item)))
+    const match = candidateSearch(transaction, eligible).find((item) => item.id === sheetId)
     if (match && !confirmedSheetIds.has(match.id)) { validConfirmed.set(transaction.id, match); confirmedSheetIds.add(match.id) }
   }
   const candidateSets = purchases.map((transaction) => {
     const available = eligible.filter((item) => !confirmedSheetIds.has(item.id) || validConfirmed.get(transaction.id)?.id === item.id)
-    const plausible = isInstallment(transaction)
-      ? available.filter((item) => installmentCandidate(transaction, item))
-      : available.filter((item) => nonInstallmentPlausible(transaction, item))
-    const sorted = [...plausible].sort((a, b) => isInstallment(transaction)
-      ? installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(b)?.description ?? b.originalDescription) - installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(a)?.description ?? a.originalDescription)
-        || Number(hasInstallmentSequence(b, eligible)) - Number(hasInstallmentSequence(a, eligible))
-      : Number(b.date === invoiceDueDate(transaction)) - Number(a.date === invoiceDueDate(transaction))
-        || dayDistance(a.date, purchaseDate(transaction)) - dayDistance(b.date, purchaseDate(transaction))
-        || descriptionSimilarity(transaction.originalDescription, b.originalDescription) - descriptionSimilarity(transaction.originalDescription, a.originalDescription))
+    const sorted = candidateSearch(transaction, available)
     return { transaction, sorted, sequenceFound: isInstallment(transaction) && sorted.some((item) => hasInstallmentSequence(item, eligible)) }
   })
   const usageCounts = new Map<string, number>()
   candidateSets.forEach(({ sorted }) => sorted.forEach((candidate) => usageCounts.set(candidate.id, (usageCounts.get(candidate.id) ?? 0) + 1)))
+  const groupMatches = new Map<string, LedgerTransaction[]>()
+  const grouped = new Set<string>()
+  for (const seed of candidateSets) {
+    if (grouped.has(seed.transaction.id) || isInstallment(seed.transaction) || seed.sorted.length < 2 || validConfirmed.has(seed.transaction.id)) continue
+    const dueDate = invoiceDueDate(seed.transaction)
+    const peers = candidateSets.filter((item) => !grouped.has(item.transaction.id) && !isInstallment(item.transaction)
+      && !validConfirmed.has(item.transaction.id) && item.transaction.amount === seed.transaction.amount
+      && invoiceDueDate(item.transaction) === dueDate && dueDate != null
+      && descriptionSimilarity(seed.transaction.originalDescription, item.transaction.originalDescription) >= 0.35)
+    if (peers.length < 2) continue
+    const peerIds = new Set(peers.map((item) => item.transaction.id))
+    const candidateIds = new Set(peers.flatMap((item) => item.sorted.map((candidate) => candidate.id)))
+    if (candidateIds.size !== peers.length || peers.some((item) => item.sorted.length !== candidateIds.size
+      || item.sorted.some((candidate) => !candidateIds.has(candidate.id)))) continue
+    const competingPurchase = candidateSets.some((item) => !peerIds.has(item.transaction.id)
+      && item.sorted.some((candidate) => candidateIds.has(candidate.id)))
+    if (competingPurchase) continue
+    const rows = eligible.filter((item) => candidateIds.has(item.id))
+    if (rows.length !== peers.length) continue
+    peers.forEach((item) => { grouped.add(item.transaction.id); groupMatches.set(item.transaction.id, rows) })
+  }
   const matches: CardStatementMatch[] = statement.transactions.filter((transaction) => transaction.type === 'PURCHASE').map((transaction) => {
     if (transaction.financialStatus === 'REFUNDED') return { transaction, status: 'CARD_REFUNDED', sheet: null, candidates: [] }
     const { sorted, sequenceFound } = candidateSets.find((set) => set.transaction.id === transaction.id)!
+    const group = groupMatches.get(transaction.id)
     const confirmed = validConfirmed.get(transaction.id)
     const evidence = isInstallment(transaction) ? [
       'Valor exato',
@@ -401,6 +428,7 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
       ...(descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35 ? ['Descrição compatível'] : []),
       ...(sorted[0].date === invoiceDueDate(transaction) ? ['Data da planilha igual ao vencimento da fatura'] : ['Data próxima à compra (registro histórico)']),
     ] : undefined
+    if (group) return { transaction, status: 'CARD_GROUP_MATCHED', sheet: null, candidates: group, evidence: ['Valor exato', 'Crédito_Bradesco', 'Vencimento da fatura', 'Grupo conciliado pela mesma quantidade de lançamentos'] }
     if (confirmed) return { transaction, status: 'CARD_MATCHED', sheet: confirmed, candidates: [confirmed], evidence }
     if (!sorted.length) return { transaction, status: 'CARD_MISSING', sheet: null, candidates: [] }
     const unique = sorted.length === 1 && (usageCounts.get(sorted[0].id) ?? 0) === 1
@@ -411,7 +439,7 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
     if (unique && (dueDateMatch || dayDistance(sorted[0].date, purchaseDate(transaction)) <= 3) && descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
     return { transaction, status: 'CARD_REVIEW', sheet: null, candidates: sorted }
   })
-  const matchedSheetIds = new Set(matches.flatMap((match) => match.status === 'CARD_MATCHED' && match.sheet ? [match.sheet.id] : []))
+  const matchedSheetIds = new Set(matches.flatMap((match) => match.status === 'CARD_MATCHED' && match.sheet ? [match.sheet.id] : match.status === 'CARD_GROUP_MATCHED' ? match.candidates.map((item) => item.id) : []))
   const matchedSheetTotal = eligible.filter((item) => matchedSheetIds.has(item.id)).reduce((sum, item) => sum + item.amount, 0)
   const statementTotal = purchases.reduce((sum, transaction) => sum + transaction.amount, 0)
   return { matches, eligibleSheetTotal: matchedSheetTotal, statementTotal, difference: statementTotal - matchedSheetTotal }

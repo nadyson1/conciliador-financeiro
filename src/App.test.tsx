@@ -5,6 +5,7 @@ import type { CardStatement } from './domain/types'
 import { readCardStatementPdf } from './importers/cardStatement'
 import { appendCostYearRecord, GoogleSheetsError, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
+import { cardTransactionIdentity } from './domain/identity'
 import App from './App'
 
 const syntheticStatement: CardStatement = {
@@ -475,9 +476,33 @@ describe('fluxo completo no navegador', () => {
     expect(appendCostYearRecord).not.toHaveBeenCalled()
     expect(await screen.findByText(/CUSTOS ANO: 12\/07\/2025 · Assinatura Kindle unlimited/)).toBeInTheDocument()
     const refreshedCard = screen.getByText(/Amazon Kindle Unltd/).closest('article')!
-    expect(within(refreshedCard).getByRole('button', { name: 'Confirmar este lançamento' })).toBeInTheDocument()
-    await user.click(within(refreshedCard).getByRole('button', { name: 'Confirmar este lançamento' }))
+    expect(within(refreshedCard).getByRole('button', { name: 'Usar este lançamento' })).toBeInTheDocument()
+    await user.click(within(refreshedCard).getByRole('button', { name: 'Usar este lançamento' }))
     await waitFor(() => expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED' && decision.selected[0] === 'kindle-existing')).toBe(true))
+  })
+
+  it('invalida confirmação persistida de ausência quando a CUSTOS ANO atual contém a compra', async () => {
+    const user = userEvent.setup()
+    const statement: CardStatement = { ...structuredClone(syntheticStatement), statementIdentity: 'statement-kindle', dueDate: '2026-03-12', transactions: [{ ...syntheticStatement.transactions[0], id: 'kindle-card', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description: 'Amazon Kindle Unltd', originalDescription: 'Amazon Kindle Unltd', amount: 299 }] }
+    const identity = cardTransactionIdentity(statement, statement.transactions[0])
+    const decision = { key: `CARD_MISSING_CONFIRMED:${JSON.stringify([identity])}`, schemaVersion: 1 as const, kind: 'CARD_MISSING_CONFIRMED', identities: [identity], selected: [], updatedAt: new Date().toISOString() }
+    savedDecisionStore.set(decision.key, decision)
+    const existing = { id: 'kindle-existing', source: 'SHEET' as const, sheetRecordId: 'kindle-existing', bankTransactionId: null, date: '2026-03-12', description: 'Assinatura Kindle unlimited (2 meses)', originalDescription: 'Assinatura Kindle unlimited (2 meses)', amount: 299, direction: 'DEBIT' as const, type: 'OTHER' as const, paymentMethod: 'Crédito_Bradesco', category: 'Assinaturas', month: '03 - Março', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    vi.mocked(readCardStatementPdf).mockResolvedValueOnce(statement)
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha atual', transactions: [existing], rowCount: 1 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha atual', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic'], 'kindle.pdf', { type: 'application/pdf' }))
+    await screen.findByText(/PDF lido · 2 páginas/)
+    await waitFor(() => expect(savedDecisionStore.has(decision.key)).toBe(false))
+    expect(decisionSyncMocks.tombstone).toHaveBeenCalledWith(decision)
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    const row = screen.getByText(/Amazon Kindle Unltd/).closest('article')!
+    expect(within(row).queryByText('AUSÊNCIA CONFIRMADA')).not.toBeInTheDocument()
+    expect(within(row).getByText('MATCHED · Crédito_Bradesco')).toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
   })
 
   it('remove confirmação MISSING_ADDED_TO_SHEET órfã quando a linha já não existe na CUSTOS ANO', async () => {
