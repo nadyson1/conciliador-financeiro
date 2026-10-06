@@ -1,0 +1,393 @@
+import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementReconciliation, CardStatementTransaction, LedgerTransaction } from '../domain/types'
+import { descriptionSimilarity, normalizeDate, normalizeDescription } from './normalize'
+import { stableFingerprint } from '../domain/identity'
+
+type PdfTextItem = { str?: string; transform?: number[]; width?: number; hasEOL?: boolean }
+type PdfPage = { getViewport: (options: { scale: number }) => { width: number }; getTextContent: (options?: object) => Promise<{ items: PdfTextItem[] }> }
+
+const moneyPattern = /(?:R\$\s*)?(-?\d{1,3}(?:\.\d{3})*,\d{2}\s*-?)/g
+const normalized = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase('pt-BR')
+
+export function parseBrazilianMoney(value: string): number | null {
+  const clean = value.replace(/R\$\s*/i, '').replace(/\s+/g, '').trim()
+  const negative = clean.startsWith('-') || clean.endsWith('-')
+  const numeric = Number(clean.replace(/-/g, '').replace(/\./g, '').replace(',', '.'))
+  return Number.isFinite(numeric) ? Math.round(numeric * 100) * (negative ? -1 : 1) : null
+}
+
+function statementDate(value: string, dueDate: string | null): string | null {
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(value)) return normalizeDate(value)
+  const [day, month] = value.split('/').map(Number)
+  if (!day || !month || !dueDate) return null
+  const dueYear = Number(dueDate.slice(0, 4)), dueMonth = Number(dueDate.slice(5, 7))
+  const year = month > dueMonth ? dueYear - 1 : dueYear
+  return normalizeDate(`${String(day).padStart(2, '0')}/${String(month).padStart(2, '0')}/${year}`)
+}
+
+function moneyFromLine(line: string): number | null {
+  const cells = rowCells(line)
+  let match: RegExpMatchArray | null = null
+  if (cells.length > 1) {
+    for (const cell of cells.slice(3)) {
+      match = [...cell.matchAll(moneyPattern)][0] ?? null
+      if (match) break
+    }
+  }
+  if (!match) {
+    const values = [...line.matchAll(moneyPattern)]
+    match = values[values.length - 1] ?? null
+  }
+  if (!match) return null
+  const parsed = parseBrazilianMoney(match[1])
+  if (parsed == null || parsed < 0) return parsed
+  const position = line.lastIndexOf(match[0]) + match[0].length
+  const trailingCellMarker = line.slice(position).replace(/[|\s]/g, '') === '-'
+  return trailingCellMarker ? -parsed : parsed
+}
+
+function amountAfterLabel(lines: string[], label: RegExp): number | null {
+  for (const line of lines) {
+    if (!label.test(normalized(line))) continue
+    const values = [...line.matchAll(moneyPattern)]
+    if (values.length) return parseBrazilianMoney(values[values.length - 1][1])
+  }
+  return null
+}
+
+function cardId(line: string): string | null {
+  const match = line.match(/(\d{4})\s+(?:XXXX|X{4})\s+(?:XXXX|X{4})\s+(\d{4})/i)
+  return match ? `${match[1]} XXXX XXXX ${match[2]}` : null
+}
+
+function parseInstallment(value: string): { installment: number | null; totalInstallments: number | null; description: string } {
+  const match = value.match(/(?:^|\s)(\d{1,2})\/(\d{1,2})(?=\s|$)/)
+  if (!match) return { installment: null, totalInstallments: null, description: value.trim() }
+  return {
+    installment: Number(match[1]),
+    totalInstallments: Number(match[2]),
+    description: value.replace(match[0], ' ').replace(/\s+/g, ' ').trim(),
+  }
+}
+
+function rowCells(line: string): string[] {
+  if (line.includes('|')) return line.split('|').map((part) => part.trim())
+  if (line.includes('\t')) return line.split('\t').map((part) => part.trim())
+  return [line]
+}
+
+function parsePurchaseRow(line: string, cardIdentifier: string, dueDate: string | null, id: number): CardStatementTransaction | null {
+  const cells = rowCells(line)
+  const rowText = cells.join(' ')
+  const dateMatch = rowText.match(/^\s*(\d{2}\/\d{2}(?:\/\d{4})?)\b/)
+  const lineHistory = cells.length > 2 ? cells[1] : rowText
+  if (!dateMatch || /pagto|pagamento da fatura|saldo anterior/i.test(normalized(lineHistory))) return null
+  const date = statementDate(dateMatch[1], dueDate)
+  if (!date) return null
+  const signedAmount = moneyFromLine(line)
+  if (signedAmount == null || signedAmount === 0) return null
+  const amount = Math.abs(signedAmount)
+  const dateColumn = cells.length > 1 ? cells[0] : ''
+  const historyColumn = cells.length > 2 ? cells[1] : ''
+  const cityColumn = cells.length > 3 ? cells[2] : ''
+  let history: string
+  let city: string
+  if (historyColumn) {
+    history = historyColumn.replace(/^\d{2}\/\d{2}(?:\/\d{4})?\s*/, '').trim()
+    city = cityColumn.replace(/\s+/g, ' ').trim()
+  } else {
+    const tail = rowText.replace(/^\s*\d{2}\/\d{2}(?:\/\d{4})?\s*/, '').replace(moneyPattern, '').trim()
+    const installmentMatch = tail.match(/(?:^|\s)\d{1,2}\/\d{1,2}(?=\s|$)/)
+    const withoutInstallment = installmentMatch ? tail.replace(installmentMatch[0], ' ').replace(/\s+/g, ' ').trim() : tail
+    history = withoutInstallment
+    city = ''
+  }
+  const installment = parseInstallment(history)
+  history = installment.description
+  const dateTime = dateColumn.match(/\d{2}\/\d{2}(?:\/\d{4})?/)
+  if (!history) return null
+  return {
+    id: `card-${id}`, date: dateTime ? statementDate(dateTime[0], dueDate) ?? date : date,
+    description: history, originalDescription: history, amount,
+    direction: signedAmount < 0 ? 'CREDIT' : 'DEBIT', type: signedAmount < 0 ? 'REFUND' : 'PURCHASE', ...(signedAmount > 0 ? { financialStatus: 'ACTIVE' as const } : {}), cardIdentifier,
+    installment: installment.installment, totalInstallments: installment.totalInstallments,
+    city, currency: 'BRL', exchangeRate: null, statementDueDate: dueDate, statementTotal: null,
+  }
+}
+
+/** Parses layout-aware lines emitted from PDF.js. Pipe/tab separators preserve the statement's table columns. */
+export function parseCardStatementPages(pages: string[][], fileName = 'Fatura PDF'): CardStatement {
+  const pageOne = pages[0]?.join('\n') ?? ''
+  let dueDate: string | null = null
+  const dueLines = pageOne.split(/\r?\n/)
+  const dueHeaderIndex = dueLines.findIndex((line) => /total da fatura.*vencimento/i.test(normalized(line)))
+  if (dueHeaderIndex >= 0) {
+    const nearby = dueLines.slice(dueHeaderIndex, dueHeaderIndex + 4).join(' ')
+    const match = nearby.match(/(\d{2}\/\d{2}\/\d{4})/)
+    if (match) dueDate = normalizeDate(match[1])
+  }
+  const nextCloseMatch = pageOne.match(/previs[aã]o de fechamento da pr[oó]xima fatura\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i)
+  const nextClosingDate = nextCloseMatch ? normalizeDate(nextCloseMatch[1]) : null
+  const pageOneLines = pages[0] ?? []
+  const purchasesDebitsTotal = amountAfterLabel(pageOneLines, /compras\s*\/\s*debitos/)
+  const creditsPaymentsTotal = amountAfterLabel(pageOneLines, /creditos\s*\/\s*pagamentos/)
+  const previousBalance = amountAfterLabel(pageOneLines, /saldo anterior/)
+
+  const transactions: CardStatementTransaction[] = []
+  const cardSubtotals: CardStatement['cardSubtotals'] = []
+  const errors: string[] = []
+  let sectionActive = false
+  let activeCard = ''
+  let pendingSubtotalCard = ''
+  let previousPayment: number | null = null
+  let reportedTotal: number | null = null
+  let purchaseId = 0
+  for (const page of pages) {
+    for (const rawLine of page) {
+      const line = rawLine.trim()
+      if (/^lan[cç]amentos\b/i.test(normalized(line))) { sectionActive = true; continue }
+      if (/^(?:limites?\b|opcoes de pagamento\b|opcoes de parcelamento\b|parcelado facil\b|parcelamento da fatura\b|pagamento minimo\b|parcelas futuras\b|total parcelado\b|juros\b|taxas?\b|cet\b|iof\b|programa de pontos\b|fidelidade\b|informacoes legais\b)/i.test(normalized(line))) { sectionActive = false; activeCard = ''; pendingSubtotalCard = ''; continue }
+      const card = cardId(line)
+      if (card) { activeCard = card; pendingSubtotalCard = ''; continue }
+      if (!sectionActive) continue
+      if (/\b(?:pagto\.?|pagamento da fatura|pagto por deb)\b/i.test(normalized(line))) {
+        previousPayment = Math.abs(moneyFromLine(line) ?? 0) || previousPayment
+        continue
+      }
+      if (/total para/i.test(normalized(line)) && activeCard) {
+        const subtotal = moneyFromLine(line)
+        if (subtotal != null) cardSubtotals.push({ cardIdentifier: activeCard, amount: subtotal })
+        else pendingSubtotalCard = activeCard
+        continue
+      }
+      if (pendingSubtotalCard && !/^\d{2}\/\d{2}/.test(line)) {
+        const subtotal = moneyFromLine(line)
+        if (subtotal != null) { cardSubtotals.push({ cardIdentifier: pendingSubtotalCard, amount: subtotal }); pendingSubtotalCard = '' }
+        continue
+      }
+      if (/total da fatura em real/i.test(normalized(line))) {
+        reportedTotal = moneyFromLine(line)
+        continue
+      }
+      if (!activeCard || !/^\s*\d{2}\/\d{2}(?:\/\d{4})?\b/.test(line)) continue
+      const transaction = parsePurchaseRow(line, activeCard, dueDate, ++purchaseId)
+      if (transaction) transactions.push(transaction)
+    }
+  }
+  if (reportedTotal == null) reportedTotal = amountAfterLabel(pages.flat(), /total da fatura em real/)
+  const statementIdentity = `statement-${stableFingerprint([dueDate ?? '', reportedTotal == null ? '' : String(reportedTotal), ...[...new Set(transactions.map((item) => item.cardIdentifier))].sort()])}`
+  transactions.forEach((transaction) => {
+    transaction.statementTotal = reportedTotal
+    transaction.id = `card-${statementIdentity}-${stableFingerprint([transaction.cardIdentifier, transaction.date, transaction.originalDescription, transaction.amount, transaction.direction, transaction.installment, transaction.totalInstallments])}`
+  })
+  // Pair only strong, one-to-one refund evidence: same card, date, amount, and normalized merchant.
+  const pairedRefunds = new Set<string>()
+  for (const purchase of transactions.filter((item) => item.type === 'PURCHASE')) {
+    const refund = transactions.find((item) => item.type === 'REFUND' && !pairedRefunds.has(item.id)
+      && item.cardIdentifier === purchase.cardIdentifier && item.date === purchase.date && item.amount === purchase.amount
+      && normalizeDescription(item.originalDescription) === normalizeDescription(purchase.originalDescription))
+    if (refund) {
+      purchase.financialStatus = 'REFUNDED'
+      pairedRefunds.add(refund.id)
+    }
+  }
+  for (const subtotal of cardSubtotals) {
+    const actual = transactions.filter((transaction) => transaction.cardIdentifier === subtotal.cardIdentifier).reduce((sum, transaction) => sum + (transaction.direction === 'DEBIT' ? transaction.amount : -transaction.amount), 0)
+    if (actual !== subtotal.amount) errors.push(`Divergência entre lançamentos extraídos e subtotal informado para o cartão final ${subtotal.cardIdentifier.slice(-4)}.`)
+  }
+  const purchaseTransactions = transactions.filter((transaction) => transaction.type === 'PURCHASE')
+  const purchaseTotal = purchaseTransactions.reduce((sum, transaction) => sum + transaction.amount, 0)
+  if (purchasesDebitsTotal != null && purchaseTotal !== purchasesDebitsTotal) errors.push('Divergência entre compras extraídas e total de Compras/Débitos informado pela fatura.')
+  const refundsTotal = transactions.filter((transaction) => transaction.type === 'REFUND').reduce((sum, transaction) => sum + transaction.amount, 0)
+  if (creditsPaymentsTotal != null && previousPayment != null && previousBalance != null && refundsTotal + previousPayment > creditsPaymentsTotal) errors.push('Os créditos/estornos e o pagamento identificado excedem o total de Créditos/Pagamentos informado pela fatura.')
+  const accountingDifference = previousBalance != null && creditsPaymentsTotal != null && purchasesDebitsTotal != null && reportedTotal != null
+    ? previousBalance - creditsPaymentsTotal + purchasesDebitsTotal - reportedTotal
+    : null
+  if (accountingDifference != null && accountingDifference !== 0) errors.push('A relação entre saldo anterior, créditos/pagamentos, compras/débitos e total da fatura não fecha.')
+  if (!purchaseTransactions.length) errors.push('Não foi possível localizar compras na seção Lançamentos da fatura.')
+  if (reportedTotal == null) errors.push('Total informado da fatura não encontrado; confira o PDF antes de conciliar.')
+  return { fileName, pageCount: pages.length, statementIdentity, transactions, cardSubtotals, reportedTotal, purchasesDebitsTotal, creditsPaymentsTotal, previousBalance, previousPayment, accountingDifference, dueDate, nextClosingDate, errors: [...new Set(errors)] }
+}
+
+function groupPageText(items: PdfTextItem[], pageWidth: number): string[] {
+  const positioned = items.filter((item) => item.str?.trim()).map((item) => ({
+    text: item.str!.trim(), x: item.transform?.[4] ?? 0, y: item.transform?.[5] ?? 0, width: item.width ?? 0,
+  })).sort((a, b) => b.y - a.y || a.x - b.x)
+  const rows: typeof positioned[] = []
+  for (const item of positioned) {
+    let row = rows.find((candidate) => Math.abs(candidate[0].y - item.y) <= 2.5)
+    if (!row) { row = []; rows.push(row) }
+    row.push(item)
+  }
+  rows.sort((a, b) => b[0].y - a[0].y)
+  let tableAnchors: number[] = []
+  const result: string[] = []
+  for (const row of rows) {
+    row.sort((a, b) => a.x - b.x)
+    const rowText = row.map((item) => item.text).join(' ')
+    if (/\bData\b/i.test(rowText) && /Hist[oó]rico de Lan[cç]amentos/i.test(normalized(rowText)) && /Cidade/i.test(rowText)) {
+      const findX = (pattern: RegExp) => row.find((item) => pattern.test(normalized(item.text)))?.x
+      const anchors = [findX(/^data$/), findX(/^hist[oó]rico/), findX(/^cidade$/), findX(/^us\$/), findX(/^cota[cç][aã]o/), findX(/^r\$$/)].filter((value): value is number => value != null)
+      if (anchors.length >= 4) tableAnchors = anchors
+    }
+    if (tableAnchors.length) {
+      const cells = Array.from({ length: tableAnchors.length }, () => [] as string[])
+      for (const item of row.filter((entry) => entry.x <= pageWidth * 0.62)) {
+        let column = 0
+        for (let index = 1; index < tableAnchors.length; index += 1) if (item.x >= tableAnchors[index] - 3) column = index
+        cells[column].push(item.text)
+      }
+      result.push(cells.map((cell) => cell.join(' ')).join(' | '))
+    } else result.push(rowText)
+  }
+  return result
+}
+
+export async function readCardStatementPdf(file: File, workerSource?: string): Promise<CardStatement> {
+  const [{ getDocument, GlobalWorkerOptions }, workerUrl] = await Promise.all([
+    import('pdfjs-dist/legacy/build/pdf.mjs'), import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+  ])
+  GlobalWorkerOptions.workerSrc = workerSource ?? workerUrl.default
+  const task = getDocument({ data: new Uint8Array(await file.arrayBuffer()) })
+  const pdf = await task.promise
+  const pages: string[][] = []
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber) as unknown as PdfPage
+    const pageWidth = page.getViewport({ scale: 1 }).width
+    const content = await page.getTextContent({ includeMarkedContent: false })
+    pages.push(groupPageText(content.items, pageWidth))
+  }
+  return parseCardStatementPages(pages, file.name)
+}
+
+export function identifyStatementPayment(statement: CardStatement, banks: BankTransaction[]): BankTransaction | null {
+  if (statement.reportedTotal == null || !statement.dueDate) return null
+  const candidates = banks.filter((bank) => bank.type === 'CARD_PAYMENT'
+    && Math.abs(bank.amount - statement.reportedTotal!) <= 1
+    && dayDistance(bank.date, statement.dueDate!) <= 7)
+  return [...candidates].sort((a, b) => dayDistance(a.date, statement.dueDate!) - dayDistance(b.date, statement.dueDate!)
+    || Math.abs(a.amount - statement.reportedTotal!) - Math.abs(b.amount - statement.reportedTotal!)
+    || a.date.localeCompare(b.date))[0] ?? null
+}
+
+export function identifyStatementPayments(statements: CardStatement[], banks: BankTransaction[]): Map<CardStatement, BankTransaction> {
+  const proposals = statements.map((statement) => {
+    const candidates = statement.reportedTotal == null || !statement.dueDate ? [] : banks.filter((bank) => bank.type === 'CARD_PAYMENT'
+      && Math.abs(bank.amount - statement.reportedTotal!) <= 1 && dayDistance(bank.date, statement.dueDate!) <= 7)
+      .sort((a, b) => dayDistance(a.date, statement.dueDate!) - dayDistance(b.date, statement.dueDate!)
+        || Math.abs(a.amount - statement.reportedTotal!) - Math.abs(b.amount - statement.reportedTotal!) || a.date.localeCompare(b.date))
+    return { statement, candidates }
+  }).sort((a, b) => a.candidates.length - b.candidates.length
+    || (a.statement.dueDate ?? '').localeCompare(b.statement.dueDate ?? '')
+    || a.statement.statementIdentity.localeCompare(b.statement.statementIdentity))
+  const usedBankIds = new Set<string>()
+  const linked = new Map<CardStatement, BankTransaction>()
+  for (const { statement, candidates } of proposals) {
+    const payment = candidates.find((candidate) => !usedBankIds.has(candidate.id))
+    if (!payment) continue
+    linked.set(statement, payment)
+    usedBankIds.add(payment.id)
+  }
+  return linked
+}
+
+function dayDistance(a: string, b: string) {
+  return Math.abs(Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86_400_000
+}
+
+function installmentInfo(item: LedgerTransaction): { installment: number; total: number; description: string } | null {
+  const marker = item.originalDescription.match(/^\s*\((\d{1,2})\s*\/\s*(\d{1,2})\)\s*/)
+  const installment = item.installment ?? (marker ? Number(marker[1]) : null)
+  const total = item.totalInstallments ?? (marker ? Number(marker[2]) : null)
+  if (!installment || !total) return null
+  return {
+    installment,
+    total,
+    description: item.originalDescription.replace(/^\s*\(\s*\d{1,2}\s*\/\s*\d{1,2}\s*\)\s*/, '').trim(),
+  }
+}
+
+function installmentDescriptionSimilarity(left: string, right: string): number {
+  const a = normalizeDescription(left).split(' ').filter((token) => token.length > 1)
+  const b = normalizeDescription(right).split(' ').filter((token) => token.length > 1)
+  if (!a.length || !b.length) return 0
+  const matched = new Set<number>()
+  let overlap = 0
+  for (const token of a) {
+    const index = b.findIndex((candidate, candidateIndex) => !matched.has(candidateIndex)
+      && (candidate === token || (Math.min(candidate.length, token.length) >= 2 && (candidate.startsWith(token) || token.startsWith(candidate)))))
+    if (index >= 0) { matched.add(index); overlap += 1 }
+  }
+  return Math.max((2 * overlap) / (a.length + b.length), (overlap / Math.min(a.length, b.length)) * 0.92)
+}
+
+function hasInstallmentSequence(candidate: LedgerTransaction, rows: LedgerTransaction[]): boolean {
+  const current = installmentInfo(candidate)
+  if (!current || current.installment <= 1) return false
+  return rows.some((previous) => {
+    if (previous.id === candidate.id || previous.amount !== candidate.amount || previous.type !== 'EXPENSE'
+      || normalizeDescription(previous.paymentMethod) !== 'credito bradesco') return false
+    const info = installmentInfo(previous)
+    return Boolean(info && info.installment === current.installment - 1 && info.total === current.total
+      && previous.date < candidate.date
+      && installmentDescriptionSimilarity(current.description, info.description) >= 0.45)
+  })
+}
+
+export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTransaction[], confirmedMatches: Map<string, string> = new Map()): CardStatementReconciliation {
+  const purchases = statement.transactions.filter((transaction) => transaction.type === 'PURCHASE' && transaction.financialStatus !== 'REFUNDED')
+  const eligible = sheet.filter((item) => normalizeDescription(item.paymentMethod) === 'credito bradesco' && item.type === 'EXPENSE')
+  const isInstallment = (transaction: CardStatementTransaction) => transaction.installment != null && transaction.totalInstallments != null
+  const installmentCandidate = (transaction: CardStatementTransaction, item: LedgerTransaction) => {
+    if (!isInstallment(transaction) || item.amount !== transaction.amount) return false
+    const info = installmentInfo(item)
+    return Boolean(info && info.installment === transaction.installment && info.total === transaction.totalInstallments
+      && installmentDescriptionSimilarity(transaction.originalDescription, info.description) >= 0.35)
+  }
+  const confirmedSheetIds = new Set<string>()
+  const validConfirmed = new Map<string, LedgerTransaction>()
+  for (const transaction of purchases) {
+    const sheetId = confirmedMatches.get(transaction.id)
+    const match = eligible.find((item) => item.id === sheetId && (isInstallment(transaction)
+      ? installmentCandidate(transaction, item)
+      : item.amount === transaction.amount && dayDistance(item.date, transaction.date) <= 7))
+    if (match && !confirmedSheetIds.has(match.id)) { validConfirmed.set(transaction.id, match); confirmedSheetIds.add(match.id) }
+  }
+  const candidateSets = purchases.map((transaction) => {
+    const available = eligible.filter((item) => !confirmedSheetIds.has(item.id) || validConfirmed.get(transaction.id)?.id === item.id)
+    const plausible = isInstallment(transaction)
+      ? available.filter((item) => installmentCandidate(transaction, item))
+      : available.filter((item) => item.amount === transaction.amount && dayDistance(item.date, transaction.date) <= 7)
+    const sorted = [...plausible].sort((a, b) => isInstallment(transaction)
+      ? installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(b)?.description ?? b.originalDescription) - installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(a)?.description ?? a.originalDescription)
+        || Number(hasInstallmentSequence(b, eligible)) - Number(hasInstallmentSequence(a, eligible))
+      : dayDistance(a.date, transaction.date) - dayDistance(b.date, transaction.date)
+        || descriptionSimilarity(transaction.originalDescription, b.originalDescription) - descriptionSimilarity(transaction.originalDescription, a.originalDescription))
+    return { transaction, sorted, sequenceFound: isInstallment(transaction) && sorted.some((item) => hasInstallmentSequence(item, eligible)) }
+  })
+  const usageCounts = new Map<string, number>()
+  candidateSets.forEach(({ sorted }) => sorted.forEach((candidate) => usageCounts.set(candidate.id, (usageCounts.get(candidate.id) ?? 0) + 1)))
+  const matches: CardStatementMatch[] = statement.transactions.filter((transaction) => transaction.type === 'PURCHASE').map((transaction) => {
+    if (transaction.financialStatus === 'REFUNDED') return { transaction, status: 'CARD_REFUNDED', sheet: null, candidates: [] }
+    const { sorted, sequenceFound } = candidateSets.find((set) => set.transaction.id === transaction.id)!
+    const confirmed = validConfirmed.get(transaction.id)
+    const evidence = isInstallment(transaction) ? [
+      'Valor exato',
+      `Parcela ${transaction.installment}/${transaction.totalInstallments}`,
+      'Crédito_Bradesco',
+      'Descrição compatível',
+      ...(sequenceFound ? ['Sequência de parcelas encontrada'] : []),
+    ] : undefined
+    if (confirmed) return { transaction, status: 'CARD_MATCHED', sheet: confirmed, candidates: [confirmed], evidence }
+    if (!sorted.length) return { transaction, status: 'CARD_MISSING', sheet: null, candidates: [] }
+    const unique = sorted.length === 1 && (usageCounts.get(sorted[0].id) ?? 0) === 1
+    if (isInstallment(transaction)) return unique
+      ? { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
+      : { transaction, status: 'CARD_REVIEW', sheet: null, candidates: sorted, evidence }
+    if (unique && dayDistance(sorted[0].date, transaction.date) <= 3 && descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted }
+    return { transaction, status: 'CARD_REVIEW', sheet: null, candidates: sorted }
+  })
+  const matchedSheetIds = new Set(matches.flatMap((match) => match.status === 'CARD_MATCHED' && match.sheet ? [match.sheet.id] : []))
+  const matchedSheetTotal = eligible.filter((item) => matchedSheetIds.has(item.id)).reduce((sum, item) => sum + item.amount, 0)
+  const statementTotal = purchases.reduce((sum, transaction) => sum + transaction.amount, 0)
+  return { matches, eligibleSheetTotal: matchedSheetTotal, statementTotal, difference: statementTotal - matchedSheetTotal }
+}

@@ -1,0 +1,8 @@
+node_modules/
+.npm-cache/
+dist/
+coverage/
+*.local
+.DS_Store
+Thumbs.db
+work/npm-cache/
