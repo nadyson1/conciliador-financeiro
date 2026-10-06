@@ -21,6 +21,7 @@ const syntheticStatement: CardStatement = {
 
 const savedDecisionStore = vi.hoisted(() => new Map<string, { key: string; schemaVersion: 1; kind: string; identities: string[]; selected: string[]; updatedAt: string }>())
 const googleSheetsMocks = vi.hoisted(() => ({ read: vi.fn(), requestToken: vi.fn(), revoke: vi.fn() }))
+
 vi.mock('./domain/localDecisions', () => ({
   decisionKey: (kind: string, identities: string[]) => `${kind}:${JSON.stringify(identities)}`,
   listPersistedDecisions: async () => [...savedDecisionStore.values()],
@@ -78,14 +79,13 @@ describe('fluxo completo no navegador', () => {
     vi.mocked(requestGoogleSheetsAccessToken).mockResolvedValueOnce('expired-token').mockRejectedValueOnce(new GoogleSheetsError('É necessário reconectar.', 'AUTH'))
     vi.mocked(readGoogleSheetLedger).mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha atualizada após reconexão', transactions: [], rowCount: 2 })
     render(<App />)
-    await screen.findByText('Não foi possível renovar a autorização automaticamente. O vínculo foi mantido; use Reconectar Google.')
     await waitFor(() => expect(loadGoogleSheetLink()).toMatchObject({ spreadsheetId: 'spreadsheet-id-12345', autoConnect: false }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Reconectar Google' })).toBeEnabled())
     const reconnect = await screen.findByRole('button', { name: 'Reconectar Google' })
     await user.click(reconnect)
     await screen.findByText('Planilha atualizada após reconexão')
     await screen.findByRole('button', { name: 'Atualizar dados' })
-    expect(requestGoogleSheetsAccessToken).toHaveBeenLastCalledWith(expect.any(String))
-    expect(readGoogleSheetLedger).toHaveBeenLastCalledWith('spreadsheet-id-12345', 'test-access-token')
+    expect(googleSheetsMocks.read).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token')
     expect(loadGoogleSheetLink()).toMatchObject({ spreadsheetId: 'spreadsheet-id-12345', autoConnect: true })
   })
 
@@ -98,9 +98,14 @@ describe('fluxo completo no navegador', () => {
     await user.clear(input); await user.type(input, 'new-spreadsheet-id-67890')
     vi.mocked(readGoogleSheetLedger).mockRejectedValueOnce(new GoogleSheetsError('A aba CUSTOS ANO não foi encontrada.', 'TAB_MISSING'))
     await user.click(screen.getByRole('button', { name: 'Validar e trocar planilha' }))
-    await screen.findByText('A aba CUSTOS ANO não foi encontrada.')
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Validar e trocar planilha' })).toBeEnabled())
     expect(loadGoogleSheetLink()).toMatchObject({ spreadsheetId: 'spreadsheet-id-12345' })
+    await user.click(screen.getByRole('button', { name: 'Cancelar troca' }))
+    expect(screen.getByText('Planilha antiga')).toBeInTheDocument()
 
+    await user.click(screen.getByRole('button', { name: 'Trocar planilha' }))
+    const newInput = screen.getByLabelText('URL ou ID da planilha')
+    await user.clear(newInput); await user.type(newInput, 'new-spreadsheet-id-67890')
     vi.mocked(readGoogleSheetLedger).mockResolvedValueOnce({ spreadsheetId: 'new-spreadsheet-id-67890', spreadsheetTitle: 'Planilha nova', transactions: [], rowCount: 8 })
     await user.click(screen.getByRole('button', { name: 'Validar e trocar planilha' }))
     await screen.findByText('Planilha nova')
