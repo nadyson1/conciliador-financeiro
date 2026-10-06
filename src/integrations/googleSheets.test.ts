@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  extractSpreadsheetId, GOOGLE_SHEETS_READ_SCOPE, GoogleSheetsError, mapGoogleSheetValues,
+  extractSpreadsheetId, GOOGLE_SHEETS_SCOPE, GoogleSheetsError, mapGoogleSheetValues,
   readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken,
 } from './googleSheets'
 
@@ -11,7 +11,7 @@ function response(body: unknown, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body } as Response
 }
 
-describe('integração Google Sheets somente leitura', () => {
+describe('leitura da aba financeira via Google Sheets', () => {
   beforeEach(() => { delete (window as Window & { google?: unknown }).google })
 
   it('faz o primeiro consentimento sem forçar prompt nem seletor de conta', async () => {
@@ -23,10 +23,10 @@ describe('integração Google Sheets somente leitura', () => {
     })
     ;(window as Window & { google?: unknown }).google = { accounts: { oauth2: { initTokenClient, revoke: vi.fn() } } }
     await expect(requestGoogleSheetsAccessToken('client-id.apps.googleusercontent.com')).resolves.toBe('memory-token')
-    expect(initTokenClient).toHaveBeenCalledWith(expect.objectContaining({ scope: GOOGLE_SHEETS_READ_SCOPE, include_granted_scopes: true }))
+    expect(initTokenClient).toHaveBeenCalledWith(expect.objectContaining({ scope: GOOGLE_SHEETS_SCOPE, include_granted_scopes: true }))
     expect(requestAccessToken).toHaveBeenCalledOnce()
     expect(requestAccessToken).toHaveBeenCalledWith()
-    expect(GOOGLE_SHEETS_READ_SCOPE).toBe('https://www.googleapis.com/auth/spreadsheets.readonly')
+    expect(GOOGLE_SHEETS_SCOPE).toBe('https://www.googleapis.com/auth/spreadsheets')
   })
 
   it('tenta restaurar token após reload sem abrir consentimento ou seletor de conta', async () => {

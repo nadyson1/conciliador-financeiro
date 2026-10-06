@@ -46,9 +46,14 @@ async function withStore<T>(mode: IDBTransactionMode, operation: (store: IDBObje
 
 export const listPersistedDecisions = () => withStore<PersistedDecision[]>('readonly', (store) => store.getAll())
 
+export async function putPersistedDecision(record: PersistedDecision) {
+  await withStore<IDBValidKey>('readwrite', (store) => store.put(record))
+}
+
 export async function savePersistedDecision(decision: Omit<PersistedDecision, 'schemaVersion' | 'updatedAt'>) {
   const record: PersistedDecision = { ...decision, schemaVersion: 1, updatedAt: new Date().toISOString() }
-  await withStore<IDBValidKey>('readwrite', (store) => store.put(record))
+  await putPersistedDecision(record)
+  return record
 }
 
 export const deletePersistedDecision = (key: string) => withStore<undefined>('readwrite', (store) => store.delete(key))

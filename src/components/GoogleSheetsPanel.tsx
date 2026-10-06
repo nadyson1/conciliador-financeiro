@@ -9,14 +9,16 @@ export interface GoogleSheetsConnectionInfo {
   connected: boolean
 }
 
-export function GoogleSheetsPanel({ configured, info, loading, error, editing, onConnect, onRefresh, onDisconnect, onChangeSheet, onForgetLink }: {
+export function GoogleSheetsPanel({ configured, info, loading, error, decisionStatus = '', editing, onConnect, onRefresh, onSyncDecisions = () => undefined, onDisconnect, onChangeSheet, onForgetLink }: {
   configured: boolean
   info: GoogleSheetsConnectionInfo | null
   loading: boolean
   error: string
+  decisionStatus?: string
   editing: boolean
   onConnect: (input: string) => void
   onRefresh: () => void
+  onSyncDecisions?: () => void
   onDisconnect: () => void
   onChangeSheet: () => void
   onForgetLink: () => void
@@ -40,10 +42,12 @@ export function GoogleSheetsPanel({ configured, info, loading, error, editing, o
       {linked && !editing && <button className="button button-outline" disabled={loading} onClick={onChangeSheet}>Trocar planilha</button>}
       {linked && <button className="text-button" disabled={loading} onClick={onDisconnect}>Desconectar Google</button>}
       {linked && !editing && <button className="text-button" disabled={loading} onClick={onForgetLink}>Esquecer planilha vinculada</button>}
+      {linked && info.connected && !editing && <button className="button button-outline" disabled={loading} onClick={onSyncDecisions}>Sincronizar decisões</button>}
       {linked && editing && <button className="text-button" disabled={loading} onClick={() => { setSpreadsheetInput(info.spreadsheetId); onChangeSheet() }}>Cancelar troca</button>}
     </div>
     {!configured && <p className="google-sheets-note">Falta configurar o OAuth Client ID no arquivo `.env.local`. Veja as instruções no README.</p>}
     {error && <p className="google-sheets-error" role="alert">{error}</p>}
-    <p className="google-sheets-note">Acesso somente de leitura. O vínculo salvo contém apenas o ID, a aba e metadados de atualização. Extratos e PDFs permanecem neste dispositivo.</p>
+    {decisionStatus && <p className="google-sheets-note" role="status">{decisionStatus}</p>}
+    <p className="google-sheets-note">CUSTOS ANO é somente leitura. As decisões de conciliação podem ser gravadas apenas na aba auxiliar _CONCILIADOR. Extratos e PDFs permanecem neste dispositivo.</p>
   </section>
 }

@@ -21,13 +21,19 @@ const syntheticStatement: CardStatement = {
 
 const savedDecisionStore = vi.hoisted(() => new Map<string, { key: string; schemaVersion: 1; kind: string; identities: string[]; selected: string[]; updatedAt: string }>())
 const googleSheetsMocks = vi.hoisted(() => ({ read: vi.fn(), requestToken: vi.fn(), revoke: vi.fn() }))
+const decisionSyncMocks = vi.hoisted(() => ({ sync: vi.fn(), save: vi.fn(), deletion: vi.fn() }))
 
 vi.mock('./domain/localDecisions', () => ({
   decisionKey: (kind: string, identities: string[]) => `${kind}:${JSON.stringify(identities)}`,
   listPersistedDecisions: async () => [...savedDecisionStore.values()],
-  savePersistedDecision: async (decision: { key: string; kind: string; identities: string[]; selected: string[] }) => savedDecisionStore.set(decision.key, { ...decision, schemaVersion: 1, updatedAt: new Date().toISOString() }),
+  savePersistedDecision: async (decision: { key: string; kind: string; identities: string[]; selected: string[] }) => { const record = { ...decision, schemaVersion: 1 as const, updatedAt: new Date().toISOString() }; savedDecisionStore.set(decision.key, record); return record },
   deletePersistedDecision: async (key: string) => savedDecisionStore.delete(key),
   clearPersistedDecisions: async () => savedDecisionStore.clear(),
+}))
+
+vi.mock('./integrations/googleSheetDecisions', () => ({
+  addDecisionTombstone: vi.fn(), listDecisionTombstones: () => ({}), removeDecisionTombstone: vi.fn(),
+  syncGoogleSheetDecisions: decisionSyncMocks.sync, syncOneGoogleSheetDecision: decisionSyncMocks.save, syncOneGoogleSheetDeletion: decisionSyncMocks.deletion,
 }))
 
 vi.mock('./importers/cardStatement', async (importOriginal) => {
@@ -49,6 +55,9 @@ beforeEach(() => {
   googleSheetsMocks.read.mockReset()
   googleSheetsMocks.requestToken.mockReset()
   googleSheetsMocks.revoke.mockReset()
+  decisionSyncMocks.sync.mockReset().mockImplementation(async (_id: string, _token: string, local: unknown[]) => local)
+  decisionSyncMocks.save.mockReset()
+  decisionSyncMocks.deletion.mockReset()
   vi.mocked(readCardStatementPdf).mockReset()
   vi.mocked(readCardStatementPdf).mockImplementation(async () => syntheticStatement)
   vi.mocked(requestGoogleSheetsAccessToken).mockResolvedValue('test-access-token')
@@ -70,6 +79,16 @@ describe('fluxo completo no navegador', () => {
     expect(screen.getByText('Aba: CUSTOS ANO')).toBeInTheDocument()
     expect(screen.queryByLabelText('URL ou ID da planilha')).not.toBeInTheDocument()
     expect(loadGoogleSheetLink()?.spreadsheetId).toBe('spreadsheet-id-12345')
+  })
+
+  it('sincroniza decisões após carregar a planilha e permite sincronização manual', async () => {
+    const user = userEvent.setup()
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha sincronizada', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    expect(await screen.findByRole('status')).toHaveTextContent('Decisões sincronizadas entre dispositivos.')
+    expect(decisionSyncMocks.sync).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', [], {})
+    await user.click(screen.getByRole('button', { name: 'Sincronizar decisões' }))
+    await waitFor(() => expect(decisionSyncMocks.sync).toHaveBeenCalledTimes(2))
   })
 
   it('mantém vínculo com token expirado e atualiza os dados após reconectar', async () => {

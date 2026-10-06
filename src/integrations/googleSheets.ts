@@ -2,7 +2,7 @@ import type { LedgerTransaction } from '../domain/types'
 import { initialColumnMap, normalizeHeader } from '../importers/csv'
 import { parseLedgerRows } from '../importers/transactions'
 
-export const GOOGLE_SHEETS_READ_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly'
+export const GOOGLE_SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets'
 const SHEET_NAME = 'CUSTOS ANO'
 const REQUIRED_SHEET_COLUMNS = ['description', 'date', 'month', 'year', 'category', 'amount', 'paymentMethod', 'isFixed', 'isEssential', 'id'] as const
 const COLUMN_NAMES: Record<(typeof REQUIRED_SHEET_COLUMNS)[number], string> = {
@@ -64,7 +64,7 @@ export async function requestGoogleSheetsAccessToken(clientId: string, prompt?: 
   return new Promise((resolve, reject) => {
     let settled = false
     const client = google.accounts.oauth2.initTokenClient({
-      client_id: clientId.trim(), scope: GOOGLE_SHEETS_READ_SCOPE, include_granted_scopes: true,
+      client_id: clientId.trim(), scope: GOOGLE_SHEETS_SCOPE, include_granted_scopes: true,
       callback: (response) => {
         if (settled) return
         settled = true

@@ -1,6 +1,6 @@
 # Conciliador Financeiro
 
-PWA estática para comparar, no próprio dispositivo, os lançamentos da aba `CUSTOS ANO` com um extrato bancário em CSV. A planilha pode ser lida opcionalmente pelo navegador com Google Identity Services e Sheets API; o CSV manual continua disponível. A integração atual não grava na planilha.
+PWA estática para comparar, no próprio dispositivo, os lançamentos da aba `CUSTOS ANO` com um extrato bancário em CSV. A planilha pode ser lida opcionalmente pelo navegador com Google Identity Services e Sheets API; o CSV manual continua disponível. A única escrita remota é a sincronização explícita das decisões do usuário na aba auxiliar `_CONCILIADOR`.
 
 ## O que está implementado
 
@@ -19,7 +19,7 @@ PWA estática para comparar, no próprio dispositivo, os lançamentos da aba `CU
 
 ## Privacidade e identificadores
 
-CSVs e PDF são lidos e processados em memória no navegador. PDF.js extrai texto usando um worker estático empacotado na própria aplicação e pré-armazenado pela PWA; não há upload do arquivo, extração remota ou OCR. O service worker pré-armazena recursos da aplicação e não configura cache de rede. A integração Google usa OAuth client-side, sem backend, e a permissão `spreadsheets.readonly`; somente metadados da planilha e valores da aba `CUSTOS ANO` são solicitados. O access token permanece apenas em memória e é revogado ao desconectar. Nenhum CSV bancário, PDF, extrato ou resultado de matching é enviado ao Google. O IndexedDB local guarda somente identidades/fingerprints e metadados mínimos das decisões do usuário; os arquivos e transações completos não são persistidos. A opção **Limpar confirmações salvas** apaga esses metadados após confirmação.
+CSVs e PDF são lidos e processados em memória no navegador. PDF.js extrai texto usando um worker estático empacotado na própria aplicação e pré-armazenado pela PWA; não há upload do arquivo, extração remota ou OCR. O service worker pré-armazena recursos da aplicação e não configura cache de rede. A integração Google usa OAuth client-side, sem backend, e o escopo `spreadsheets` para ler `CUSTOS ANO` e sincronizar decisões somente em `_CONCILIADOR`. O access token permanece apenas em memória e é revogado ao desconectar. Nenhum CSV bancário, PDF, extrato, descrição, valor ou resultado completo de matching é enviado ao Google. O IndexedDB e a aba auxiliar guardam apenas tipos de decisão, IDs/fingerprints, IDs relacionados, escolha confirmada e datas de atualização; arquivos e transações completos não são persistidos. A opção **Limpar confirmações salvas** também propaga remoções para outros dispositivos na próxima sincronização.
 
 O app mantém `sheetRecordId` e `bankTransactionId` separados; quando IDs de origem não existem ou se repetem, gera fingerprints determinísticos a partir de atributos da movimentação para conservar decisões após a reimportação. IDs de fontes diferentes nunca são comparados como se fossem equivalentes.
 
@@ -42,7 +42,7 @@ npm run dev
 
 ### Configurar Google Sheets (opcional)
 
-1. No Google Cloud Console, habilite a Google Sheets API e configure a tela de consentimento OAuth.
+1. No Google Cloud Console, habilite a Google Sheets API e configure a tela de consentimento OAuth. O escopo solicitado é `https://www.googleapis.com/auth/spreadsheets`, necessário para escrever apenas na aba auxiliar de decisões. Como o escopo é mais amplo que `spreadsheets.readonly`, usuários já conectados podem precisar conceder autorização novamente uma vez.
 2. Crie um OAuth Client ID do tipo **Aplicativo da Web** e inclua a origem exata usada para abrir o app (por exemplo, `http://localhost:4173` no ambiente local e a origem HTTPS publicada). Não crie client secret para esta PWA.
 3. Crie `.env.local` na raiz do projeto e informe `VITE_GOOGLE_CLIENT_ID=SEU_CLIENT_ID.apps.googleusercontent.com`.
 4. Reinicie o servidor da aplicação. Na tela inicial, informe a URL ou o ID da planilha e escolha **Conectar Google Sheets**.
@@ -58,9 +58,13 @@ O workflow `.github/workflows/deploy-pages.yml` testa, compila e publica automat
 
 O workflow publica os arquivos estáticos de `dist/`. O PDF.js worker, manifesto e service worker são empacotados com a base do repositório, e a PWA mantém o pré-cache/offline dentro do escopo publicado.
 
-A autorização usa o token model do Google Identity Services e solicita somente `https://www.googleapis.com/auth/spreadsheets.readonly`. O app lê a aba `CUSTOS ANO` em modo `FORMATTED_VALUE`; nomes de cabeçalho são mapeados sem depender da ordem. `Mês` e `Ano` são copiados como recebidos e nunca recalculados ou gravados. O vínculo (ID, aba, título e horário da leitura) fica no armazenamento local; ao abrir, o app faz uma tentativa única de autenticação sem prompt e leitura. Se o Google exigir interação, a planilha continua vinculada e aparece **Reconectar Google**. **Atualizar dados** segue disponível manualmente; não há polling. Desconectar revoga o token e mantém o vínculo. **Esquecer planilha vinculada** remove esse metadado local.
+A autorização usa o token model do Google Identity Services e solicita `https://www.googleapis.com/auth/spreadsheets`. O app lê a aba `CUSTOS ANO` em modo `FORMATTED_VALUE`; nomes de cabeçalho são mapeados sem depender da ordem. `Mês` e `Ano` são copiados como recebidos e nunca recalculados ou gravados. O vínculo (ID, aba, título e horário da leitura) fica no armazenamento local; ao abrir, o app faz uma tentativa única de autenticação sem prompt e leitura. Se o Google exigir interação, a planilha continua vinculada e aparece **Reconectar Google**. **Atualizar dados** segue disponível manualmente; não há polling. Desconectar revoga o token e mantém o vínculo. **Esquecer planilha vinculada** remove esse metadado local.
 
-A integração é read-only. Não foi habilitada a inserção de despesas porque não foi possível confirmar, sem acesso de inspeção à planilha real, como o AppSheet gera valores compatíveis para a coluna `ID`, nem validar se `Mês` e `Ano` são fórmulas/colunas calculadas. O app não envia linhas de escrita, não cria abas e não altera cabeçalhos ou estrutura. Antes de habilitar escrita, é necessário confirmar o contrato de geração de `ID` usado pelo AppSheet e como as colunas calculadas são preenchidas ao acrescentar uma linha.
+Depois que a planilha for carregada com autenticação válida, as decisões locais são sincronizadas automaticamente com `_CONCILIADOR`. Essa aba é criada se estiver ausente; a aba `CUSTOS ANO` nunca é criada, renomeada ou alterada. O botão **Sincronizar decisões** executa a sincronização manual. Sem conexão, as decisões e remoções continuam na cache local/na fila mínima e são enviadas na próxima conexão. Não há polling. Se uma mesma decisão foi alterada em dois dispositivos, vence o registro com `updatedAt` mais recente; em empate, o registro remoto prevalece. Remoções são representadas por tombstones para que uma decisão desfeita offline não reapareça no outro dispositivo.
+
+O esquema da aba `_CONCILIADOR` é versionado por `schemaVersion` e usa as colunas: `decisionId`, `decisionType`, `subjectFingerprint`, `status`, `relatedIds`, `metadata`, `createdAt`, `updatedAt`, `schemaVersion`. `decisionId` e `subjectFingerprint` são fingerprints determinísticos; `relatedIds` contém somente as identidades/fingerprints que a decisão já usa localmente. `metadata` armazena somente os IDs selecionados, não descrições ou valores financeiros. Os tipos sincronizados são `PAIR_CONFIRMED`, `PAIR_REJECTED`, `BANK_IGNORED`, `SHEET_IGNORED`, `COMPOSITION_CONFIRMED`, `STATEMENT_MATCH_CONFIRMED` e `CARD_MISSING_CONFIRMED`. `ACTIVE` e `DELETED` em `status` distinguem decisões ativas de remoções sincronizadas.
+
+`CUSTOS ANO` permanece somente leitura. O app pode criar ou atualizar linhas exclusivamente em `_CONCILIADOR`; não grava despesas, cabeçalhos, IDs, `Mês` ou `Ano` na aba financeira.
 
 Para conferir o service worker e a PWA de produção:
 
@@ -77,7 +81,7 @@ O site publicado deve ser servido por HTTPS para instalação fora de `localhost
 npm test
 ```
 
-Os testes permanentes usam apenas dados sintéticos e cobrem CSV, normalização, classificações, identidades estáveis, matching 1:1, composição 1:N, persistência local de decisões, parser de fatura, estornos, validação matemática, ambiguidades, prevenção de reutilização, filtros, exportação e navegação da interface. O PDF de referência foi validado localmente e não foi copiado para os testes nem para o repositório.
+Os testes permanentes usam apenas dados sintéticos e mocks, sem acessar planilhas reais. Cobrem CSV, normalização, classificações, identidades estáveis, matching 1:1, composição 1:N, persistência local e sincronização/conflictos de decisões, isolamento de escrita em `_CONCILIADOR`, parser de fatura, estornos, validação matemática, ambiguidades, prevenção de reutilização, filtros, exportação e navegação da interface. O PDF de referência foi validado localmente e não foi copiado para os testes nem para o repositório.
 
 ## Limitações conhecidas
 
