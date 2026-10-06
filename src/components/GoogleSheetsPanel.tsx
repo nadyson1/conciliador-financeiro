@@ -48,6 +48,6 @@ export function GoogleSheetsPanel({ configured, info, loading, error, decisionSt
     {!configured && <p className="google-sheets-note">Falta configurar o OAuth Client ID no arquivo `.env.local`. Veja as instruções no README.</p>}
     {error && <p className="google-sheets-error" role="alert">{error}</p>}
     {decisionStatus && <p className="google-sheets-note" role="status">{decisionStatus}</p>}
-    <p className="google-sheets-note">CUSTOS ANO é somente leitura. As decisões de conciliação podem ser gravadas apenas na aba auxiliar _CONCILIADOR. Extratos e PDFs permanecem neste dispositivo.</p>
+    <p className="google-sheets-note">CUSTOS ANO: linhas existentes e fórmulas não são alteradas. Uma nova linha só é adicionada após sua confirmação explícita. As decisões técnicas ficam em _CONCILIADOR; extratos e PDFs permanecem neste dispositivo.</p>
   </section>
 }

@@ -92,6 +92,7 @@ export function transactionType(description: string, paymentMethod = ''): 'EXPEN
   const value = normalizeDescription(description)
   const payment = normalizeDescription(paymentMethod)
   if (/^gastos cartao de credito(?: |$)/.test(value)) return 'CARD_PAYMENT'
+  if (/^rentab invest facilcred(?: |$)/.test(value)) return 'INCOME'
   if (/resg|resgate|venc(?:imento)? cdb|resg venc/.test(value)) return 'INVESTMENT'
   if (/aplicacao/.test(value) || payment === 'investimento') return 'INVESTMENT'
   if (/transferencia|ted|\bdoc\b|movimentacao interna|entre contas|transf\b/.test(value)) return 'TRANSFER'

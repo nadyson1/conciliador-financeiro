@@ -103,12 +103,14 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap): P
     const paymentMethod = cell(row, map.paymentMethod)
     const classifiedType = transactionType(originalDescription, paymentMethod)
     const type = classifiedType
+    const outOfScopeSubtype = /^rentab invest facilcred(?: |$)/.test(originalDescription.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()) ? 'INVEST_FACIL_YIELD' as const : undefined
     const installment = installmentFrom(originalDescription)
     transactions.push({
       id: `bank-${index + 1}`, source: 'BANK', sheetRecordId: null,
       bankTransactionId: cell(row, map.id) || '',
       date, description: originalDescription, originalDescription, amount, direction, directionKnown,
       type, investmentAction: investmentAction(originalDescription),
+      ...(outOfScopeSubtype ? { outOfScopeSubtype } : {}),
       paymentMethod, category: '', month: '', year: date.slice(0, 4), isFixed: null, isEssential: null,
       ...installment, balanceAfter: map.balance ? normalizeSignedBalance(cell(row, map.balance)) : null, original: { ...row },
     })

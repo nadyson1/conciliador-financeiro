@@ -3,7 +3,7 @@ import { cleanup, render, screen, waitFor, within } from '@testing-library/react
 import userEvent from '@testing-library/user-event'
 import type { CardStatement } from './domain/types'
 import { readCardStatementPdf } from './importers/cardStatement'
-import { GoogleSheetsError, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
+import { appendCostYearRecord, GoogleSheetsError, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import App from './App'
 
@@ -20,7 +20,7 @@ const syntheticStatement: CardStatement = {
 }
 
 const savedDecisionStore = vi.hoisted(() => new Map<string, { key: string; schemaVersion: 1; kind: string; identities: string[]; selected: string[]; updatedAt: string }>())
-const googleSheetsMocks = vi.hoisted(() => ({ read: vi.fn(), requestToken: vi.fn(), revoke: vi.fn() }))
+const googleSheetsMocks = vi.hoisted(() => ({ read: vi.fn(), append: vi.fn(), requestToken: vi.fn(), revoke: vi.fn() }))
 const decisionSyncMocks = vi.hoisted(() => ({ sync: vi.fn(), save: vi.fn(), deletion: vi.fn() }))
 
 vi.mock('./domain/localDecisions', () => ({
@@ -45,7 +45,7 @@ vi.mock('./importers/cardStatement', async (importOriginal) => {
 
 vi.mock('./integrations/googleSheets', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./integrations/googleSheets')>()
-  return { ...actual, readGoogleSheetLedger: googleSheetsMocks.read, requestGoogleSheetsAccessToken: googleSheetsMocks.requestToken, revokeGoogleSheetsAccessToken: googleSheetsMocks.revoke }
+  return { ...actual, appendCostYearRecord: googleSheetsMocks.append, readGoogleSheetLedger: googleSheetsMocks.read, requestGoogleSheetsAccessToken: googleSheetsMocks.requestToken, revokeGoogleSheetsAccessToken: googleSheetsMocks.revoke }
 })
 
 beforeEach(() => {
@@ -55,6 +55,7 @@ beforeEach(() => {
   localStorage.clear()
   sessionStorage.clear()
   googleSheetsMocks.read.mockReset()
+  googleSheetsMocks.append.mockReset()
   googleSheetsMocks.requestToken.mockReset()
   googleSheetsMocks.revoke.mockReset()
   decisionSyncMocks.sync.mockReset().mockImplementation(async (_id: string, _token: string, local: unknown[]) => local)
@@ -73,6 +74,91 @@ afterEach(() => {
 })
 
 describe('fluxo completo no navegador', () => {
+  it('adiciona somente após confirmação, valida campos e associa a nova linha ao ausente', async () => {
+    const user = userEvent.setup()
+    const existing = { id: 'sheet-old', source: 'SHEET' as const, sheetRecordId: 'sheet-old', bankTransactionId: null, date: '2026-01-05', description: 'Escola', originalDescription: 'Escola', amount: 9900, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const created = { ...existing, id: 'sheet-new', sheetRecordId: 'abcd1234', date: '2026-01-08', description: 'PIX ENVIADO MERCADO', originalDescription: 'PIX ENVIADO MERCADO', amount: 4500, category: 'Casa', paymentMethod: 'Pix' }
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [existing], rowCount: 1 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    await user.click(await screen.findByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    const dialog = screen.getByRole('dialog', { name: 'Adicionar lançamento à CUSTOS ANO' })
+    expect(dialog).toBeInTheDocument()
+    expect(screen.getByLabelText('Descrição')).toHaveValue('PIX ENVIADO MERCADO')
+    expect(screen.getByLabelText('Data')).toHaveValue('2026-01-08')
+    expect(screen.getByLabelText('Custo (R$)')).toHaveValue(45)
+    expect(screen.getByLabelText('Categoria')).toHaveValue('')
+    expect(screen.getByLabelText('Forma de pagamento')).toHaveValue('Pix')
+    expect(appendCostYearRecord).not.toHaveBeenCalled()
+    await user.selectOptions(screen.getByLabelText('Categoria'), 'Casa')
+    await user.clear(screen.getByLabelText('Descrição'))
+    await user.click(within(dialog).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(await screen.findByText('Informe uma descrição.')).toBeInTheDocument()
+    expect(appendCostYearRecord).not.toHaveBeenCalled()
+    await user.type(screen.getByLabelText('Descrição'), 'PIX ENVIADO MERCADO')
+    const appendResult = { spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [existing, created], rowCount: 2, transaction: created, alreadyPresent: false }
+    let resolveAppend!: (value: typeof appendResult) => void
+    googleSheetsMocks.append.mockImplementationOnce(() => new Promise((resolve) => { resolveAppend = resolve }))
+    await user.dblClick(within(dialog).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(appendCostYearRecord).toHaveBeenCalledOnce()
+    resolveAppend(appendResult)
+    expect(await screen.findByText('Lançamento adicionado à CUSTOS ANO e confirmado na conciliação.')).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(appendCostYearRecord).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', expect.objectContaining({ description: 'PIX ENVIADO MERCADO', date: '2026-01-08', amount: 4500, category: 'Casa', paymentMethod: 'Pix', isFixed: false, isEssential: false }))
+    expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'MISSING_ADDED_TO_SHEET' && decision.selected[0] === 'abcd1234')).toBe(true)
+    expect(screen.getByRole('button', { name: /Ausentes/ })).toHaveTextContent('0')
+  })
+
+  it('agrupa os rendimentos Invest Fácil fora de Ausentes e não oferece adicionar crédito', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const sheet = new File(['Descrição,Data,Custo\nEscola,01/01/2026,"90,00"'], 'custos.csv', { type: 'text/csv' })
+    const bank = new File(['Data,Histórico,Crédito (R$),Débito (R$)\n02/10/2026,RENTAB.INVEST FACILCRED*,"0,03",\n03/10/2026,RENTAB.INVEST FACILCRED*,"0,02",\n04/10/2026,RENTAB.INVEST FACILCRED*,"0,01",\n05/10/2026,PIX RECEBIDO,"12,00",'], 'extrato.csv', { type: 'text/csv' })
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheet)
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bank)
+    await user.click(await screen.findByRole('button', { name: 'Usar 4 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Fora do escopo/ }))
+    expect(screen.getByText('Rendimentos Invest Fácil')).toBeInTheDocument()
+    expect(screen.getByText(/3 créditos · total R\$ 0,06/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    expect(screen.queryByText('PIX RECEBIDO')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
+  })
+
+  it('mantém o ausente e os campos preenchidos após falha de token e permite reconectar', async () => {
+    const user = userEvent.setup()
+    const existing = { id: 'sheet-old', source: 'SHEET' as const, sheetRecordId: 'sheet-old', bankTransactionId: null, date: '2026-01-05', description: 'Escola', originalDescription: 'Escola', amount: 9900, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [existing], rowCount: 1 })
+    googleSheetsMocks.append.mockRejectedValueOnce(new GoogleSheetsError('Autorização expirada.', 'AUTH'))
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    await user.click(await screen.findByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    const dialog = screen.getByRole('dialog')
+    await user.selectOptions(screen.getByLabelText('Categoria'), 'Casa')
+    await user.click(within(dialog).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Autorização expirada')
+    expect(screen.getByLabelText('Descrição')).toHaveValue('PIX ENVIADO MERCADO')
+    expect(screen.getByRole('button', { name: /Ausentes/ })).toHaveTextContent('1')
+    await user.click(within(dialog).getByRole('button', { name: 'Reconectar Google' }))
+    await waitFor(() => expect(readGoogleSheetLedger).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(within(dialog).queryByRole('button', { name: 'Reconectar Google' })).not.toBeInTheDocument())
+    expect(screen.getByLabelText('Descrição')).toHaveValue('PIX ENVIADO MERCADO')
+    expect(screen.getByRole('button', { name: /Ausentes/ })).toHaveTextContent('1')
+  })
+
   it('restaura o vínculo e tenta atualizar uma vez ao abrir o app', async () => {
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'CONTROLE ORÇAMENTÁRIO PESSOAL 2026', lastUpdated: '2026-10-06T03:19:00.000Z', autoConnect: true })
     render(<App />)

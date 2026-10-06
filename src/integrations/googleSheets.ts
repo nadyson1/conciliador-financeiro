@@ -1,6 +1,8 @@
 import type { LedgerTransaction } from '../domain/types'
 import { initialColumnMap, normalizeHeader } from '../importers/csv'
 import { parseLedgerRows } from '../importers/transactions'
+import { normalizeDate } from '../importers/normalize'
+import { COST_YEAR_PAYMENT_METHODS } from '../features/costYearRecord'
 
 export const GOOGLE_SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets'
 const SHEET_NAME = 'CUSTOS ANO'
@@ -30,8 +32,23 @@ export interface GoogleSheetReadResult {
   rowCount: number
 }
 
+export interface CostYearRecordInput {
+  description: string
+  date: string
+  category: string
+  amount: number
+  paymentMethod: string
+  isFixed: boolean
+  isEssential: boolean
+}
+
+export interface CostYearAppendResult extends GoogleSheetReadResult {
+  transaction: LedgerTransaction
+  alreadyPresent: boolean
+}
+
 export class GoogleSheetsError extends Error {
-  constructor(message: string, readonly code: 'CONFIG' | 'AUTH' | 'NOT_FOUND' | 'ACCESS' | 'TAB_MISSING' | 'HEADERS' | 'DUPLICATE_ID' | 'EMPTY' | 'NETWORK' | 'API') {
+  constructor(message: string, readonly code: 'CONFIG' | 'AUTH' | 'NOT_FOUND' | 'ACCESS' | 'TAB_MISSING' | 'HEADERS' | 'DUPLICATE_ID' | 'DUPLICATE_RECORD' | 'INTEGRITY' | 'AMBIGUOUS' | 'EMPTY' | 'NETWORK' | 'API') {
     super(message)
     this.name = 'GoogleSheetsError'
   }
@@ -98,7 +115,7 @@ export function extractSpreadsheetId(input: string): string {
   return id
 }
 
-export function mapGoogleSheetValues(values: unknown[][]): LedgerTransaction[] {
+export function mapGoogleSheetValues(values: unknown[][], options: { allowEmpty?: boolean } = {}): LedgerTransaction[] {
   const headers = (values[0] ?? []).map((value) => String(value ?? '').trim())
   const map = initialColumnMap(headers, 'sheet')
   const missing = REQUIRED_SHEET_COLUMNS.filter((key) => !map[key])
@@ -108,14 +125,149 @@ export function mapGoogleSheetValues(values: unknown[][]): LedgerTransaction[] {
   const normalizedHeaders = headers.map(normalizeHeader)
   const duplicated = normalizedHeaders.find((header, index) => Boolean(header) && normalizedHeaders.indexOf(header) !== index)
   if (duplicated) throw new GoogleSheetsError(`Há cabeçalhos repetidos na aba CUSTOS ANO: ${headers[normalizedHeaders.indexOf(duplicated)]}.`, 'HEADERS')
-  const rows = values.slice(1).map((valuesRow) => Object.fromEntries(headers.map((header, index) => [header, String(valuesRow[index] ?? '').trim()])))
-    .filter((row) => Object.values(row).some(Boolean))
+  const rows = values.slice(1).flatMap((valuesRow, index) => {
+    const row = Object.fromEntries(headers.map((header, columnIndex) => [header, String(valuesRow[columnIndex] ?? '').trim()]))
+    const hasFinancialData = [map.description, map.date, map.amount, map.category, map.paymentMethod, map.id].some((column) => Boolean(column && row[column]))
+    // Validation-only rows commonly contain FALSE in checkbox columns. They are not records.
+    if (!hasFinancialData) return []
+    const missing = [map.description, map.date, map.amount, map.id].filter((column) => !row[column])
+    if (missing.length) {
+      const labels = missing.map((column) => headers.find((header) => header === column) ?? column)
+      throw new GoogleSheetsError(`Integridade inválida na linha ${index + 2} da CUSTOS ANO: falta ${labels.join(', ')}.`, 'INTEGRITY')
+    }
+    return [row]
+  })
   const nonEmptyIds = rows.map((row) => row[map.id!]).filter(Boolean)
   if (new Set(nonEmptyIds).size !== nonEmptyIds.length) throw new GoogleSheetsError('A coluna ID contém valores repetidos. A leitura foi interrompida para preservar a identidade dos lançamentos.', 'DUPLICATE_ID')
   const parsed = parseLedgerRows(rows, map)
   if (parsed.issues.length) throw new GoogleSheetsError(`A aba CUSTOS ANO contém ${parsed.issues.length} linha(s) com Data, Descrição ou Custo inválido. Corrija os dados na planilha e atualize novamente; os dados atuais foram mantidos.`, 'EMPTY')
-  if (!parsed.transactions.length) throw new GoogleSheetsError('A aba CUSTOS ANO não contém lançamentos válidos para conciliar.', 'EMPTY')
+  if (!parsed.transactions.length && !options.allowEmpty) throw new GoogleSheetsError('A aba CUSTOS ANO não contém lançamentos válidos para conciliar.', 'EMPTY')
   return parsed.transactions
+}
+
+function columnLetter(index: number) {
+  let number = index + 1, label = ''
+  while (number > 0) { const remainder = (number - 1) % 26; label = String.fromCharCode(65 + remainder) + label; number = Math.floor((number - 1) / 26) }
+  return label
+}
+
+function costYearHeaderIndexes(headers: string[]) {
+  const indexes = {} as Record<(typeof REQUIRED_SHEET_COLUMNS)[number], number>
+  for (const key of REQUIRED_SHEET_COLUMNS) {
+    const index = headers.findIndex((header) => header.trim() === COLUMN_NAMES[key])
+    if (index < 0) throw new GoogleSheetsError(`Não foi possível adicionar: o cabeçalho exato “${COLUMN_NAMES[key]}” não foi encontrado em CUSTOS ANO.`, 'HEADERS')
+    indexes[key] = index
+  }
+  return indexes
+}
+
+function normalizeCostDescription(value: string) { return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ') }
+function matchesCostRecord(transaction: LedgerTransaction, input: CostYearRecordInput) {
+  return transaction.date === input.date && transaction.amount === input.amount
+    && normalizeCostDescription(transaction.originalDescription) === normalizeCostDescription(input.description)
+    && normalizeHeader(transaction.paymentMethod) === normalizeHeader(input.paymentMethod)
+}
+
+export function generateCostYearId(existingIds: Iterable<string>, randomBytes?: (buffer: Uint8Array) => Uint8Array) {
+  const secureRandom = randomBytes ?? ((buffer: Uint8Array) => {
+    if (!globalThis.crypto?.getRandomValues) throw new GoogleSheetsError('Este navegador não oferece geração segura de ID. Nenhuma linha foi adicionada.', 'CONFIG')
+    return globalThis.crypto.getRandomValues(buffer)
+  })
+  const existing = new Set([...existingIds].map((id) => id.trim().toLowerCase()).filter(Boolean))
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const bytes = secureRandom(new Uint8Array(4))
+    const id = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+    if (!existing.has(id.toLowerCase())) return id
+  }
+  throw new GoogleSheetsError('Não foi possível gerar um ID único após várias tentativas. Nenhuma linha foi adicionada.', 'DUPLICATE_ID')
+}
+
+async function getSheetValues(spreadsheetId: string, token: string, fetcher: typeof fetch) {
+  const base = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}`
+  const metadata = await getJson(`${base}?fields=${encodeURIComponent('spreadsheetId,properties.title,sheets.properties(sheetId,title)')}`, token, fetcher)
+  const sheets = metadata.sheets as { properties?: { title?: string } }[] | undefined
+  if (!sheets?.some((sheet) => sheet.properties?.title === SHEET_NAME)) throw new GoogleSheetsError('A aba obrigatória CUSTOS ANO não foi encontrada. Nenhuma alteração foi feita.', 'TAB_MISSING')
+  const range = encodeURIComponent("'CUSTOS ANO'!A:ZZ")
+  const response = await getJson(`${base}/values/${range}?valueRenderOption=FORMATTED_VALUE&majorDimension=ROWS`, token, fetcher)
+  return { base, metadata, values: (response.values as unknown[][] | undefined) ?? [] }
+}
+
+/** Adds exactly one confirmed expense after locating the header row and checking existing records/IDs. */
+export async function appendCostYearRecord(spreadsheetIdInput: string, accessToken: string, input: CostYearRecordInput, fetcher: typeof fetch = fetch, options: { randomBytes?: (buffer: Uint8Array) => Uint8Array } = {}): Promise<CostYearAppendResult> {
+  const spreadsheetId = extractSpreadsheetId(spreadsheetIdInput)
+  if (!input.description.trim() || normalizeDate(input.date) !== input.date || !Number.isInteger(input.amount) || input.amount <= 0 || !input.category.trim() || !COST_YEAR_PAYMENT_METHODS.some((method) => method === input.paymentMethod) || typeof input.isFixed !== 'boolean' || typeof input.isEssential !== 'boolean') {
+    throw new GoogleSheetsError('Revise descrição, data, categoria, custo, forma de pagamento e opções de fixo/essencial antes de adicionar.', 'INTEGRITY')
+  }
+  const snapshot = await getSheetValues(spreadsheetId, accessToken, fetcher)
+  if (!snapshot.values.length) throw new GoogleSheetsError('A CUSTOS ANO não possui cabeçalhos; nenhuma alteração foi feita.', 'HEADERS')
+  const headers = snapshot.values[0].map((value) => String(value ?? '').trim())
+  const indexes = costYearHeaderIndexes(headers)
+  const transactions = mapGoogleSheetValues(snapshot.values, { allowEmpty: true })
+  if (!transactions.some((transaction) => transaction.category === input.category.trim())) throw new GoogleSheetsError('A categoria escolhida não aparece entre as categorias já usadas em CUSTOS ANO. Nenhuma linha foi adicionada.', 'INTEGRITY')
+  const duplicates = transactions.filter((transaction) => matchesCostRecord(transaction, input))
+  if (duplicates.length > 1) throw new GoogleSheetsError('Já existem várias linhas iguais na CUSTOS ANO. Revise a planilha antes de adicionar outra.', 'DUPLICATE_RECORD')
+  if (duplicates.length === 1) return { spreadsheetId, spreadsheetTitle: (snapshot.metadata.properties as { title?: string } | undefined)?.title || 'Planilha Google', transactions, rowCount: transactions.length, transaction: duplicates[0], alreadyPresent: true }
+
+  let expectedAppendRow = 2
+  snapshot.values.slice(1).forEach((existingRow, index) => {
+    if ([indexes.description, indexes.date, indexes.amount, indexes.id].some((column) => String(existingRow[column] ?? '').trim())) expectedAppendRow = index + 3
+  })
+
+  const existingIds = transactions.map((transaction) => transaction.sheetRecordId)
+  const id = generateCostYearId(existingIds, options.randomBytes)
+  const booleanStart = Math.min(indexes.isFixed, indexes.isEssential)
+  const appendEnd = booleanStart - 1
+  const coreIndexes = [indexes.description, indexes.date, indexes.category, indexes.amount, indexes.paymentMethod]
+  if (appendEnd < 0 || coreIndexes.some((index) => index > appendEnd)) {
+    throw new GoogleSheetsError('A ordem das colunas não permite localizar uma área segura para append sem incluir checkboxes; nenhuma alteração foi feita.', 'HEADERS')
+  }
+  const writeWidth = Math.max(...Object.values(indexes)) + 1
+  const row: unknown[] = Array(writeWidth).fill(null)
+  row[indexes.description] = input.description.trim()
+  const [year, month, day] = input.date.split('-')
+  row[indexes.date] = `${day}/${month}/${year}`
+  row[indexes.category] = input.category.trim()
+  row[indexes.amount] = input.amount / 100
+  row[indexes.paymentMethod] = input.paymentMethod.trim()
+  row[indexes.isFixed] = input.isFixed
+  row[indexes.isEssential] = input.isEssential
+  row[indexes.id] = id
+  // Mês/Ano and unknown auxiliary columns stay null so ARRAYFORMULA and other cells are untouched.
+  const searchRange = encodeURIComponent(`'${SHEET_NAME}'!A:${columnLetter(appendEnd)}`)
+  const appendUrl = `${snapshot.base}/values/${searchRange}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS&includeValuesInResponse=true`
+  let writeError: unknown
+  let reportedPositionMismatch = false
+  try {
+    let response: Response
+    try { response = await fetcher(appendUrl, { method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ majorDimension: 'ROWS', values: [row] }) }) }
+    catch { throw new GoogleSheetsError('A conexão caiu durante o append; o resultado pode ser incerto. A planilha será relida antes de qualquer nova tentativa.', 'AMBIGUOUS') }
+    if (response.status === 401) throw new GoogleSheetsError('A autorização expirou. Reconecte o Google e verifique a CUSTOS ANO antes de tentar novamente.', 'AUTH')
+    if (response.status === 403) throw new GoogleSheetsError('O Google recusou a escrita. Confirme que você tem permissão de edição na CUSTOS ANO.', 'ACCESS')
+    if (!response.ok) throw new GoogleSheetsError(`O Google Sheets recusou a escrita (HTTP ${response.status}). Nenhuma nova tentativa automática será feita.`, 'API')
+    const appendResponse = await response.json() as { updates?: { updatedRange?: string } }
+    const appendedRow = appendResponse.updates?.updatedRange?.match(/!A\$?(\d+):/i)?.[1]
+    if (!appendedRow || Number(appendedRow) !== expectedAppendRow) {
+      reportedPositionMismatch = true
+      throw new GoogleSheetsError(`O Google informou append na linha ${appendedRow ?? 'desconhecida'}, mas a próxima posição lógica era ${expectedAppendRow}. A planilha foi relida; confira antes de tentar novamente.`, 'AMBIGUOUS')
+    }
+  } catch (error) { writeError = error }
+
+  // Always re-read after the request, including a network failure, to resolve ambiguous writes safely.
+  let updated: GoogleSheetReadResult
+  try { updated = await readGoogleSheetLedger(spreadsheetId, accessToken, fetcher) }
+  catch (readError) {
+    if (writeError) throw writeError
+    throw new GoogleSheetsError('O append foi enviado, mas não foi possível confirmar o resultado relendo CUSTOS ANO. Não tente novamente até atualizar a planilha.', 'AMBIGUOUS')
+  }
+  const written = updated.transactions.find((transaction) => transaction.sheetRecordId === id)
+  if (written) {
+    if (reportedPositionMismatch) throw writeError
+    return { ...updated, transaction: written, alreadyPresent: false }
+  }
+  const nowPresent = updated.transactions.filter((transaction) => matchesCostRecord(transaction, input))
+  if (nowPresent.length === 1) return { ...updated, transaction: nowPresent[0], alreadyPresent: true }
+  if (writeError) throw writeError
+  throw new GoogleSheetsError('O append não foi confirmado na releitura da CUSTOS ANO. Nenhum retry automático foi feito.', 'AMBIGUOUS')
 }
 
 async function getJson(url: string, accessToken: string, fetcher: typeof fetch): Promise<Record<string, unknown>> {
@@ -146,5 +298,5 @@ export async function readGoogleSheetLedger(spreadsheetIdInput: string, accessTo
   if (!values?.length) throw new GoogleSheetsError('A aba CUSTOS ANO está vazia.', 'EMPTY')
   const transactions = mapGoogleSheetValues(values)
   const properties = metadata.properties as { title?: string } | undefined
-  return { spreadsheetId, spreadsheetTitle: properties?.title || 'Planilha Google', transactions, rowCount: values.length - 1 }
+  return { spreadsheetId, spreadsheetTitle: properties?.title || 'Planilha Google', transactions, rowCount: transactions.length }
 }

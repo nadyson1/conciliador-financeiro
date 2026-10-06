@@ -13,7 +13,8 @@ import type { DecisionKind, PersistedDecision } from './domain/localDecisions'
 import { GoogleSheetsPanel } from './components/GoogleSheetsPanel'
 import type { GoogleSheetsConnectionInfo } from './components/GoogleSheetsPanel'
 import { PwaUpdateNotice } from './components/PwaUpdateNotice'
-import { GoogleSheetsError, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
+import { AddCostYearDialog } from './components/AddCostYearDialog'
+import { GoogleSheetsError, appendCostYearRecord, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { addDecisionTombstone, listDecisionTombstones, removeDecisionTombstone, syncGoogleSheetDecisions, syncOneGoogleSheetDecision, syncOneGoogleSheetDeletion } from './integrations/googleSheetDecisions'
 import { forgetGoogleSheetLink, GOOGLE_SHEET_TAB_NAME, loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import type { SavedGoogleSheetLink } from './integrations/googleSheetLinkStorage'
@@ -102,6 +103,13 @@ export default function App() {
   const reconcileButtonRef = useRef<HTMLButtonElement | null>(null)
   const previousScreen = useRef(screen)
   const [showStickyReconcile, setShowStickyReconcile] = useState(false)
+  const [missingToAdd, setMissingToAdd] = useState<BankTransaction | null>(null)
+  const [missingWriteError, setMissingWriteError] = useState('')
+  const [missingWriteNotice, setMissingWriteNotice] = useState('')
+  const [writingMissingId, setWritingMissingId] = useState('')
+  const [reconnectingForWrite, setReconnectingForWrite] = useState(false)
+  const writingMissingRef = useRef(new Set<string>())
+  const [locallyAddedMissingPairs, setLocallyAddedMissingPairs] = useState<Record<string, string>>({})
 
   useEffect(() => {
     let active = true
@@ -398,14 +406,26 @@ export default function App() {
         const bank = data.bank.find((item) => bankIdentity(item) === record.identities[0]), sheet = data.sheet.find((item) => sheetIdentity(item) === record.selected[0])
         if (bank && sheet) confirmedPairs.set(bank.id, sheet.id)
       }
+      if (record.kind === 'MISSING_ADDED_TO_SHEET') {
+        const bank = data.bank.find((item) => bankIdentity(item) === record.identities[0])
+        const sheet = data.sheet.find((item) => sheetIdentity(item) === record.selected[0])
+        if (bank && sheet) confirmedPairs.set(bank.id, sheet.id)
+        else if (bank) ignoredBankIds.add(bank.id)
+      }
       if (record.kind === 'COMPOSITION_CONFIRMED' && (record.identities[1] === 'no-statement' || cardPdfs.some((entry) => entry.statement && (entry.statement.statementIdentity === record.identities[1] || entry.legacyStatementIdentity === record.identities[1])))) {
         const bank = data.bank.find((item) => bankIdentity(item) === record.identities[0])
         if (bank && record.selected.every((identity) => data.sheet.some((item) => sheetIdentity(item) === identity))) confirmedCompositions.set(bank.id, record.selected)
       }
       if (record.kind === 'CARD_MISSING_CONFIRMED' && cardPdfs.some((entry) => entry.statement && (record.identities[0].startsWith(`${entry.statement.statementIdentity}:`) || record.identities[0].startsWith(`${entry.legacyStatementIdentity}:`)))) cardMissingConfirmed.add(record.identities[0])
     }
+    for (const [bankKey, sheetKey] of Object.entries(locallyAddedMissingPairs)) {
+      const bank = data.bank.find((item) => bankIdentity(item) === bankKey)
+      const sheet = data.sheet.find((item) => sheetIdentity(item) === sheetKey)
+      if (bank && sheet) confirmedPairs.set(bank.id, sheet.id)
+      else if (bank) ignoredBankIds.add(bank.id)
+    }
     return { ignoredBankIds, ignoredSheetIdentities, rejectedPairKeys, confirmedPairs, confirmedCompositions, cardMissingConfirmed }
-  }, [savedDecisions, data, cardPdfs])
+  }, [savedDecisions, data, cardPdfs, locallyAddedMissingPairs])
   const statementPayments = useMemo(() => identifyStatementPayments(cardPdfs.flatMap((entry) => entry.statement ? [entry.statement] : []), data.bank), [cardPdfs, data.bank])
   const result = useMemo(() => reconcile(data.bank, data.sheet, {
     ignoredBankIds: hydratedDecisions.ignoredBankIds, rejectedPairKeys: hydratedDecisions.rejectedPairKeys, confirmedPairs: hydratedDecisions.confirmedPairs, confirmedCompositions: hydratedDecisions.confirmedCompositions,
@@ -443,6 +463,9 @@ export default function App() {
   const shownMissing = filteredItems.filter((item) => item.status === 'MISSING')
   const shownOutOfScope = filteredItems.filter((item) => item.status === 'OUT_OF_SCOPE')
   const shownMatched = filteredItems.filter((item) => item.status === 'MATCHED' && item.bank.type !== 'CARD_PAYMENT')
+  const costCategories = [...new Set((googleSheetRows ?? []).map((item) => item.category.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'pt-BR'))
+  const investFacilYields = shownOutOfScope.filter((item) => item.bank.outOfScopeSubtype === 'INVEST_FACIL_YIELD')
+  const otherOutOfScope = shownOutOfScope.filter((item) => item.bank.outOfScopeSubtype !== 'INVEST_FACIL_YIELD')
   const statementMatchedSheetIds = new Set(statementResults.flatMap((result) => result.matches.flatMap((match) => match.status === 'CARD_MATCHED' && match.sheet ? [match.sheet.id] : [])))
   const unmatchedFilteredSheet = result.unmatchedSheet.filter((sheet) => !statementMatchedSheetIds.has(sheet.id) && inPeriod(sheet, filterYear, filterMonth, fromDate, toDate))
   const canReconcile = sourceStatus.sheet === 'ACCEPTED' && data.sheet.length > 0 && ((sourceStatus.bank === 'ACCEPTED' && data.bank.length > 0) || cardPdfs.some((entry) => entry.statement != null))
@@ -547,6 +570,58 @@ export default function App() {
     if (decision === 'reject' && item.sheet && item.candidate) void persistDecision('PAIR_REJECTED', [bankId, sheetIdentity(item.sheet)])
   }
 
+  async function reconnectGoogleForCostWrite() {
+    if (!googleSheetLink) { setMissingWriteError('Vincule uma planilha Google antes de adicionar lançamentos. Cancele e conecte a planilha na tela inicial.'); return }
+    setReconnectingForWrite(true); setMissingWriteError('')
+    try {
+      const token = await requestGoogleSheetsAccessToken(googleClientId)
+      const refreshed = await readGoogleSheetLedger(googleSheetLink.spreadsheetId, token)
+      googleAccessToken.current = token
+      const nextLink: SavedGoogleSheetLink = { ...googleSheetLink, spreadsheetTitle: refreshed.spreadsheetTitle, sheetName: GOOGLE_SHEET_TAB_NAME, lastUpdated: new Date().toISOString(), autoConnect: true }
+      setGoogleSheetLink(nextLink); saveGoogleSheetLink(nextLink)
+      setGoogleSheetInfo({ ...nextLink, rowCount: refreshed.rowCount, connected: true })
+      setGoogleSheetRows(refreshed.transactions)
+      if (selectedLedgerSource.current === 'google' || !ledgerSourceChangedByUser.current) { setData((current) => ({ ...current, sheet: refreshed.transactions })); setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' })) }
+      void synchronizeSavedDecisions(refreshed.spreadsheetId, token)
+    } catch (error) { setMissingWriteError(error instanceof GoogleSheetsError ? error.message : 'Não foi possível reconectar ao Google Sheets. Os dados do formulário foram mantidos.') }
+    finally { setReconnectingForWrite(false) }
+  }
+
+  async function addMissingToCostYear(bank: BankTransaction, record: Parameters<typeof appendCostYearRecord>[2]) {
+    const bankKey = bankIdentity(bank)
+    if (writingMissingRef.current.has(bankKey)) return
+    if (!googleSheetLink) { setMissingWriteError('Vincule uma planilha Google para adicionar a nova linha.'); return }
+    if (!googleAccessToken.current) { setMissingWriteError('Conecte o Google antes de adicionar. Seus dados preenchidos foram mantidos.'); return }
+    writingMissingRef.current.add(bankKey)
+    setWritingMissingId(bankKey); setMissingWriteError('')
+    try {
+      const appended = await appendCostYearRecord(googleSheetLink.spreadsheetId, googleAccessToken.current, record)
+      const nextLink: SavedGoogleSheetLink = { ...googleSheetLink, spreadsheetTitle: appended.spreadsheetTitle, sheetName: GOOGLE_SHEET_TAB_NAME, lastUpdated: new Date().toISOString(), autoConnect: true }
+      setGoogleSheetLink(nextLink); saveGoogleSheetLink(nextLink)
+      setGoogleSheetRows(appended.transactions)
+      setGoogleSheetInfo({ ...nextLink, rowCount: appended.rowCount, connected: true })
+      const selectedSheetKey = sheetIdentity(appended.transaction)
+      setLocallyAddedMissingPairs((current) => ({ ...current, [bankKey]: selectedSheetKey }))
+      if (selectedLedgerSource.current === 'google' || !ledgerSourceChangedByUser.current) {
+        setData((current) => ({ ...current, sheet: appended.transactions }))
+        setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' }))
+      }
+      await persistDecision('MISSING_ADDED_TO_SHEET', [bankKey], [selectedSheetKey])
+      setMissingWriteNotice(appended.alreadyPresent ? 'Já havia uma linha igual em CUSTOS ANO; o vínculo foi confirmado sem criar duplicata.' : 'Lançamento adicionado à CUSTOS ANO e confirmado na conciliação.')
+      setMissingToAdd(null)
+      setMissingWriteError('')
+    } catch (error) {
+      if (error instanceof GoogleSheetsError && error.code === 'AUTH') {
+        googleAccessToken.current = ''
+        setGoogleSheetInfo((current) => current ? { ...current, connected: false } : current)
+      }
+      setMissingWriteError(error instanceof Error ? error.message : 'Não foi possível confirmar o append. Seus dados foram mantidos; atualize a planilha antes de tentar novamente.')
+    } finally {
+      writingMissingRef.current.delete(bankKey)
+      setWritingMissingId('')
+    }
+  }
+
   function confirmComposition(item: ReconciliationItem, statementIdentity: string | null, sheetIds: string[]) {
     const identities = sheetIds.map((id) => { const sheet = data.sheet.find((entry) => entry.id === id || sheetIdentity(entry) === id); return sheet ? sheetIdentity(sheet) : id })
     void persistDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), statementIdentity ?? 'no-statement'], identities)
@@ -630,10 +705,10 @@ export default function App() {
             {filteredItems.some((item) => item.compositionStatus === 'MATCHED') && <section className="review-list"><PanelTitle title="Pagamentos de cartão conciliados" note="Uma saída bancária pode corresponder a vários lançamentos Crédito_Bradesco"/>{filteredItems.filter((item) => item.compositionStatus === 'MATCHED').map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}</section>}
           </>}
           {tab === 'review' && <div className="review-list">{shownReview.map((item) => item.bank.type === 'CARD_PAYMENT' ? <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/> : <ReviewCard key={item.bank.id} item={item} onConfirm={() => decide(item, 'confirm')} onReject={() => decide(item, 'reject')} onIgnore={() => decide(item, 'ignore')}/>)}{!shownReview.length && <EmptyState title="Nenhum item para revisar" copy="A conciliação não encontrou itens pendentes neste período."/>}</div>}
-          {tab === 'missing' && <div className="review-list">{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')}/>)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
+          {tab === 'missing' && <div className="review-list">{missingWriteNotice && <p className="cost-write-notice" role="status">{missingWriteNotice}</p>}{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')} onAddToSheet={() => { setMissingWriteError(''); setMissingWriteNotice(''); setMissingToAdd(item.bank) }} canAddToSheet={item.bank.direction === 'DEBIT' && item.bank.type === 'EXPENSE'} />)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
           {tab === 'card' && <div className="review-list">{shownCardDivergences.map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}{!shownCardDivergences.length && <EmptyState title="Nenhuma divergência de cartão" copy="Todas as faturas têm uma composição confirmada ou não há pagamentos de cartão neste período."/>}</div>}
           {tab === 'statement' && statementResults.map((item) => <CardStatementResults key={item.entry.key} statement={item.statement} payment={item.payment} matches={item.matches} extractedTotal={item.extractedTotal} matchedTotal={item.matchedTotal} difference={item.difference} confirmations={item.confirmations} confirmedMissing={item.confirmedMissing} onConfirm={(transactionId, sheetId) => confirmStatementMatch(item.statement, transactionId, sheetId)} onConfirmMissing={(transactionId) => confirmCardMissing(item.statement, transactionId)} onUndo={(kind, identities) => { void undoStatementDecision(kind, item.statement, identities) }}/>)}
-          {tab === 'outofscope' && <div className="issue-columns"><section className="panel"><PanelTitle title="Movimentações fora da conciliação de despesas" note="Entradas, investimentos, transferências e tipos sem natureza confirmada"/>{shownOutOfScope.length ? shownOutOfScope.map((item) => <div className="issue-row" key={item.bank.id}><span className="status-icon blue">ℹ</span><div><strong>{item.bank.originalDescription}</strong><p>{dateLabel(item.bank.date)} · {item.bank.directionKnown === false ? 'Direção não identificada' : item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} · {formatCents(item.bank.amount)}</p><small>{item.sheet ? `Correspondência de investimento: ${item.sheet.originalDescription} · ${formatCents(item.sheet.amount)}` : outOfScopeReason(item.bank.type)}</small></div></div>) : <EmptyState title="Nenhuma movimentação fora do escopo" copy="Todas as movimentações deste período estão em outras seções."/>}</section></div>}
+          {tab === 'outofscope' && <div className="issue-columns"><section className="panel"><PanelTitle title="Movimentações fora da conciliação de despesas" note="Entradas, investimentos, transferências e tipos sem natureza confirmada"/>{shownOutOfScope.length ? <>{investFacilYields.length > 0 && <details className="investment-yield-group"><summary><strong>Rendimentos Invest Fácil</strong><span>{investFacilYields.length} créditos · total {formatCents(investFacilYields.reduce((sum, item) => sum + item.bank.amount, 0))}</span><small>Créditos de rendimento agrupados; não são lançados em CUSTOS ANO.</small></summary><div>{investFacilYields.map((item) => <p key={item.bank.id}>{dateLabel(item.bank.date)} · {item.bank.originalDescription} · {formatCents(item.bank.amount)}</p>)}</div></details>}{otherOutOfScope.map((item) => <div className="issue-row" key={item.bank.id}><span className="status-icon blue">ℹ</span><div><strong>{item.bank.originalDescription}</strong><p>{dateLabel(item.bank.date)} · {item.bank.directionKnown === false ? 'Direção não identificada' : item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} · {formatCents(item.bank.amount)}</p><small>{item.sheet ? `Correspondência de investimento: ${item.sheet.originalDescription} · ${formatCents(item.sheet.amount)}` : outOfScopeReason(item.bank.type)}</small></div></div>)}</> : <EmptyState title="Nenhuma movimentação fora do escopo" copy="Todas as movimentações deste período estão em outras seções."/>}</section></div>}
           {tab === 'duplicates' && <section className="panel"><PanelTitle title="Possíveis duplicidades na CUSTOS ANO" note="Sugestões baseadas em lançamentos da planilha; nada é removido automaticamente"/>{filteredDuplicates.length ? filteredDuplicates.map((group, index) => <div className="issue-row duplicate-group" key={`${group.source}-${index}`}><span className="status-icon orange">Ⅱ</span><div><strong>Confira este grupo · {group.transactionIds.length} lançamentos</strong>{group.transactionIds.map((id) => { const sheet = data.sheet.find((entry) => entry.id === id); return sheet ? <p className="duplicate-entry" key={id}>{dateLabel(sheet.date)} · {sheet.originalDescription} · {formatCents(sheet.amount)}{sheet.paymentMethod ? ` · ${sheet.paymentMethod}` : ''}</p> : null })}<small>Possíveis duplicidades precisam de confirmação manual.</small></div></div>) : <EmptyState title="Nenhuma duplicidade sugerida" copy="Nenhuma linha da CUSTOS ANO com data, valor e descrição parecida foi encontrada."/>}</section>}
           {tab === 'flags' && <section className="panel"><PanelTitle title="Lançamentos da planilha não encontrados no extrato" note="Podem pertencer a outra conta, período ou meio de pagamento"/>{unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).length ? unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).map((sheet) => <div className="issue-row" key={sheet.id}><span className="status-icon blue">↗</span><div><strong>{sheet.originalDescription}</strong><p>{dateLabel(sheet.date)} · {formatCents(sheet.amount)} · {sheet.category || 'Sem categoria'}</p><small>Não encontrado no extrato importado.</small><button className="text-button" onClick={() => ignoreSheet(sheet.id)}>Ignorar este lançamento</button></div></div>) : <EmptyState title="Sem sinalizações" copy="Não há lançamentos da planilha pendentes neste período."/>}</section>}
           <ExportBar result={{ ...result, duplicateGroups: filteredDuplicates }} items={filteredItems} banks={data.bank} sheets={data.sheet}/>
@@ -642,6 +717,7 @@ export default function App() {
       </main>
       {screen === 'home' && showStickyReconcile && <div className="sticky-reconcile" aria-label="Ação de conciliação"><button className="button button-primary button-launch" aria-label="Conciliar agora" onClick={runReconciliation} disabled={!canReconcile || !decisionsReady}>Conciliar agora <span aria-hidden="true">↗</span></button></div>}
       <PwaUpdateNotice />
+      {screen === 'results' && missingToAdd && <AddCostYearDialog transaction={missingToAdd} categories={costCategories} connected={Boolean(googleSheetInfo?.connected && googleAccessToken.current)} saving={writingMissingId === bankIdentity(missingToAdd) || reconnectingForWrite} error={missingWriteError} onCancel={() => { if (!writingMissingId) { setMissingToAdd(null); setMissingWriteError('') } }} onReconnect={() => void reconnectGoogleForCostWrite()} onSubmit={(record) => void addMissingToCostYear(missingToAdd, record)} />}
       <footer className="site-footer"><span>Conciliador Financeiro <span>·</span> Extratos e PDFs permanecem no dispositivo.</span><span>Aplicação local · CSV, Google Sheets e fatura PDF</span><span>Build de teste PWA</span></footer>
     </div>
   )
@@ -780,7 +856,7 @@ function CardSummaryNotice({ item }: { item: ReconciliationItem }) {
 }
 function outOfScopeReason(type: BankTransaction['type']) { return ({ INCOME: 'Entrada identificada; não é uma despesa ausente.', INVESTMENT: 'Movimentação de investimento, como aplicação ou resgate.', TRANSFER: 'Transferência entre contas.', OTHER: 'Natureza não confirmada; não foi presumida como despesa.', EXPENSE: 'Despesa fora da lista principal.', CARD_PAYMENT: 'Pagamento de fatura, tratado pela composição do cartão.' } as const)[type] }
 function TransactionBox({ label, transaction }: { label: string; transaction: BankTransaction | LedgerTransaction | null }) { return <div className="transaction-box"><span className="step-label">{label}</span>{transaction ? <><strong className="transaction-date">{dateLabel(transaction.date)}</strong><strong className="transaction-description">{transaction.originalDescription}</strong><strong className="transaction-amount">{formatCents(transaction.amount)}</strong><span className="transaction-meta">{transaction.source === 'BANK' && transaction.directionKnown === false ? 'Direção não identificada no arquivo' : transaction.direction === 'DEBIT' ? 'Saída' : 'Entrada'}{transaction.paymentMethod ? ` · Forma de pagamento: ${transaction.paymentMethod}` : ''}{transaction.source === 'SHEET' && transaction.category ? ` · ${transaction.category}` : ''}</span></> : <span className="no-candidate">Nenhum lançamento sugerido para comparar.</span>}</div> }
-function MissingCard({ item, onIgnore }: { item: ReconciliationItem; onIgnore: () => void }) { return <article className="missing-card"><span className="status-icon red">⌕</span><div className="missing-content"><span className="step-label">POSSÍVEL LANÇAMENTO AUSENTE</span><h2>{item.bank.originalDescription}</h2><p>{dateLabel(item.bank.date)} · Saída{item.bank.paymentMethod ? ` · Forma de pagamento: ${item.bank.paymentMethod}` : ''}</p><strong className="transaction-amount">{formatCents(item.bank.amount)}</strong><small>Nenhum lançamento correspondente foi encontrado na CUSTOS ANO.</small></div><button className="button button-outline" onClick={onIgnore}>Ignorar</button></article> }
+function MissingCard({ item, onIgnore, onAddToSheet, canAddToSheet }: { item: ReconciliationItem; onIgnore: () => void; onAddToSheet: () => void; canAddToSheet: boolean }) { return <article className="missing-card"><span className="status-icon red">⌕</span><div className="missing-content"><span className="step-label">POSSÍVEL LANÇAMENTO AUSENTE</span><h2>{item.bank.originalDescription}</h2><p>{dateLabel(item.bank.date)} · Saída{item.bank.paymentMethod ? ` · Forma de pagamento: ${item.bank.paymentMethod}` : ''}</p><strong className="transaction-amount">{formatCents(item.bank.amount)}</strong><small>Nenhum lançamento correspondente foi encontrado na CUSTOS ANO.</small></div>{canAddToSheet && <button className="button button-primary" onClick={onAddToSheet}>Adicionar à CUSTOS ANO</button>}<button className="button button-outline" onClick={onIgnore}>Ignorar</button></article> }
 function FilterBar({ years, year, month, fromDate, toDate, onYear, onMonth, onFrom, onTo }: { years: string[]; year: string; month: string; fromDate: string; toDate: string; onYear: (value: string) => void; onMonth: (value: string) => void; onFrom: (value: string) => void; onTo: (value: string) => void }) {
   return <section className="filter-bar"><div className="filter-heading"><span>⌕</span><strong>Filtrar período</strong></div><label>Ano<select value={year} onChange={(event) => onYear(event.target.value)}><option value="all">Todos os anos</option>{years.map((item) => <option key={item}>{item}</option>)}</select></label><label>Mês<select value={month} onChange={(event) => onMonth(event.target.value)}><option value="all">Todos os meses</option>{Array.from({ length: 12 }, (_, index) => <option key={index + 1} value={String(index + 1).padStart(2, '0')}>{String(index + 1).padStart(2, '0')} - {new Intl.DateTimeFormat('pt-BR', { month: 'long', timeZone: 'UTC' }).format(new Date(Date.UTC(2026, index, 1)))}</option>)}</select></label><label>De<input type="date" value={fromDate} onChange={(event) => onFrom(event.target.value)}/></label><label>Até<input type="date" value={toDate} onChange={(event) => onTo(event.target.value)}/></label></section>
 }

@@ -41,6 +41,7 @@ export interface BankTransaction {
   directionKnown?: boolean
   type: TransactionType
   investmentAction?: InvestmentAction
+  outOfScopeSubtype?: 'INVEST_FACIL_YIELD'
   paymentMethod: string
   category: ''
   month: ''

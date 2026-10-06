@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  extractSpreadsheetId, GOOGLE_SHEETS_SCOPE, GoogleSheetsError, mapGoogleSheetValues,
+  appendCostYearRecord, extractSpreadsheetId, generateCostYearId, GOOGLE_SHEETS_SCOPE, GoogleSheetsError, mapGoogleSheetValues,
   readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken,
 } from './googleSheets'
 
@@ -87,7 +87,108 @@ describe('leitura da aba financeira via Google Sheets', () => {
 
   it('interrompe a leitura ao encontrar IDs repetidos ou linhas inválidas', () => {
     expect(() => mapGoogleSheetValues([headers, values[1], [...values[1].slice(0, 2), 'row-id-001', ...values[1].slice(3)]])).toThrow(/ID contém valores repetidos/)
-    expect(() => mapGoogleSheetValues([headers, ['2026', 'Sem custo', 'row-id-002', '12/05/2026', '', '05 - Maio', 'Casa', 'Pix', 'Não', 'Sim']])).toThrow(/linha\(s\).*inválido/)
+    expect(() => mapGoogleSheetValues([headers, ['2026', 'Sem custo', 'row-id-002', '12/05/2026', '', '05 - Maio', 'Casa', 'Pix', 'Não', 'Sim']])).toThrow(/Integridade inválida|linha\(s\).*inválido/)
+  })
+
+  it('ignora linhas futuras que contêm apenas FALSE nos checkboxes', () => {
+    const futureDefaults = Array.from({ length: 250 }, () => ['', '', '', '', '', '', '', '', 'FALSE', 'FALSE'])
+    expect(() => mapGoogleSheetValues([headers, ...futureDefaults])).toThrow(/não contém lançamentos válidos/)
+    expect(mapGoogleSheetValues([headers, values[1], ...futureDefaults])).toHaveLength(1)
+  })
+
+  it('trata linha financeira sem ID como erro de integridade, não como linha vazia', () => {
+    expect(() => mapGoogleSheetValues([headers, ['2026', 'Compra sem ID', '', '12/05/2026', '94,50', '05 - Maio', 'Casa', 'Pix', 'FALSE', 'FALSE']]))
+      .toThrow(/Integridade inválida na linha 2.*ID/)
+  })
+
+  it('trata outros dados principais em linha incompleta como erro de integridade', () => {
+    expect(() => mapGoogleSheetValues([headers, ['2026', '', '', '', '', '', 'Casa', '', 'FALSE', 'FALSE']]))
+      .toThrow(/Integridade inválida na linha 2/)
+  })
+
+  it('gera ID hexadecimal de oito caracteres e repete em caso de colisão', () => {
+    const blocks = [[0x12, 0x34, 0x56, 0x78], [0xab, 0xcd, 0xef, 0x01]]
+    const randomBytes = (buffer: Uint8Array) => { buffer.set(blocks.shift()!); return buffer }
+    expect(generateCostYearId(['12345678'], randomBytes)).toBe('abcdef01')
+    expect(generateCostYearId([], (buffer) => { buffer.set([1, 2, 3, 4]); return buffer })).toMatch(/^[0-9a-f]{8}$/)
+  })
+
+  it('faz append na próxima linha lógica, ignora checkboxes futuros e não escreve Mês/Ano', async () => {
+    const futureDefaults = Array.from({ length: 250 }, () => ['', '', '', '', '', '', '', '', 'FALSE', 'FALSE'])
+    let currentValues = [headers, values[1], ...futureDefaults] as unknown[][]
+    let appendedUrl = ''
+    let appendedBody: { values: unknown[][] } | null = null
+    const fetcherMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes(':append')) {
+        appendedUrl = decodeURIComponent(url)
+        appendedBody = JSON.parse(String(init?.body)) as { values: unknown[][] }
+        const row = [...appendedBody.values[0]]
+        row[0] = ''
+        row[1] = 'Conta de telefone'
+        row[2] = String(row[2])
+        row[3] = ''
+        row[3] = '06/01/2026'
+        row[4] = '45,00'
+        row[5] = ''
+        row[6] = 'Casa'
+        row[7] = 'Débito automático'
+        row[8] = 'FALSE'
+        row[9] = 'FALSE'
+        currentValues.splice(2, 0, row)
+        return response({ updates: { updatedRange: "'CUSTOS ANO'!A3:J3" } })
+      }
+      if (url.includes('/values/')) return response({ values: currentValues })
+      return response({ properties: { title: 'Finanças' }, sheets: [{ properties: { sheetId: 1, title: 'CUSTOS ANO' } }] })
+    })
+    const fetcher = fetcherMock as unknown as typeof fetch
+    const result = await appendCostYearRecord('abcdefghijklmnop', 'token', { description: 'Conta de telefone', date: '2026-01-06', category: 'Casa', amount: 4500, paymentMethod: 'Débito automático', isFixed: false, isEssential: false }, fetcher, { randomBytes: (buffer) => { buffer.set([0x12, 0x34, 0x56, 0x78]); return buffer } })
+    expect(result).toMatchObject({ rowCount: 2, alreadyPresent: false, transaction: { sheetRecordId: '12345678' } })
+    expect(appendedUrl).toContain("'CUSTOS ANO'!A:H:append")
+    expect(appendedBody!.values[0]).toHaveLength(10)
+    expect(appendedBody!.values[0][5]).toBeNull()
+    expect(appendedBody!.values[0][0]).toBeNull()
+    expect(appendedBody!.values[0][8]).toBe(false)
+    expect(appendedBody!.values[0][8]).toBe(false)
+    expect(fetcherMock.mock.calls.filter(([url]) => String(url).includes(':append'))).toHaveLength(1)
+    expect(fetcherMock.mock.calls.every(([url, init]) => !String(url).includes(':batchClear') && init?.method !== 'DELETE' && !(String(url).includes('/values/') && init?.method === 'PUT'))).toBe(true)
+  })
+
+  it('não duplica uma linha financeira já existente', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ properties: { title: 'Finanças' }, sheets: [{ properties: { title: 'CUSTOS ANO' } }] }))
+      .mockResolvedValueOnce(response({ values }))
+    const result = await appendCostYearRecord('abcdefghijklmnop', 'token', { description: 'Mercado sintético', date: '2026-05-12', category: 'Casa', amount: 9450, paymentMethod: 'Pix', isFixed: false, isEssential: true }, fetcher)
+    expect(result.alreadyPresent).toBe(true)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(fetcher.mock.calls.some(([url]) => String(url).includes(':append'))).toBe(false)
+  })
+
+  it('não grava categoria não verificada quando ainda não há opções de categoria carregadas', async () => {
+    const currentValues: unknown[][] = [headers]
+    const fetcherMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      void init
+      if (url.includes('/values/')) return response({ values: currentValues })
+      return response({ properties: { title: 'Finanças' }, sheets: [{ properties: { title: 'CUSTOS ANO' } }] })
+    })
+    const fetcher = fetcherMock as unknown as typeof fetch
+    await expect(appendCostYearRecord('abcdefghijklmnop', 'token', { description: 'Conta modelo', date: '2026-01-06', category: 'Casa', amount: 1000, paymentMethod: 'Pix', isFixed: false, isEssential: false }, fetcher))
+      .rejects.toMatchObject({ code: 'INTEGRITY' })
+    expect(fetcherMock.mock.calls).toHaveLength(2)
+    expect(fetcherMock.mock.calls.some(([url]) => String(url).includes(':append'))).toBe(false)
+  })
+
+  it('releitura após resposta ambígua não repete o append', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ properties: { title: 'Finanças' }, sheets: [{ properties: { title: 'CUSTOS ANO' } }] }))
+      .mockResolvedValueOnce(response({ values }))
+      .mockRejectedValueOnce(new TypeError('network lost'))
+      .mockResolvedValueOnce(response({ properties: { title: 'Finanças' }, sheets: [{ properties: { title: 'CUSTOS ANO' } }] }))
+      .mockResolvedValueOnce(response({ values }))
+    await expect(appendCostYearRecord('abcdefghijklmnop', 'token', { description: 'Novo item', date: '2026-01-06', category: 'Casa', amount: 1000, paymentMethod: 'Pix', isFixed: false, isEssential: false }, fetcher, { randomBytes: (buffer) => { buffer.set([0, 0, 0, 1]); return buffer } }))
+      .rejects.toMatchObject({ code: 'AMBIGUOUS' })
+    expect(fetcher.mock.calls.filter(([url]) => String(url).includes(':append'))).toHaveLength(1)
   })
 
   it.each([[401, 'AUTH'], [403, 'ACCESS'], [404, 'NOT_FOUND']] as const)('classifica resposta HTTP %s', async (status, code) => {

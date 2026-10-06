@@ -42,6 +42,17 @@ describe('sincronização de decisões no Google Sheets', () => {
     expect(localStoreMocks.put).toHaveBeenCalledWith(newerRemote)
   })
 
+  it('sincroniza entre dispositivos a decisão de ausente já adicionado à CUSTOS ANO', async () => {
+    const added: PersistedDecision = { key: 'MISSING_ADDED_TO_SHEET:["bank:fingerprint"]', schemaVersion: 1, kind: 'MISSING_ADDED_TO_SHEET', identities: ['bank:fingerprint'], selected: ['sheet:record-8'], updatedAt: '2026-01-04T00:00:00.000Z' }
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(added)] }))
+    const result = await syncGoogleSheetDecisions('spreadsheet-id-12345', 'token', [], {}, fetcher)
+    expect(result).toEqual([added])
+    expect(localStoreMocks.put).toHaveBeenCalledWith(added)
+    expect(fetcher.mock.calls.slice(2).every(([url]) => decodeURIComponent(String(url)).includes('_CONCILIADOR'))).toBe(true)
+  })
+
   it('envia decisão local mais recente para a linha existente', async () => {
     const olderRemote = { ...decision, selected: ['sheet:old'], updatedAt: '2026-01-01T00:00:00.000Z' }
     const fetcher = vi.fn()
