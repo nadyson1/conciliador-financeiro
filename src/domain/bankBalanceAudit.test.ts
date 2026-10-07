@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { BankTransaction } from './types'
-import { auditBankBalance, summarizeMissingExpenses } from './bankBalanceAudit'
+import { auditBankBalance, selectMissingExpenses, summarizeMissingExpenses } from './bankBalanceAudit'
 
 const bank = (overrides: Partial<BankTransaction> = {}): BankTransaction => ({
   id: 'bank-1', source: 'BANK', sheetRecordId: null, bankTransactionId: 'tx-1', date: '2026-01-01',
@@ -39,6 +39,14 @@ describe('conferência aritmética do saldo bancário', () => {
     ])
     expect(result.reportedBalance).toBe(10000)
   })
+
+  it('não aplica tolerância automática para diferença de três centavos', () => {
+    const result = auditBankBalance([
+      bank({ id: 'opening', date: '2026-01-01', amount: 0, balanceAfter: 10000 }),
+      bank({ id: 'credit', date: '2026-01-02', amount: 10000, direction: 'CREDIT', balanceAfter: 19997 }),
+    ])
+    expect(result).toMatchObject({ calculatedBalance: 20000, reportedBalance: 19997, difference: -3, isBalanced: false })
+  })
 })
 
 describe('resumo de despesas ausentes', () => {
@@ -53,7 +61,9 @@ describe('resumo de despesas ausentes', () => {
       { status: 'REVIEW', bank: bank({ amount: 9000, direction: 'DEBIT', type: 'EXPENSE' }) },
       { status: 'MATCHED', bank: bank({ amount: 10000, direction: 'DEBIT', type: 'EXPENSE' }) },
     ]
-    expect(summarizeMissingExpenses(items)).toEqual({ count: 2, total: 3500 })
+    const visible = selectMissingExpenses(items)
+    expect(visible).toHaveLength(2)
+    expect(summarizeMissingExpenses(visible)).toEqual({ count: 2, total: 3500 })
   })
 
   it('acompanha o subconjunto visível após aplicar o filtro de período', () => {
@@ -61,7 +71,17 @@ describe('resumo de despesas ausentes', () => {
     const april = { status: 'MISSING', bank: bank({ date: '2026-04-10', amount: 2400, direction: 'DEBIT', type: 'EXPENSE' }) }
     const all = [march, april]
     const filtered = all.filter((item) => item.bank.date.startsWith('2026-03'))
-    expect(summarizeMissingExpenses(all)).toEqual({ count: 2, total: 3600 })
-    expect(summarizeMissingExpenses(filtered)).toEqual({ count: 1, total: 1200 })
+    expect(summarizeMissingExpenses(selectMissingExpenses(all))).toEqual({ count: 2, total: 3600 })
+    expect(summarizeMissingExpenses(selectMissingExpenses(filtered))).toEqual({ count: 1, total: 1200 })
+  })
+
+  it('usa a mesma seleção para contagem e total e exclui uma saída REFUNDED', () => {
+    const items = [
+      { status: 'MISSING', bank: bank({ id: 'missing', direction: 'DEBIT', type: 'EXPENSE', amount: 67770 }) },
+      { status: 'REFUNDED', bank: bank({ id: 'refunded', direction: 'DEBIT', type: 'EXPENSE', amount: 67770 }) },
+    ]
+    const visible = selectMissingExpenses(items)
+    expect(visible.map(({ bank: transaction }) => transaction.id)).toEqual(['missing'])
+    expect(summarizeMissingExpenses(visible)).toEqual({ count: 1, total: 67770 })
   })
 })

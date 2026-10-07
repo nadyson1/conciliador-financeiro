@@ -1,8 +1,8 @@
 export type Source = 'SHEET' | 'BANK'
 export type Direction = 'DEBIT' | 'CREDIT'
-export type TransactionType = 'EXPENSE' | 'INVESTMENT' | 'INVESTMENT_INCOME' | 'INCOME' | 'TRANSFER' | 'CARD_PAYMENT' | 'OTHER'
+export type TransactionType = 'EXPENSE' | 'INVESTMENT' | 'INVESTMENT_INCOME' | 'INCOME' | 'TRANSFER' | 'CARD_PAYMENT' | 'REFUND' | 'OTHER'
 export type InvestmentAction = 'APPLICATION' | 'RESCUE' | null
-export type MatchStatus = 'MATCHED' | 'REVIEW' | 'CARD_DIVERGENCE' | 'CARD_PAYMENT_IDENTIFIED' | 'MISSING' | 'DUPLICATE' | 'UNMATCHED_SHEET' | 'IGNORED' | 'OUT_OF_SCOPE'
+export type MatchStatus = 'MATCHED' | 'REVIEW' | 'REFUNDED' | 'CARD_DIVERGENCE' | 'CARD_PAYMENT_IDENTIFIED' | 'MISSING' | 'DUPLICATE' | 'UNMATCHED_SHEET' | 'IGNORED' | 'OUT_OF_SCOPE'
 export type ReconciliationReasonCode = 'MISSING_NO_CANDIDATE' | 'LEGACY_PAYMENT_ALIAS' | 'OUT_OF_SCOPE_TRANSFER' | 'OUT_OF_SCOPE_INVESTMENT' | 'NOT_EXPENSE'
 
 export interface LedgerTransaction {
@@ -32,6 +32,9 @@ export interface LedgerTransaction {
 export interface BankTransaction {
   id: string
   sourceRow?: number
+  statementSourceId?: string
+  statementSourceIds?: string[]
+  statementFileName?: string
   source: 'BANK'
   sheetRecordId: null
   bankTransactionId: string
@@ -62,6 +65,7 @@ export interface CsvDocument {
   headers: string[]
   rows: Record<string, string>[]
   auxiliaryRows: Record<string, string>[]
+  auxiliaryRowsStartIndex?: number
   auxiliarySectionLabel: string | null
   statementPeriodStart: string | null
   statementPeriodEnd: string | null
@@ -94,12 +98,15 @@ export interface RowIssue {
 
 export interface ExcludedBankRow {
   row: number
-  reason: 'EMPTY' | 'REPEATED_HEADER' | 'NO_MOVEMENT' | 'FOOTER_OR_METADATA' | 'OUTSIDE_STATEMENT_PERIOD'
+  reason: 'EMPTY' | 'REPEATED_HEADER' | 'NO_MOVEMENT' | 'FOOTER_OR_METADATA' | 'OUTSIDE_STATEMENT_PERIOD' | 'DUPLICATE_AUXILIARY'
   date: string | null
   description: string
+  document?: string | null
   balanceAfter: number | null
   amount: number | null
   direction: Direction | null
+  credit?: number | null
+  debit?: number | null
 }
 
 export interface ParsedTransactions<T extends Transaction> {
@@ -131,6 +138,7 @@ export interface ReconciliationItem {
   compositionStatus: 'MATCHED' | 'REVIEW' | 'NO_MATCH' | 'LIMITED' | null
   cardSummary?: CardPaymentSummary | null
   reasonCode?: ReconciliationReasonCode
+  reviewReason?: 'REFUND_AMBIGUITY' | 'ASSIGNMENT_CONFLICT' | 'DIRECTION_UNCERTAIN'
 }
 
 export interface CardPaymentSummary {
@@ -244,6 +252,7 @@ export interface DuplicateGroup {
 
 export interface ReconciliationResult {
   items: ReconciliationItem[]
+  bankRefundGroups: BankRefundGroup[]
   unmatchedSheet: LedgerTransaction[]
   duplicateGroups: DuplicateGroup[]
   totals: {
@@ -255,4 +264,14 @@ export interface ReconciliationResult {
     calculatedFinalBalance: number | null
     balanceDifference: number | null
   }
+}
+
+export interface BankRefundGroup {
+  id: string
+  status: 'REFUNDED' | 'PARTIAL' | 'REVIEW'
+  originalTransactionIds: string[]
+  refundTransactionId: string
+  grossAmount: number | null
+  refundAmount: number
+  netAmount: number | null
 }

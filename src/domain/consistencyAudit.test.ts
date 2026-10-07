@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { auditConsistency, auditDecisionMerge, DECISION_DOMAIN, derivedMismatchSeverity, filterAuditFindings, recomputeWithoutPersistedDecisions, type AuditFinding } from './consistencyAudit'
-import type { CardStatement, CardStatementMatch, CardStatementTransaction, LedgerTransaction } from './types'
+import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, LedgerTransaction, ReconciliationItem } from './types'
 import type { PersistedDecision } from './localDecisions'
 import { cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity, stableFingerprint } from './identity'
 
@@ -16,6 +16,68 @@ const missingMatch = (): CardStatementMatch => ({ transaction: statement.transac
 const oldMissing: PersistedDecision = { key: 'CARD_MISSING_CONFIRMED:["old-identity"]', schemaVersion: 1, kind: 'CARD_MISSING_CONFIRMED', identities: ['old-identity'], selected: [], updatedAt: '2026-02-03T00:00:00.000Z' }
 
 describe('consistency audit', () => {
+  it('diagnostica REVIEW sem candidato, estorno ainda ausente e duplicata entre extratos', () => {
+    const makeBank = (id: string, sourceId?: string): BankTransaction => ({ id, source: 'BANK', sheetRecordId: null, bankTransactionId: id, date: '2026-09-18', description: 'PIX QR CODE ESTATICO', originalDescription: 'PIX QR CODE ESTATICO', amount: 67770, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: '', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {}, ...(sourceId ? { statementSourceId: sourceId, statementFileName: `${sourceId}.csv` } : {}) })
+    const bank = makeBank('original', 'statement-a')
+    const reviewItem = { bank: makeBank('review'), status: 'REVIEW', sheet: null, candidate: null, composition: [], compositionOptions: [], compositionStatus: null } as unknown as ReconciliationItem
+    const missingItem = { bank, status: 'MISSING', sheet: null, candidate: null, composition: [], compositionOptions: [], compositionStatus: null } as unknown as ReconciliationItem
+    const secondCopy = makeBank('duplicate', 'statement-b')
+    const report = auditConsistency({ banks: [bank, secondCopy], sheets: [], statements: [], currentCardMatches: [], localDecisions: [], currentBankItems: [reviewItem, missingItem], bankRefundGroups: [{ id: 'refund-group', status: 'REFUNDED', originalTransactionIds: ['original'], refundTransactionId: 'refund', grossAmount: 67770, refundAmount: 67770, netAmount: 0 }] })
+    expect(report.findings.map((finding) => finding.code)).toEqual(expect.arrayContaining(['REVIEW_WITHOUT_CANDIDATES', 'REFUNDED_BUT_MISSING', 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS']))
+  })
+
+  it('não trata provenance de duas fontes em uma movimentação já consolidada como duplicata', () => {
+    const merged: BankTransaction = { id: 'merged-pix', source: 'BANK', sheetRecordId: null, bankTransactionId: 'merged-pix', date: '2026-09-18', description: 'PIX QR CODE ESTATICO', originalDescription: 'PIX QR CODE ESTATICO', amount: 67770, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: '', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {}, statementSourceId: 'statement-a', statementSourceIds: ['statement-a', 'statement-b'], statementFileName: 'statement-a.csv' }
+    const sourceA = { ...merged, id: 'source-a', statementSourceId: 'statement-a', statementSourceIds: ['statement-a'] }
+    const sourceB = { ...merged, id: 'source-b', statementSourceId: 'statement-b', statementSourceIds: ['statement-b'] }
+    const report = auditConsistency({ banks: [merged], bankSourceRows: [{ sourceId: 'statement-a', sourceName: 'A.csv', transactions: [sourceA] }, { sourceId: 'statement-b', sourceName: 'B.csv', transactions: [sourceB] }], sheets: [], statements: [], currentCardMatches: [], localDecisions: [] })
+    expect(report.findings.some((finding) => finding.code === 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS')).toBe(false)
+    expect(report.summary.review).toBe(0)
+    expect(report.summary.attention).toBe(0)
+  })
+
+  it('não cria uma REVIEW por cada uma das 73 sobreposições já consolidadas', () => {
+    const banks: BankTransaction[] = Array.from({ length: 73 }, (_, index) => ({ id: `merged-${index}`, source: 'BANK', sheetRecordId: null, bankTransactionId: `merged-${index}`, date: `2026-09-${String((index % 28) + 1).padStart(2, '0')}`, description: `PIX ${index}`, originalDescription: `PIX ${index}`, amount: 1000 + index, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: '', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {}, statementSourceId: 'statement-a', statementSourceIds: ['statement-a', 'statement-b'] }))
+    const report = auditConsistency({ banks, sheets: [], statements: [], currentCardMatches: [], localDecisions: [] })
+    expect(report.findings.filter((finding) => finding.code === 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS')).toHaveLength(0)
+    expect(report.summary.review).toBe(0)
+    expect(report.summary.attention).toBe(0)
+  })
+
+  it('mantém finding quando entidades equivalentes de sources disjuntas sobreviveram ao merge', () => {
+    const makeBank = (id: string, sourceId: string): BankTransaction => ({ id, source: 'BANK', sheetRecordId: null, bankTransactionId: id, date: '2026-09-18', description: 'PIX QR CODE ESTATICO', originalDescription: 'PIX QR CODE ESTATICO', amount: 67770, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: '', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {}, statementSourceId: sourceId, statementSourceIds: [sourceId], statementFileName: `${sourceId}.csv` })
+    const report = auditConsistency({ banks: [makeBank('survivor-a', 'statement-a'), makeBank('survivor-b', 'statement-b')], sheets: [], statements: [], currentCardMatches: [], localDecisions: [] })
+    expect(report.findings.filter((finding) => finding.code === 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS')).toHaveLength(1)
+    expect(report.findings[0]).toMatchObject({ severity: 'REVIEW', title: 'Possível duplicidade entre extratos não resolvida', technical: { bankTransactionIds: ['survivor-a', 'survivor-b'] } })
+    expect(report.summary.attention).toBe(1)
+  })
+
+  it.each([
+    { label: 'valor', override: { amount: 67771, direction: 'DEBIT' as const } },
+    { label: 'direção', override: { amount: 67770, direction: 'CREDIT' as const } },
+  ])('mantém em revisão uma representação conflitante entre fontes por $label', ({ override }) => {
+    const makeRow = (id: string, sourceId: string, values: { amount: number; direction: 'DEBIT' | 'CREDIT' }): BankTransaction => ({ id, source: 'BANK', sheetRecordId: null, bankTransactionId: id, date: '2026-09-18', description: 'PIX QR CODE ESTATICO', originalDescription: 'PIX QR CODE ESTATICO', amount: values.amount, direction: values.direction, directionKnown: true, type: 'EXPENSE', paymentMethod: '', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {}, statementSourceId: sourceId, statementSourceIds: [sourceId] })
+    const sourceA = makeRow('a', 'statement-a', { amount: 67770, direction: 'DEBIT' })
+    const sourceB = makeRow('b', 'statement-b', override)
+    const report = auditConsistency({ banks: [sourceA], bankSourceRows: [{ sourceId: 'statement-a', sourceName: 'A.csv', transactions: [sourceA] }, { sourceId: 'statement-b', sourceName: 'B.csv', transactions: [sourceB] }], sheets: [], statements: [], currentCardMatches: [], localDecisions: [] })
+    expect(report.findings).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS', severity: 'REVIEW', title: 'Os extratos divergem sobre a mesma movimentação' })]))
+    expect(report.summary.review).toBe(1)
+  })
+
+  it('audita divergência de contadores e fontes que deveriam ter saído da sessão', () => {
+    const bank: BankTransaction = { id: 'stale-tx', source: 'BANK', sheetRecordId: null, bankTransactionId: 'stale-tx', date: '2026-10-01', description: 'PIX', originalDescription: 'PIX ENVIADO', amount: 67770, direction: 'DEBIT', type: 'EXPENSE', paymentMethod: '', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {}, statementSourceId: 'old-csv', statementSourceIds: ['old-csv'] }
+    const item = { bank, status: 'MISSING', sheet: null, candidate: null, composition: [], compositionOptions: [], compositionStatus: null } as unknown as ReconciliationItem
+    const report = auditConsistency({
+      banks: [bank], sheets: [], statements: [], currentCardMatches: [], localDecisions: [], currentBankItems: [item],
+      missingCounterCollections: [{ source: 'card', items: [item] }, { source: 'lista', items: [] }],
+      activeDriveSourceIds: [], currentDriveSourceIds: ['pdf-a', 'pdf-b'], missingDriveSourceIds: ['pdf-a'],
+      duplicateInvoiceSources: [{ identity: 'invoice-x', sourceIds: ['pdf-a', 'pdf-b'] }],
+    })
+    expect(report.findings.map(({ code }) => code)).toEqual(expect.arrayContaining(['MISSING_COUNT_DIVERGENCE', 'STALE_ACTIVE_SOURCE', 'DUPLICATE_PRESENT_BUT_MARKED_MISSING']))
+    const divergence = report.findings.find(({ code }) => code === 'MISSING_COUNT_DIVERGENCE')!
+    expect(divergence.technical?.presentInSummaryOnly).toMatchObject([{ item: { bank: { id: 'stale-tx', originalDescription: 'PIX ENVIADO', amount: 67770 } } }])
+  })
+
   it('exclui compra neutralizada por estorno agregado da auditoria de ausências e candidatos', () => {
     const canceled = { ...statement.transactions[0], financialStatus: 'REFUNDED' as const, refundGroupId: 'refund-group-synthetic' }
     const invoice = { ...statement, transactions: [canceled], refundGroups: [{ id: 'refund-group-synthetic', cardIdentifier: '0000', date: canceled.date, merchant: 'LOJA MODELO', transactionIds: [canceled.id], refundTransactionId: 'refund-credit', purchaseGroupAmount: 299, refundAmount: 299, netAmount: 0, installmentCount: 1 }] }

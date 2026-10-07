@@ -113,10 +113,11 @@ export function descriptionSimilarity(left: string, right: string): number {
   return Math.max(dice, containment * 0.92)
 }
 
-export function transactionType(description: string, paymentMethod = ''): 'EXPENSE' | 'INVESTMENT' | 'INVESTMENT_INCOME' | 'INCOME' | 'TRANSFER' | 'CARD_PAYMENT' | 'OTHER' {
+export function transactionType(description: string, paymentMethod = ''): 'EXPENSE' | 'INVESTMENT' | 'INVESTMENT_INCOME' | 'INCOME' | 'TRANSFER' | 'CARD_PAYMENT' | 'REFUND' | 'OTHER' {
   const value = normalizeDescription(description)
   const payment = normalizeDescription(paymentMethod)
   if (/^gastos cartao de credito(?: |$)/.test(value)) return 'CARD_PAYMENT'
+  if (/^(?:devolucao|estorno|reembolso)(?: pix| transferencia| compra| pagamento)?(?: |$)/.test(value) || /\b(?:devolucao|estorno|reembolso)\b/.test(value)) return 'REFUND'
   if (/^rentab invest facilcred(?: |$)/.test(value)) return 'INVESTMENT_INCOME'
   if (/resg|resgate|venc(?:imento)? cdb|resg venc/.test(value)) return 'INVESTMENT'
   if (/aplicacao/.test(value) || payment === 'investimento') return 'INVESTMENT'

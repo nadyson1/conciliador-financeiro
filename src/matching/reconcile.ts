@@ -1,4 +1,4 @@
-import type { BankTransaction, CardCompositionOption, DuplicateGroup, LedgerTransaction, MatchCandidate, ReconciliationItem, ReconciliationResult } from '../domain/types'
+import type { BankRefundGroup, BankTransaction, CardCompositionOption, DuplicateGroup, LedgerTransaction, MatchCandidate, ReconciliationItem, ReconciliationResult } from '../domain/types'
 import { descriptionSimilarity, normalizeDescription } from '../importers/normalize'
 import { auditBankBalance } from '../domain/bankBalanceAudit'
 
@@ -8,6 +8,7 @@ export const MATCHING_CONFIG = {
   automaticMatchScore: 85,
   globalAmbiguityMargin: 10,
   cardPayment: { maxCandidates: 24, maxItems: 18, maxSearchNodes: 75_000, maxSolutions: 8, searchHorizonDays: 365 },
+  bankRefund: { windowDays: 60 },
 } as const
 
 export interface ReviewDecisions {
@@ -152,16 +153,62 @@ function searchCompositions(bank: BankTransaction, sheets: LedgerTransaction[]):
   return { options, limited, candidateCount: candidates.length, candidateTotal }
 }
 
-function emptyItem(bank: BankTransaction, status: ReconciliationItem['status'], reasonCode?: ReconciliationItem['reasonCode']): ReconciliationItem {
-  return { bank, sheet: null, status, candidate: null, composition: [], compositionOptions: [], compositionStatus: null, cardSummary: null, ...(reasonCode ? { reasonCode } : {}) }
+function emptyItem(bank: BankTransaction, status: ReconciliationItem['status'], reasonCode?: ReconciliationItem['reasonCode'], reviewReason?: ReconciliationItem['reviewReason']): ReconciliationItem {
+  return { bank, sheet: null, status, candidate: null, composition: [], compositionOptions: [], compositionStatus: null, cardSummary: null, ...(reasonCode ? { reasonCode } : {}), ...(reviewReason ? { reviewReason } : {}) }
+}
+
+function analyzeBankRefunds(banks: BankTransaction[]): BankRefundGroup[] {
+  const refunds = banks.filter((bank) => bank.type === 'REFUND' && bank.direction === 'CREDIT')
+  const originals = banks.filter((bank) => bank.direction === 'DEBIT' && /\bpix\b/.test(normalizeDescription(bank.originalDescription)) && (bank.type === 'EXPENSE' || bank.type === 'OTHER'))
+  const inWindow = (refund: BankTransaction, original: BankTransaction) => {
+    const age = dayNumber(refund.date) - dayNumber(original.date)
+    return age > 0 && age <= MATCHING_CONFIG.bankRefund.windowDays
+  }
+  const exactByRefund = new Map(refunds.map((refund) => [refund.id, originals.filter((original) => original.amount === refund.amount && inWindow(refund, original))]))
+  const exactOriginalIds = new Set([...exactByRefund.values()].flatMap((items) => items.map((item) => item.id)))
+  const candidatesByRefund = new Map<string, BankTransaction[]>()
+  const candidateRefundsByOriginal = new Map<string, BankTransaction[]>()
+  for (const refund of refunds) {
+    const exact = exactByRefund.get(refund.id) ?? []
+    // Exact-value evidence wins. A smaller, unrelated refund must not compete with a complete refund.
+    const partial = exact.length ? [] : originals.filter((original) => original.amount > refund.amount
+      && !exactOriginalIds.has(original.id) && inWindow(refund, original))
+    // A partial amount alone is weak evidence. Only retain it when one PIX debit is uniquely plausible.
+    const candidates = exact.length ? exact : partial.length === 1 ? partial : []
+    candidatesByRefund.set(refund.id, candidates)
+    for (const original of candidates) candidateRefundsByOriginal.set(original.id, [...(candidateRefundsByOriginal.get(original.id) ?? []), refund])
+  }
+  const groups: BankRefundGroup[] = []
+  for (const refund of refunds) {
+    const candidates = candidatesByRefund.get(refund.id) ?? []
+    if (!candidates.length) continue
+    const contested = candidates.some((original) => (candidateRefundsByOriginal.get(original.id) ?? []).length > 1)
+    if (candidates.length > 1 || contested) {
+      groups.push({ id: `bank-refund-${refund.id}`, status: 'REVIEW', originalTransactionIds: candidates.map((item) => item.id), refundTransactionId: refund.id, grossAmount: null, refundAmount: refund.amount, netAmount: null })
+      continue
+    }
+    const original = candidates[0]
+    groups.push({
+      id: `bank-refund-${refund.id}`, status: refund.amount === original.amount ? 'REFUNDED' : 'PARTIAL',
+      originalTransactionIds: [original.id], refundTransactionId: refund.id,
+      grossAmount: original.amount, refundAmount: refund.amount, netAmount: original.amount - refund.amount,
+    })
+  }
+  return groups
 }
 
 export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[], decisions: ReviewDecisions = {}): ReconciliationResult {
   const ignored = decisions.ignoredBankIds ?? new Set<string>(), rejected = decisions.rejectedPairKeys ?? new Set<string>()
   const confirmed = decisions.confirmedPairs ?? new Map<string, string>(), confirmedCompositions = decisions.confirmedCompositions ?? new Map<string, string[]>()
   const identifiedCardPaymentIds = decisions.identifiedCardPaymentIds ?? new Set<string>()
+  const bankRefundGroups = analyzeBankRefunds(banks)
+  const refundedOriginalIds = new Set(bankRefundGroups.filter((group) => group.status === 'REFUNDED').flatMap((group) => group.originalTransactionIds))
+  const ambiguousOriginalIds = new Set(bankRefundGroups.filter((group) => group.status === 'REVIEW').flatMap((group) => group.originalTransactionIds))
+  const refundIds = new Set(bankRefundGroups.map((group) => group.refundTransactionId))
+  const refundedCreditIds = new Set(bankRefundGroups.filter((group) => group.status === 'REFUNDED').map((group) => group.refundTransactionId))
   const duplicateGroups = findDuplicateGroups(sheets)
-  const allCandidates = banks.flatMap((bank) => sheets.map((sheet) => candidate(bank, sheet)).filter((item): item is MatchCandidate => item != null && !rejected.has(pairKey(item.bankId, item.sheetId))))
+  const excludedRefundMatchingIds = new Set([...refundedOriginalIds, ...ambiguousOriginalIds, ...refundIds])
+  const allCandidates = banks.filter((bank) => !excludedRefundMatchingIds.has(bank.id)).flatMap((bank) => sheets.map((sheet) => candidate(bank, sheet)).filter((item): item is MatchCandidate => item != null && !rejected.has(pairKey(item.bankId, item.sheetId))))
   const byBank = groupBy(allCandidates, (item) => item.bankId)
   const usedBanks = new Set<string>(), usedSheets = new Set<string>(), matches = new Map<string, MatchCandidate>()
   for (const [bankId, sheetId] of confirmed) {
@@ -236,6 +283,9 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
 
   const items: ReconciliationItem[] = banks.map((bank) => {
     if (ignored.has(bank.id)) return emptyItem(bank, 'IGNORED')
+    if (refundedOriginalIds.has(bank.id)) return emptyItem(bank, 'REFUNDED')
+    if (ambiguousOriginalIds.has(bank.id)) return emptyItem(bank, 'REVIEW', undefined, 'REFUND_AMBIGUITY')
+    if (refundIds.has(bank.id)) return refundedCreditIds.has(bank.id) ? emptyItem(bank, 'REFUNDED') : emptyItem(bank, 'OUT_OF_SCOPE', 'NOT_EXPENSE')
     if (bank.type === 'CARD_PAYMENT') {
       if (identifiedCardPaymentIds.has(bank.id)) return emptyItem(bank, 'CARD_PAYMENT_IDENTIFIED')
       const composition = compositionByBank.get(bank.id) ?? []
@@ -262,8 +312,8 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
     const available = plausible.filter((item) => !plannedSheetIds.has(item.sheetId)).sort((a, b) => b.score - a.score)
     const best = available[0]
     if (best) return { ...emptyItem(bank, 'REVIEW'), sheet: sheets.find((sheet) => sheet.id === best.sheetId) ?? null, candidate: best }
-    if (plausible.length) return emptyItem(bank, 'REVIEW')
-    if (bank.directionKnown === false) return emptyItem(bank, 'REVIEW')
+    if (plausible.length) return emptyItem(bank, 'REVIEW', undefined, 'ASSIGNMENT_CONFLICT')
+    if (bank.directionKnown === false) return emptyItem(bank, 'REVIEW', undefined, 'DIRECTION_UNCERTAIN')
     return emptyItem(bank, 'MISSING', 'MISSING_NO_CANDIDATE')
   })
   const matchedSheetIds = new Set([...matches.values()].map((item) => item.sheetId))
@@ -271,12 +321,13 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
   const reviewSheetIds = new Set(items.filter((item) => item.status === 'REVIEW' && item.sheet).map((item) => item.sheet!.id))
   const duplicateSheetIds = new Set(duplicateGroups.filter((group) => group.source === 'SHEET').flatMap((group) => group.transactionIds))
   const unmatchedSheet = sheets.filter((sheet) => sheet.type === 'EXPENSE' && !matchedSheetIds.has(sheet.id) && !reviewSheetIds.has(sheet.id) && !duplicateSheetIds.has(sheet.id))
-  const balanceAudit = auditBankBalance(banks)
-  return { items, unmatchedSheet, duplicateGroups, totals: {
+  const sourceIds = new Set(banks.map((bank) => bank.statementSourceId ?? 'single-source'))
+  const balanceAudit = sourceIds.size <= 1 ? auditBankBalance(banks) : null
+  return { items, unmatchedSheet, duplicateGroups, bankRefundGroups, totals: {
     bankDebit: banks.filter((bank) => bank.direction === 'DEBIT').reduce((sum, bank) => sum + bank.amount, 0),
     bankCredit: banks.filter((bank) => bank.direction === 'CREDIT').reduce((sum, bank) => sum + bank.amount, 0), sheetTotal: sheets.reduce((sum, sheet) => sum + sheet.amount, 0),
-    initialBalance: balanceAudit.initialBalance, finalBalance: balanceAudit.reportedBalance,
-    calculatedFinalBalance: balanceAudit.calculatedBalance, balanceDifference: balanceAudit.difference,
+    initialBalance: balanceAudit?.initialBalance ?? null, finalBalance: balanceAudit?.reportedBalance ?? null,
+    calculatedFinalBalance: balanceAudit?.calculatedBalance ?? null, balanceDifference: balanceAudit?.difference ?? null,
   } }
 }
 

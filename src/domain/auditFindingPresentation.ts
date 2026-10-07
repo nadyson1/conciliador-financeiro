@@ -26,6 +26,12 @@ const descriptions: Record<AuditFinding['code'], { title: string; explanation: s
   REJECTED_CANDIDATE_FILTERED: { title: 'Uma rejeição salva removeu uma linha compatível', explanation: 'Uma decisão anterior está excluindo uma linha que a busca atual considera candidata.' },
   DECISION_STATUS: { title: 'Uma decisão salva precisa de conferência', explanation: 'O estado atual de uma decisão não pode ser aplicado com segurança ao resultado analisado.' },
   SYNC_PENDING: { title: 'Há alterações aguardando sincronização', explanation: 'Algumas decisões ainda não foram atualizadas entre este dispositivo e a cópia sincronizada.' },
+  REVIEW_WITHOUT_CANDIDATES: { title: 'Movimentação enviada para revisão sem candidato', explanation: 'A conciliação marcou uma movimentação para revisão, mas não encontrou uma correspondência plausível.' },
+  REFUNDED_BUT_MISSING: { title: 'Uma saída devolvida ainda aparece como ausente', explanation: 'Uma devolução integral foi identificada, mas a movimentação original continua na lista de ausências.' },
+  DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS: { title: 'Possível divergência entre extratos', explanation: 'O mesmo movimento pode ter permanecido duplicado após a consolidação, ou os arquivos podem divergir sobre seus dados. Sobreposições já consolidadas são tratadas normalmente e não geram este aviso.' },
+  STALE_ACTIVE_SOURCE: { title: 'Uma movimentação usa uma origem que já não está ativa', explanation: 'A conciliação ainda inclui uma movimentação cuja fonte não aparece mais na listagem atual do Drive.' },
+  MISSING_COUNT_DIVERGENCE: { title: 'Os números de Ausentes não conferem', explanation: 'Os contadores da tela receberam listas diferentes de lançamentos ausentes.' },
+  DUPLICATE_PRESENT_BUT_MARKED_MISSING: { title: 'Um PDF duplicado presente foi marcado como ausente', explanation: 'Uma fatura continua presente por mais de um arquivo, mas um dos arquivos foi contado como removido.' },
 }
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' ? value as Record<string, unknown> : {}

@@ -1,4 +1,4 @@
-import type { BankTransaction, ColumnMap, ExcludedBankRow, LedgerTransaction, ParsedTransactions, RowIssue } from '../domain/types'
+import type { BankTransaction, ColumnMap, CsvDocument, ExcludedBankRow, LedgerTransaction, ParsedTransactions, RowIssue } from '../domain/types'
 import { classifySheetRecord, investmentAction, normalizeAmount, normalizeDate, parseBoolean, transactionType } from './normalize'
 import { stableFingerprint } from '../domain/identity'
 
@@ -60,9 +60,12 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap, ph
       reason,
       date: normalizeDate(cell(row, map.date)),
       description: cell(row, map.description),
+      document: cell(row, map.id) || null,
       balanceAfter: map.balance ? normalizeSignedBalance(cell(row, map.balance)) : null,
       amount: excludedAmount == null ? null : Math.abs(excludedAmount),
       direction: debitText ? 'DEBIT' : creditText ? 'CREDIT' : null,
+      credit: credit == null ? null : Math.abs(credit),
+      debit: debit == null ? null : Math.abs(debit),
     })
   }
   rows.forEach((row, index) => {
@@ -105,13 +108,13 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap, ph
     const describedType = transactionType(originalDescription)
     const action = investmentAction(originalDescription)
     const explicitTextDirection = /credit|credito|entrada|receb|debit|debito|saida|pag/.test(directionValue)
-    const directionKnown = Boolean(splitColumns && (debitPresent || creditPresent)) || explicitTextDirection || describedType === 'INCOME' || describedType === 'INVESTMENT_INCOME' || (describedType === 'EXPENSE' && /pix enviado|pix qr code|compra|seguro cart deb bradesco|conta de telefone|mercado|supermercado|farmacia|drogaria|posto de combustivel/.test(originalDescription.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase())) || (describedType === 'INVESTMENT' && action != null) || describedType === 'CARD_PAYMENT'
+    const directionKnown = Boolean(splitColumns && (debitPresent || creditPresent)) || explicitTextDirection || describedType === 'INCOME' || describedType === 'REFUND' || describedType === 'INVESTMENT_INCOME' || (describedType === 'EXPENSE' && /pix enviado|pix qr code|compra|seguro cart deb bradesco|conta de telefone|mercado|supermercado|farmacia|drogaria|posto de combustivel/.test(originalDescription.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase())) || (describedType === 'INVESTMENT' && action != null) || describedType === 'CARD_PAYMENT'
     let direction: 'DEBIT' | 'CREDIT'
     if (splitColumns && (debitPresent || creditPresent)) direction = debitPresent ? 'DEBIT' : 'CREDIT'
     else if (/credit|credito|entrada|receb/.test(directionValue)) direction = 'CREDIT'
     else if (/debit|debito|saida|pag/.test(directionValue)) direction = 'DEBIT'
     else {
-      direction = describedType === 'INCOME' || describedType === 'INVESTMENT_INCOME' || (describedType === 'INVESTMENT' && investmentAction(originalDescription) === 'RESCUE') ? 'CREDIT' : 'DEBIT'
+      direction = describedType === 'INCOME' || describedType === 'REFUND' || describedType === 'INVESTMENT_INCOME' || (describedType === 'INVESTMENT' && investmentAction(originalDescription) === 'RESCUE') ? 'CREDIT' : 'DEBIT'
     }
     const paymentMethod = cell(row, map.paymentMethod)
     const classifiedType = transactionType(originalDescription, paymentMethod)
@@ -144,10 +147,78 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap, ph
         fingerprintCounts.set(fingerprint, occurrence)
         transaction.bankTransactionId = `auto:${fingerprint}:${occurrence}`
       }
-      transaction.id = `bank-${stableFingerprint([transaction.bankTransactionId])}`
+      transaction.id = `bank-${stableFingerprint([transaction.date, transaction.originalDescription, transaction.amount, transaction.direction, transaction.bankTransactionId])}`
     }
   }
   return { transactions, issues, rowCount: rows.length, ignoredRows, excludedRows }
+}
+
+/** Parses the main Bradesco section and its auxiliary recent-movements section independently. */
+export function parseBankCsvSections(csv: CsvDocument, map: ColumnMap) {
+  const period = csv.statementPeriodStart && csv.statementPeriodEnd
+    ? { start: csv.statementPeriodStart, end: csv.statementPeriodEnd }
+    : undefined
+  const main = parseBankRows(csv.rows, map, csv.metadataRowsIgnored, period)
+  const auxiliary = csv.auxiliaryRows.length && period
+    ? parseBankRows(csv.auxiliaryRows, map, csv.metadataRowsIgnored + (csv.auxiliaryRowsStartIndex ?? csv.rows.length), period)
+    : { transactions: [], issues: [], rowCount: 0, ignoredRows: 0, excludedRows: [] as ExcludedBankRow[] }
+  const auxiliaryMerge = mergeAuxiliaryBankTransactionsWithDiagnostics(main.transactions, auxiliary.transactions)
+  const transactions = auxiliaryMerge.transactions
+  const addedAuxiliary = transactions.length - main.transactions.length
+  return {
+    ...main,
+    transactions,
+    issues: [...main.issues, ...auxiliary.issues],
+    rowCount: main.rowCount + auxiliary.rowCount,
+    ignoredRows: main.ignoredRows + auxiliary.ignoredRows + auxiliaryMerge.duplicates.length,
+    excludedRows: [...(main.excludedRows ?? []), ...(auxiliary.excludedRows ?? []), ...auxiliaryMerge.duplicates.map((transaction) => ({
+      row: transaction.sourceRow ?? 0,
+      reason: 'DUPLICATE_AUXILIARY' as const,
+      date: transaction.date,
+      description: transaction.originalDescription,
+      document: Object.entries(transaction.original).find(([header]) => ['docto', 'documento', 'nsu', 'id transacao'].includes(header.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()))?.[1] ?? null,
+      balanceAfter: transaction.balanceAfter,
+      amount: transaction.amount,
+      direction: transaction.direction,
+      credit: transaction.direction === 'CREDIT' ? transaction.amount : null,
+      debit: transaction.direction === 'DEBIT' ? transaction.amount : null,
+    }))],
+    auxiliaryIncludedCount: addedAuxiliary,
+    auxiliaryOutsidePeriodCount: (auxiliary.excludedRows ?? []).filter((row) => row.reason === 'OUTSIDE_STATEMENT_PERIOD').length,
+  }
+}
+
+/** Keep the primary section authoritative and append only genuinely new auxiliary movements. */
+function sourceDocument(transaction: BankTransaction) {
+  const originalValue = Object.entries(transaction.original).find(([header]) => {
+    const normalized = header.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+    return ['docto', 'documento', 'nsu', 'id transacao'].includes(normalized)
+  })?.[1]?.trim()
+  if (originalValue) return originalValue.toLowerCase()
+  return transaction.bankTransactionId.startsWith('auto:') ? '' : transaction.bankTransactionId.replace(/^doc:/, '').toLowerCase()
+}
+
+function auxiliaryTransactionIdentity(transaction: BankTransaction) {
+    const rawDocument = sourceDocument(transaction)
+    const normalizedDescription = transaction.originalDescription.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ')
+    return [transaction.date, rawDocument, normalizedDescription, transaction.direction, transaction.amount].join('|')
+}
+
+export function mergeAuxiliaryBankTransactionsWithDiagnostics(primary: BankTransaction[], auxiliary: BankTransaction[]) {
+  const seen = new Set(primary.map(auxiliaryTransactionIdentity))
+  const appended: BankTransaction[] = []
+  const duplicates: BankTransaction[] = []
+  for (const transaction of auxiliary) {
+    const key = auxiliaryTransactionIdentity(transaction)
+    if (seen.has(key)) { duplicates.push(transaction); continue }
+    seen.add(key)
+    appended.push(transaction)
+  }
+  return { transactions: [...primary, ...appended], duplicates }
+}
+
+export function mergeAuxiliaryBankTransactions(primary: BankTransaction[], auxiliary: BankTransaction[]) {
+  return mergeAuxiliaryBankTransactionsWithDiagnostics(primary, auxiliary).transactions
 }
 
 function isRepeatedHeader(row: Record<string, string>, map: ColumnMap): boolean {

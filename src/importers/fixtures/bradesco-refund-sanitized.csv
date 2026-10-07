@@ -1,0 +1,13 @@
+Data;Histórico;Docto.;Crédito (R$);Débito (R$);Saldo (R$)
+01/09/2026;PIX RECEBIDO;DOC-A;1.875,20;;1.875,20
+18/09/2026;PIX QR CODE ESTATICO;DOC-B;;677,70;1.197,50
+02/10/2026;COMPRA CARTAO VISA;DOC-C;;795,13;402,37
+Filtro de resultados - Movimentação entre: 01/09/2026 e 07/10/2026;;;;;
+Os dados acima têm como base uma data fictícia e estão sujeitos a alterações.;;;;;
+Últimos Lançamentos;;;;;
+Data;Histórico;Docto.;Crédito (R$);Débito (R$);Saldo (R$)
+02/10/2026;COD. LANC. 0;0;0,00;0,00;402,37
+02/10/2026;COMPRA CARTAO VISA;DOC-C;;795,13;402,37
+07/10/2026;DEVOLUCAO PIX;DOC-D;677,70;;1.080,07
+08/10/2026;PIX RECEBIDO;DOC-E;10,00;;1.090,07
+;;Total;687,70;795,13;1.090,07

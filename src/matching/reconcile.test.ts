@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { BankTransaction, LedgerTransaction } from '../domain/types'
 import { canonicalCompositionKey, reconcile } from './reconcile'
+import { summarizeMissingExpenses } from '../domain/bankBalanceAudit'
 
 function sheet(id: string, description: string, date = '2026-01-08', amount = 1350): LedgerTransaction {
   return { id, source: 'SHEET', sheetRecordId: `record-${id}`, bankTransactionId: null, date, description, originalDescription: description, amount, direction: 'DEBIT', type: 'EXPENSE', paymentMethod: 'Pix', category: 'Alimentação', month: '01 - Janeiro', year: date.slice(0, 4), isFixed: false, isEssential: true, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
@@ -127,6 +128,61 @@ describe('motor de conciliação', () => {
     const result = reconcile([incoming], [sheet('s1', 'Mercado')])
     expect(result.items[0].status).toBe('OUT_OF_SCOPE')
     expect(result.items[0].bank.direction).toBe('CREDIT')
+  })
+
+  it('neutraliza uma saída PIX integralmente devolvida antes de classificá-la como ausente', () => {
+    const original = bank('pix-out', 'PIX QR CODE ESTATICO', '2026-09-18', 67770)
+    const refund = bank('pix-refund', 'DEVOLUCAO PIX', '2026-10-07', 67770, 'CREDIT', 'REFUND')
+    const result = reconcile([original, refund], [])
+    expect(result.items.map((item) => item.status)).toEqual(['REFUNDED', 'REFUNDED'])
+    expect(result.bankRefundGroups).toMatchObject([{ status: 'REFUNDED', originalTransactionIds: ['pix-out'], refundTransactionId: 'pix-refund', grossAmount: 67770, refundAmount: 67770, netAmount: 0 }])
+    expect(summarizeMissingExpenses(result.items).count).toBe(0)
+    expect(result.items.some((item) => item.status === 'MISSING')).toBe(false)
+  })
+
+  it('envia devolução ambígua para revisão sem escolher uma saída arbitrariamente', () => {
+    const first = bank('pix-a', 'PIX QR CODE ESTATICO', '2026-09-18', 67770)
+    const second = bank('pix-b', 'PIX ENVIADO para loja', '2026-09-20', 67770)
+    const refund = bank('pix-refund', 'DEVOLUCAO PIX', '2026-10-07', 67770, 'CREDIT', 'REFUND')
+    const result = reconcile([first, second, refund], [])
+    expect(result.items.map((item) => item.status)).toEqual(['REVIEW', 'REVIEW', 'OUT_OF_SCOPE'])
+    expect(result.bankRefundGroups).toMatchObject([{ status: 'REVIEW', originalTransactionIds: ['pix-a', 'pix-b'], refundTransactionId: 'pix-refund', grossAmount: null, netAmount: null }])
+    expect(summarizeMissingExpenses(result.items).count).toBe(0)
+  })
+
+  it('prioriza a devolução exata para não deixar crédito parcial competir com ela', () => {
+    const original = bank('pix-out', 'PIX QR CODE ESTATICO', '2026-09-18', 67770)
+    const fullRefund = bank('pix-full-refund', 'DEVOLUCAO PIX', '2026-10-07', 67770, 'CREDIT', 'REFUND')
+    const unrelatedSmallerRefund = bank('pix-other-refund', 'DEVOLUCAO PIX', '2026-10-06', 1200, 'CREDIT', 'REFUND')
+    const result = reconcile([original, fullRefund, unrelatedSmallerRefund], [])
+    expect(result.items.map((item) => item.status)).toEqual(['REFUNDED', 'REFUNDED', 'OUT_OF_SCOPE'])
+    expect(result.bankRefundGroups).toMatchObject([{ status: 'REFUNDED', originalTransactionIds: ['pix-out'], refundTransactionId: 'pix-full-refund', netAmount: 0 }])
+  })
+
+  it('não coloca saídas em REVIEW por uma devolução parcial genérica com várias possíveis origens', () => {
+    const first = bank('pix-a', 'PIX QR CODE ESTATICO', '2026-09-18', 67770)
+    const second = bank('pix-b', 'PIX ENVIADO', '2026-09-20', 80000)
+    const refund = bank('pix-refund', 'DEVOLUCAO PIX', '2026-10-07', 1200, 'CREDIT', 'REFUND')
+    const result = reconcile([first, second, refund], [])
+    expect(result.bankRefundGroups).toEqual([])
+    expect(result.items.filter((item) => item.status === 'REVIEW')).toEqual([])
+    expect(result.items.slice(0, 2).map((item) => item.status)).toEqual(['MISSING', 'MISSING'])
+  })
+
+  it('mantém a saída como despesa após devolução parcial e calcula o líquido', () => {
+    const original = bank('pix-out', 'PIX ENVIADO para loja', '2026-09-18', 100000)
+    const refund = bank('pix-refund', 'DEVOLUCAO PIX', '2026-10-07', 40000, 'CREDIT', 'REFUND')
+    const result = reconcile([original, refund], [])
+    expect(result.items.map((item) => item.status)).toEqual(['MISSING', 'OUT_OF_SCOPE'])
+    expect(result.bankRefundGroups).toMatchObject([{ status: 'PARTIAL', grossAmount: 100000, refundAmount: 40000, netAmount: 60000 }])
+    expect(summarizeMissingExpenses(result.items)).toMatchObject({ count: 1, total: 100000 })
+  })
+
+  it('não cria relação de devolução para PIX sem crédito explícito posterior', () => {
+    const normalPix = bank('pix-out', 'PIX QR CODE ESTATICO', '2026-09-18', 67770)
+    const result = reconcile([normalPix], [])
+    expect(result.items[0].status).toBe('MISSING')
+    expect(result.bankRefundGroups).toEqual([])
   })
 
   it('separa possível ausência e lançamento da planilha não encontrado', () => {

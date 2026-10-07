@@ -88,7 +88,29 @@ afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  vi.unstubAllEnvs()
 })
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise })
+  return { promise, resolve, reject }
+}
+
+function hideReconcileButtonFromViewport() {
+  class HiddenObserver {
+    constructor(private callback: IntersectionObserverCallback) {}
+    observe(target: Element) { this.callback([{ isIntersecting: false, target } as IntersectionObserverEntry], this as unknown as IntersectionObserver) }
+    disconnect() {}
+    unobserve() {}
+    takeRecords() { return [] }
+    root = null
+    rootMargin = '0px'
+    thresholds = [0]
+  }
+  vi.stubGlobal('IntersectionObserver', HiddenObserver)
+}
 
 describe('fluxo completo no navegador', () => {
   it('executa Auditor de consistência sem escrever na planilha nem alterar decisões', async () => {
@@ -463,6 +485,101 @@ describe('fluxo completo no navegador', () => {
     expect(screen.getByRole('button', { name: 'Conciliar agora' })).toBeEnabled()
     await user.click(screen.getByRole('button', { name: 'Conciliar agora' }))
     expect(await screen.findByRole('heading', { name: 'Visão geral' })).toBeInTheDocument()
+  })
+
+  it('desabilita os botões normal e sticky durante o lote de PDFs e habilita após o último arquivo', async () => {
+    const user = userEvent.setup()
+    hideReconcileButtonFromViewport()
+    const lastPdf = deferred<CardStatement>()
+    vi.mocked(readCardStatementPdf).mockImplementation(async (file) => file.name === 'segundo.pdf' ? lastPdf.promise : syntheticStatement)
+    render(<App />)
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo\nMercado,08/01/2026,"45,00"'], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), [
+      new File(['first'], 'primeiro.pdf', { type: 'application/pdf' }),
+      new File(['second'], 'segundo.pdf', { type: 'application/pdf' }),
+    ])
+    await waitFor(() => expect(readCardStatementPdf).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(document.querySelector('.launch-action small')).toHaveTextContent('Processando arquivos...'))
+    const actions = [...document.querySelectorAll<HTMLButtonElement>('.button-launch')]
+    expect(actions).toHaveLength(2)
+    expect(actions.every((button) => button.disabled && button.textContent?.includes('Processando arquivos...'))).toBe(true)
+
+    lastPdf.resolve(syntheticStatement)
+    await waitFor(() => expect([...document.querySelectorAll<HTMLButtonElement>('.button-launch')].every((button) => !button.disabled && button.textContent?.includes('Conciliar agora'))).toBe(true))
+  })
+
+  it('mantém a conciliação bloqueada durante a leitura de um CSV e libera quando a leitura termina', async () => {
+    const user = userEvent.setup()
+    const csvRead = deferred<string>()
+    render(<App />)
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo\nMercado,08/01/2026,"45,00"'], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['pdf'], 'fatura.pdf', { type: 'application/pdf' }))
+    await screen.findByText(/^Fatura /)
+    expect(screen.getByRole('button', { name: 'Conciliar agora' })).toBeEnabled()
+
+    const bankCsv = new File([''], 'extrato-pendente.csv', { type: 'text/csv' })
+    Object.defineProperty(bankCsv, 'text', { configurable: true, value: () => csvRead.promise })
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bankCsv)
+    expect(await screen.findByRole('button', { name: 'Processando arquivos...' })).toBeDisabled()
+    expect(document.querySelector('.launch-action small')).toHaveTextContent('Processando arquivos...')
+
+    csvRead.resolve('Data,Descrição,Valor,Tipo\n08/01/2026,Mercado,"45,00",Débito')
+    await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Conciliar agora' })).toBeEnabled())
+  })
+
+  it('bloqueia os dois botões durante download/processamento do Drive e libera após o lote', async () => {
+    const user = userEvent.setup()
+    hideReconcileButtonFromViewport()
+    vi.stubEnv('VITE_GOOGLE_API_KEY', 'test-drive-api-key')
+    vi.stubEnv('VITE_GOOGLE_PROJECT_NUMBER', '123456')
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha conectada', lastUpdated: null, autoConnect: true })
+    const download = deferred<Blob>()
+    googleDriveMocks.pick.mockResolvedValue({ id: 'invoice-folder', name: 'Faturas' })
+    googleDriveMocks.list.mockResolvedValue([{ id: 'drive-pdf', name: 'drive.pdf', mimeType: 'application/pdf', modifiedTime: 'v1' }])
+    googleDriveMocks.download.mockImplementation(() => download.promise)
+    render(<App />)
+    await screen.findByRole('button', { name: 'Atualizar dados' })
+    await user.click(screen.getByRole('radio', { name: /Importar CSV/ }))
+    const csvInputs = screen.getAllByLabelText('Selecionar arquivo CSV')
+    await user.upload(csvInputs[0], new File(['Descrição,Data,Custo\nMercado,08/01/2026,"45,00"'], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], new File(['Data,Descrição,Valor,Tipo\n08/01/2026,Mercado,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    expect([...document.querySelectorAll<HTMLButtonElement>('.button-launch')].every((button) => !button.disabled)).toBe(true)
+
+    const drivePanel = screen.getByRole('region', { name: 'Fontes do Google Drive' })
+    await user.click(within(drivePanel).getAllByRole('button', { name: 'Selecionar pasta' })[0])
+    await waitFor(() => expect(googleDriveMocks.download).toHaveBeenCalledWith('drive-pdf', expect.any(String)))
+    expect(await screen.findByRole('button', { name: 'Processando arquivos...' })).toBeDisabled()
+    const pendingActions = [...document.querySelectorAll<HTMLButtonElement>('.button-launch')]
+    expect(pendingActions).toHaveLength(2)
+    expect(pendingActions.every((button) => button.disabled && button.textContent?.includes('Processando arquivos...'))).toBe(true)
+
+    download.resolve(new Blob(['drive pdf'], { type: 'application/pdf' }))
+    await screen.findByText('1 arquivo(s) novo(s) processado(s)')
+    await waitFor(() => expect([...document.querySelectorAll<HTMLButtonElement>('.button-launch')].every((button) => !button.disabled)).toBe(true))
+  })
+
+  it('libera a conciliação quando um lote termina mesmo se um PDF falha', async () => {
+    const user = userEvent.setup()
+    const badPdf = deferred<CardStatement>()
+    vi.mocked(readCardStatementPdf).mockImplementation(async (file) => file.name === 'ruim.pdf' ? badPdf.promise : syntheticStatement)
+    render(<App />)
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo\nMercado,08/01/2026,"45,00"'], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), [
+      new File(['good'], 'boa.pdf', { type: 'application/pdf' }),
+      new File(['bad'], 'ruim.pdf', { type: 'application/pdf' }),
+    ])
+    await waitFor(() => expect(readCardStatementPdf).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('button', { name: 'Processando arquivos...' })).toBeDisabled()
+
+    badPdf.reject(new Error('PDF inválido'))
+    expect(await screen.findByText('⚠ Erro de parsing')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Conciliar agora' })).toBeEnabled())
   })
 
   it('mantém vínculo com token expirado e atualiza os dados após reconectar', async () => {
@@ -1274,11 +1391,50 @@ describe('fluxo completo no navegador', () => {
     await waitFor(() => expect(googleDriveMocks.list).toHaveBeenCalledTimes(6))
     expect(googleDriveMocks.download).toHaveBeenCalledTimes(2)
     const drivePanel = screen.getByRole('region', { name: 'Fontes do Google Drive' })
+    await user.click(within(drivePanel).getByText(/Status dos extratos · 2/))
     await user.click(within(drivePanel).getByRole('button', { name: 'Remover da sessão' }))
     expect(within(drivePanel).queryByText('extrato-drive.csv')).not.toBeInTheDocument()
     await user.click(within(drivePanel).getByRole('button', { name: 'Sincronizar arquivos' }))
     await waitFor(() => expect(googleDriveMocks.list).toHaveBeenCalledTimes(8))
     expect(googleDriveMocks.download).toHaveBeenCalledTimes(2)
+  })
+
+  it('mantém status reais no lote Drive com 9 faturas válidas e 1 duplicado financeiro', async () => {
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha conectada', lastUpdated: null, autoConnect: true })
+    saveDriveFolders({ invoices: { id: 'invoice-folder', name: 'Faturas' }, statements: null })
+    const files = [
+      ...Array.from({ length: 9 }, (_, index) => ({ id: `pdf-${index}`, name: `fatura-${index}.pdf`, mimeType: 'application/pdf', modifiedTime: `v${index}` })),
+      { id: 'pdf-copy', name: 'fatura-copia.pdf', mimeType: 'application/pdf', modifiedTime: 'v10' },
+    ]
+    googleDriveMocks.list.mockResolvedValue(files)
+    googleDriveMocks.download.mockImplementation(async (id: string) => new Blob([id]))
+    vi.mocked(readCardStatementPdf).mockImplementation(async (file) => {
+      const index = file.name === 'fatura-copia.pdf' ? 0 : Number(file.name.match(/fatura-(\d+)/)?.[1] ?? 0)
+      const statement = structuredClone(syntheticStatement)
+      const dueDate = `2026-${String(index + 1).padStart(2, '0')}-12`
+      statement.sourceLayout = 'INTERNET_BANKING'
+      statement.dueDate = dueDate
+      statement.reportedTotal = 10000 + index
+      statement.cardSubtotals = statement.cardSubtotals.map((card) => ({ ...card, amount: 10000 + index }))
+      statement.transactions = statement.transactions.map((transaction, transactionIndex) => ({
+        ...transaction,
+        purchaseDate: `2026-${String(index + 1).padStart(2, '0')}-${String(transactionIndex + 1).padStart(2, '0')}`,
+        date: `2026-${String(index + 1).padStart(2, '0')}-${String(transactionIndex + 1).padStart(2, '0')}`,
+        invoiceDueDate: dueDate,
+        statementDueDate: dueDate,
+      }))
+      return statement
+    })
+
+    render(<App />)
+    expect(await screen.findByText('10 arquivos · 9 únicos · 1 duplicados · 0 erros')).toBeInTheDocument()
+    expect(vi.mocked(readCardStatementPdf)).toHaveBeenCalledTimes(10)
+    const drivePanel = screen.getByRole('region', { name: 'Fontes do Google Drive' })
+    await userEvent.setup().click(within(drivePanel).getByText('Status das faturas · 10'))
+    const fileList = within(drivePanel).getByRole('list')
+    expect(within(fileList).getAllByText('Processado')).toHaveLength(9)
+    expect(within(fileList).getByText('Duplicado financeiro')).toBeInTheDocument()
+    expect(within(fileList).queryByText('Erro')).not.toBeInTheDocument()
   })
 
   it('continua processando os demais arquivos se um PDF do Drive falhar', async () => {

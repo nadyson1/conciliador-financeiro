@@ -10,6 +10,8 @@ export interface DriveFileIndexEntry {
   folderId: string
   processingStatus: 'PROCESSED' | 'ERROR'
 }
+export interface DriveFolderSnapshot { folderId: string; fileIds: string[] }
+export type DriveFolderSnapshots = Partial<Record<DriveFolderKind, DriveFolderSnapshot>>
 
 export function isDriveFileUnchanged(file: { id: string; modifiedTime: string; size?: string; mimeType: string }, previous: DriveFileIndexEntry | undefined, processedModifiedTime: string | undefined, kind: DriveFolderKind, folderId: string): boolean {
   return processedModifiedTime === (file.modifiedTime ?? '')
@@ -25,6 +27,7 @@ export function isDriveFileUnchanged(file: { id: string; modifiedTime: string; s
 const FOLDERS_KEY = 'conciliador.google-drive.folders.v1'
 const INDEX_KEY = 'conciliador.google-drive.file-index.v1'
 const LAST_SYNC_KEY = 'conciliador.google-drive.last-sync.v1'
+const FOLDER_SNAPSHOTS_KEY = 'conciliador.google-drive.folder-snapshots.v1'
 const emptyFolders: SavedDriveFolders = { invoices: null, statements: null }
 
 export function loadDriveFolders(storage: Storage = localStorage): SavedDriveFolders {
@@ -50,5 +53,20 @@ export function saveDriveFileIndex(index: Record<string, DriveFileIndexEntry>, s
 }
 
 export function clearDriveFileIndex(storage: Storage = localStorage): void { storage.removeItem(INDEX_KEY) }
+export function loadDriveFolderSnapshots(storage: Storage = localStorage): DriveFolderSnapshots {
+  try {
+    const value = JSON.parse(storage.getItem(FOLDER_SNAPSHOTS_KEY) ?? '{}') as DriveFolderSnapshots
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  } catch { return {} }
+}
+export function saveDriveFolderSnapshots(snapshots: DriveFolderSnapshots, storage: Storage = localStorage): void {
+  storage.setItem(FOLDER_SNAPSHOTS_KEY, JSON.stringify(snapshots))
+}
+/** A first listing establishes a baseline; only IDs absent from the same folder's previous snapshot are missing. */
+export function missingDriveFileIds(previous: DriveFolderSnapshot | undefined, folderId: string, currentFileIds: string[]): string[] {
+  if (!previous || previous.folderId !== folderId) return []
+  const current = new Set(currentFileIds)
+  return previous.fileIds.filter((id) => !current.has(id))
+}
 export function loadDriveLastSync(storage: Storage = localStorage): string | null { return storage.getItem(LAST_SYNC_KEY) }
 export function saveDriveLastSync(value: string, storage: Storage = localStorage): void { storage.setItem(LAST_SYNC_KEY, value) }

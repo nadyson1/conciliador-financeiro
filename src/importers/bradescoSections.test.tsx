@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
+import { readFileSync } from 'node:fs'
 import { parseCsvText, initialColumnMap } from './csv'
-import { parseBankRows } from './transactions'
-import { auditBankBalance } from '../domain/bankBalanceAudit'
+import { parseBankCsvSections, parseBankRows } from './transactions'
+import { auditBankBalance, summarizeMissingExpenses } from '../domain/bankBalanceAudit'
 import { reconcile } from '../matching/reconcile'
 import { BankCsvUploadCard } from '../components/BankCsvUploadCard'
 import type { ColumnMap } from '../domain/types'
@@ -49,6 +50,63 @@ describe('seções do CSV Bradesco', () => {
     expect(audit.discontinuities).toHaveLength(0)
     expect(audit.reportedBalance).not.toBe(40237)
     expect(auxiliary.transactions.some((transaction) => transaction.originalDescription === 'Total')).toBe(false)
+  })
+
+  it('incorpora Últimos Lançamentos no período, deduplica e atualiza o saldo usando fixture sanitizada', () => {
+    const fixture = readFileSync(`${process.cwd()}/src/importers/fixtures/bradesco-refund-sanitized.csv`, 'utf8')
+    const csv = parseCsvText(fixture)
+    const map = initialColumnMap(csv.headers, 'bank') as ColumnMap
+    const parsed = parseBankCsvSections(csv, map)
+    const refund = parsed.transactions.find((item) => item.originalDescription === 'DEVOLUCAO PIX')
+    const audit = auditBankBalance(parsed.transactions, parsed.excludedRows)
+    const result = reconcile(parsed.transactions, [])
+
+    expect(csv.statementPeriodStart).toBe('2026-09-01')
+    expect(csv.statementPeriodEnd).toBe('2026-10-07')
+    expect(parsed.transactions.filter((item) => item.bankTransactionId === 'doc:DOC-C')).toHaveLength(1)
+    expect(parsed.transactions.some((item) => item.originalDescription === 'COD. LANC. 0')).toBe(false)
+    expect(parsed.transactions.some((item) => item.originalDescription === 'Total')).toBe(false)
+    expect(parsed.transactions.some((item) => item.date === '2026-10-08')).toBe(false)
+    expect(parsed.excludedRows).toContainEqual(expect.objectContaining({ date: '2026-10-02', description: 'COD. LANC. 0', reason: 'NO_MOVEMENT' }))
+    expect(parsed.excludedRows).toContainEqual(expect.objectContaining({ date: '2026-10-08', reason: 'OUTSIDE_STATEMENT_PERIOD' }))
+    expect(parsed.excludedRows).toContainEqual(expect.objectContaining({ date: null, reason: 'FOOTER_OR_METADATA' }))
+    expect(parsed.auxiliaryIncludedCount).toBe(1)
+    expect(parsed.auxiliaryOutsidePeriodCount).toBe(1)
+    expect(refund).toMatchObject({ date: '2026-10-07', amount: 67770, direction: 'CREDIT', type: 'REFUND', balanceAfter: 108007 })
+    expect(result.items.find((item) => item.bank.originalDescription === 'PIX QR CODE ESTATICO')?.status).toBe('REFUNDED')
+    expect(result.items.find((item) => item.bank.originalDescription === 'DEVOLUCAO PIX')?.status).toBe('REFUNDED')
+    expect(audit).toMatchObject({ reportedBalance: 108007, calculatedBalance: 108007, difference: 0, isBalanced: true })
+    expect(result.totals.finalBalance).toBe(108007)
+    expect(result.bankRefundGroups).toMatchObject([{ status: 'REFUNDED', grossAmount: 67770, refundAmount: 67770, netAmount: 0 }])
+    expect(summarizeMissingExpenses(result.items).count).toBe(1) // somente a compra fictícia do cartão
+    expect(summarizeMissingExpenses(result.items).total).toBe(79513)
+  })
+
+  it('deduplica crédito repetido entre seções mesmo quando o ID gerado difere e audita a referência COD. LANC. 0', () => {
+    const csvText = [
+      'Data;Histórico;Docto.;Crédito (R$);Débito (R$);Saldo (R$)',
+      '31/01/2026;COD. LANC. 0;0;0,00;;100,00',
+      '01/02/2026;RENTAB.INVEST FACILCRED*;2;0,01;;100,01',
+      '02/02/2026;RENTAB.INVEST FACILCRED*;2;0,03;;100,04',
+      '02/02/2026;COMPRA CARTAO VISA;3;;0,04;100,00',
+      'Filtro de resultados - Movimentação entre: 01/02/2026 e 02/02/2026;;;;;',
+      'Os dados acima tem como base 03/02/2026 às 10:00 e estão sujeitos a alterações.;;;;;',
+      'Últimos Lançamentos;;;;;',
+      'Data;Histórico;Docto.;Crédito (R$);Débito (R$);Saldo (R$)',
+      '02/02/2026;COD. LANC. 0;0;;;99,97',
+      '02/02/2026;RENTAB.INVEST FACILCRED*;2;0,03;;100,00',
+      ';;Total;0,03;0,00;100,00',
+    ].join('\n')
+    const csv = parseCsvText(csvText)
+    const map = initialColumnMap(csv.headers, 'bank') as ColumnMap
+    const parsed = parseBankCsvSections(csv, map)
+    const audit = auditBankBalance(parsed.transactions, parsed.excludedRows)
+
+    expect(parsed.transactions).toHaveLength(3)
+    expect(parsed.auxiliaryIncludedCount).toBe(0)
+    expect(parsed.excludedRows).toContainEqual(expect.objectContaining({ row: 11, reason: 'DUPLICATE_AUXILIARY', date: '2026-02-02', document: '2', amount: 3, credit: 3, balanceAfter: 10000 }))
+    expect(audit).toMatchObject({ calculatedBalance: 10000, reportedBalance: 10000, difference: 0, isBalanced: true })
+    expect(audit.referenceDiscrepancy).toMatchObject({ sourceRow: 10, date: '2026-02-02', description: 'COD. LANC. 0', document: '0', credit: 0, debit: 0, previousBalance: 10000, expectedBalance: 10000, reportedBalance: 9997, difference: -3, compensatedByFollowingRow: true, compensationSourceRow: 11 })
   })
 
   it('mostra o período explícito e a quantidade auxiliar ignorada na interface de importação', () => {

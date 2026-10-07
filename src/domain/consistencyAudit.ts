@@ -1,12 +1,13 @@
-import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, LedgerTransaction } from './types'
+import type { BankRefundGroup, BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, LedgerTransaction, ReconciliationItem } from './types'
 import type { PersistedDecision } from './localDecisions'
 import { auditPersistedDecisions, type DecisionAudit } from './decisionAudit'
 import { cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity, stableFingerprint } from './identity'
 import { deriveCardPurchaseStatus, explainCostYearCandidateRejection, findExistingCostYearCandidates, reconcileCardStatement } from '../importers/cardStatement'
 import { canAddMissingToCostYear } from '../features/missingEligibility'
 import { classifySheetRecord, normalizeDescription } from '../importers/normalize'
+import { diagnoseMissingCounterDivergence } from './sourceLifecycle'
 
-export type AuditCode = 'MISSING_COM_CANDIDATO' | 'CARD_MISSING_NO_CANDIDATE' | 'DERIVED_STATE_MISMATCH' | 'PREWRITE_MATCH_MISMATCH' | 'STALE_MISSING_DECISION' | 'ORPHANED_SHEET_REFERENCE' | 'EDITED_SHEET_REFERENCE' | 'MISSING_ADDED_TO_SHEET_ORPHAN' | 'DOUBLE_CLAIM' | 'UNUSED_STRONG_CANDIDATE' | 'LEGACY_FINGERPRINT_MATCH' | 'LOCAL_REMOTE_DECISION_DIVERGENCE' | 'NEWER_TOMBSTONE_EXISTS' | 'WRONG_DECISION_DOMAIN' | 'REVIEW_ONLY_WRONG_CYCLE_CANDIDATES' | 'IGNORED_DECISION_REVIEW' | 'CURRENT_SOURCE_DIVERGENCE' | 'REJECTED_CANDIDATE_FILTERED' | 'DECISION_STATUS' | 'SYNC_PENDING'
+export type AuditCode = 'MISSING_COM_CANDIDATO' | 'CARD_MISSING_NO_CANDIDATE' | 'DERIVED_STATE_MISMATCH' | 'PREWRITE_MATCH_MISMATCH' | 'STALE_MISSING_DECISION' | 'ORPHANED_SHEET_REFERENCE' | 'EDITED_SHEET_REFERENCE' | 'MISSING_ADDED_TO_SHEET_ORPHAN' | 'DOUBLE_CLAIM' | 'UNUSED_STRONG_CANDIDATE' | 'LEGACY_FINGERPRINT_MATCH' | 'LOCAL_REMOTE_DECISION_DIVERGENCE' | 'NEWER_TOMBSTONE_EXISTS' | 'WRONG_DECISION_DOMAIN' | 'REVIEW_ONLY_WRONG_CYCLE_CANDIDATES' | 'IGNORED_DECISION_REVIEW' | 'CURRENT_SOURCE_DIVERGENCE' | 'REJECTED_CANDIDATE_FILTERED' | 'DECISION_STATUS' | 'SYNC_PENDING' | 'REVIEW_WITHOUT_CANDIDATES' | 'REFUNDED_BUT_MISSING' | 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS' | 'STALE_ACTIVE_SOURCE' | 'MISSING_COUNT_DIVERGENCE' | 'DUPLICATE_PRESENT_BUT_MARKED_MISSING'
 export type AuditSeverity = 'CRITICAL' | 'REVIEW' | 'MAINTENANCE' | 'LEGACY' | 'INFO'
 export type DecisionDomain = 'bank-reconciliation' | 'sheet-bank-reconciliation' | 'card-payment-composition' | 'pdf-card-purchase' | 'bank-missing-sheet-record'
 export const DECISION_DOMAIN: Record<PersistedDecision['kind'], DecisionDomain> = {
@@ -36,6 +37,8 @@ export type AppliedDecision = { decisionKey: string; subjectFingerprint: string;
 export type AuditFinding = { id: string; code: AuditCode; severity: AuditSeverity; title: string; detail: string; item?: AuditedCardItem; technical?: Record<string, unknown>; relatedFindings?: Pick<AuditFinding, 'code' | 'title' | 'detail' | 'technical'>[] }
 export type ConsistencyAuditInput = {
   banks: BankTransaction[]
+  /** Original parsed rows by source, used only to detect contradictory representations of one movement. */
+  bankSourceRows?: { sourceId: string; sourceName?: string; transactions: BankTransaction[] }[]
   sheets: LedgerTransaction[]
   statements: { statement: CardStatement; legacyStatementIdentity?: string }[]
   currentCardMatches: { statementIdentity: string; transactionId: string; match: CardStatementMatch }[]
@@ -46,6 +49,13 @@ export type ConsistencyAuditInput = {
   localTombstones?: Record<string, { updatedAt: string; decision: PersistedDecision }>
   appliedDecisions?: AppliedDecision[]
   onlySubjectFingerprints?: string[]
+  currentBankItems?: ReconciliationItem[]
+  bankRefundGroups?: BankRefundGroup[]
+  missingCounterCollections?: { source: string; items: ReconciliationItem[] }[]
+  activeDriveSourceIds?: string[]
+  currentDriveSourceIds?: string[]
+  missingDriveSourceIds?: string[]
+  duplicateInvoiceSources?: { identity: string; sourceIds: string[] }[]
 }
 export type AuditSummary = { critical: number; review: number; maintenance: number; legacy: number; informational: number; attention: number; evaluatedPurchases: number }
 export type ConsistencyAuditResult = { findings: AuditFinding[]; items: AuditedCardItem[]; decisionAudit: AuditDecision[]; auditedAt: string; pureStates: Record<string, string>; currentStates: Record<string, string>; summary: AuditSummary }
@@ -185,6 +195,97 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
   const currentMap = new Map(input.currentCardMatches.map(({ statementIdentity, transactionId, match }) => [`${statementIdentity}\u001f${transactionId}`, match]))
   const items: AuditedCardItem[] = []
   const findings: AuditFinding[] = []
+  for (const item of input.currentBankItems ?? []) {
+    if (item.status === 'REVIEW' && !item.candidate) findings.push({ id: `REVIEW_WITHOUT_CANDIDATES:${item.bank.id}`, code: 'REVIEW_WITHOUT_CANDIDATES', severity: 'REVIEW', title: 'Movimentação em revisão sem candidato da planilha', detail: 'O resultado atual não apresenta um candidato de CUSTOS ANO para esta movimentação. O motivo técnico explica se existe outro conflito que justifique a revisão.', technical: { bank: item.bank, status: item.status, candidateCount: 0, reviewReason: item.reviewReason ?? null } })
+  }
+  if (input.missingCounterCollections && input.missingCounterCollections.length > 1) {
+    const [reference, ...others] = input.missingCounterCollections
+    for (const other of others) {
+      const diff = diagnoseMissingCounterDivergence(reference.items, other.items)
+      if (diff.presentInSummaryOnly.length || diff.presentInMissingListOnly.length) findings.push({
+        id: `MISSING_COUNT_DIVERGENCE:${reference.source}:${other.source}`, code: 'MISSING_COUNT_DIVERGENCE', severity: 'REVIEW', title: 'Os contadores de Ausentes usam coleções diferentes', detail: `As coleções “${reference.source}” e “${other.source}” não contêm os mesmos lançamentos.`,
+        technical: { referenceSource: reference.source, comparedSource: other.source, presentInSummaryOnly: diff.presentInSummaryOnly, presentInMissingListOnly: diff.presentInMissingListOnly },
+      })
+    }
+  }
+  if (input.activeDriveSourceIds) {
+    const active = new Set(input.activeDriveSourceIds)
+    for (const item of input.currentBankItems ?? []) {
+      const sourceIds = item.bank.statementSourceIds ?? (item.bank.statementSourceId ? [item.bank.statementSourceId] : [])
+      const stale = sourceIds.filter((id) => id !== 'manual' && !active.has(id))
+      if (stale.length) findings.push({ id: `STALE_ACTIVE_SOURCE:${item.bank.id}`, code: 'STALE_ACTIVE_SOURCE', severity: 'REVIEW', title: 'Movimentação mantida sem uma fonte ativa', detail: 'Uma movimentação ainda participa da conciliação, mas sua origem não está na listagem atual do Drive.', technical: { bankTransaction: item.bank, staleSourceIds: stale, activeSourceIds: [...active] } })
+    }
+  }
+  const currentDrive = new Set(input.currentDriveSourceIds ?? [])
+  const missingDrive = new Set(input.missingDriveSourceIds ?? [])
+  for (const group of input.duplicateInvoiceSources ?? []) {
+    const present = group.sourceIds.filter((id) => currentDrive.has(id))
+    const markedMissing = present.filter((id) => missingDrive.has(id))
+    if (present.length > 1 && markedMissing.length) findings.push({ id: `DUPLICATE_PRESENT_BUT_MARKED_MISSING:${group.identity}`, code: 'DUPLICATE_PRESENT_BUT_MARKED_MISSING', severity: 'CRITICAL', title: 'Um PDF duplicado presente foi contado como ausente', detail: 'A mesma fatura possui mais de um arquivo presente, mas um deles também foi marcado como ausente.', technical: { financialIdentity: group.identity, currentSourceIds: present, missingSourceIds: markedMissing } })
+  }
+  for (const group of input.bankRefundGroups ?? []) if (group.status === 'REFUNDED') {
+    for (const transactionId of group.originalTransactionIds) {
+      const item = input.currentBankItems?.find((candidate) => candidate.bank.id === transactionId)
+      if (item?.status === 'MISSING') findings.push({ id: `REFUNDED_BUT_MISSING:${group.id}:${transactionId}`, code: 'REFUNDED_BUT_MISSING', severity: 'CRITICAL', title: 'Saída devolvida ainda aparece como ausente', detail: 'Uma movimentação que foi integralmente devolvida continua listada como despesa ausente.', technical: { refundGroup: group, item } })
+    }
+  }
+  const normalizeBankDescription = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ')
+  const bankSources = (bank: BankTransaction) => [...new Set(bank.statementSourceIds ?? (bank.statementSourceId ? [bank.statementSourceId] : []))]
+  const bySemantic = new Map<string, BankTransaction[]>()
+  for (const bank of input.banks.filter((item) => bankSources(item).length > 0)) {
+    const key = JSON.stringify([bank.date, normalizeBankDescription(bank.originalDescription), bank.direction, bank.amount])
+    bySemantic.set(key, [...(bySemantic.get(key) ?? []), bank])
+  }
+  // Provenance on one merged entity is evidence that the overlap was already resolved.
+  // Only flag separate surviving entities whose source sets are disjoint.
+  for (const [key, group] of bySemantic) {
+    const unresolvedPairs: [BankTransaction, BankTransaction][] = []
+    for (let left = 0; left < group.length; left += 1) for (let right = left + 1; right < group.length; right += 1) {
+      const leftSources = new Set(bankSources(group[left]))
+      if (bankSources(group[right]).every((source) => !leftSources.has(source))) unresolvedPairs.push([group[left], group[right]])
+    }
+    if (!unresolvedPairs.length) continue
+    const entities = [...new Map(unresolvedPairs.flatMap(([left, right]) => [left, right]).map((item) => [item.id, item])).values()]
+    const sources = [...new Set(entities.flatMap(bankSources))]
+    findings.push({ id: `DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS:${key}`, code: 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS', severity: 'REVIEW', title: 'Possível duplicidade entre extratos não resolvida', detail: `${unresolvedPairs.length} par(es) de movimentações equivalentes permaneceram como lançamentos separados após a consolidação.`, technical: { sources: sources.map((id) => ({ id, name: entities.find((item) => item.statementSourceId === id || item.statementSourceIds?.includes(id))?.statementFileName })), bankTransactionIds: entities.map((item) => item.id), date: group[0].date, amount: group[0].amount } })
+  }
+  // The merged bank model keeps one canonical value per entity. Inspect parsed source rows
+  // separately so a contradictory amount/direction can be reviewed without changing merge behavior.
+  const bankDocumentReference = (bank: BankTransaction) => {
+    const entry = Object.entries(bank.original).find(([header]) => {
+      const normalized = normalizeBankDescription(header)
+      return /(^| )(docto|documento|numero documento|num documento|numero doc|num doc|id transacao|identificador transacao)( |$)/.test(normalized)
+    })
+    const value = entry?.[1]?.trim()
+    return value && value !== '0' && value !== '-' ? value.toLowerCase() : null
+  }
+  const sourceOverlap = new Map<string, Map<string, BankTransaction[]>>()
+  for (const source of input.bankSourceRows ?? []) for (const transaction of source.transactions) {
+    const description = normalizeBankDescription(transaction.originalDescription)
+    if (!description) continue
+    const document = bankDocumentReference(transaction)
+    const key = document ? JSON.stringify(['document', document]) : JSON.stringify(['date-description', transaction.date, description])
+    const bySource = sourceOverlap.get(key) ?? new Map<string, BankTransaction[]>()
+    bySource.set(source.sourceId, [...(bySource.get(source.sourceId) ?? []), transaction])
+    sourceOverlap.set(key, bySource)
+  }
+  for (const [key, bySource] of sourceOverlap) {
+    const sources = [...bySource.entries()]
+    for (let left = 0; left < sources.length; left += 1) for (let right = left + 1; right < sources.length; right += 1) {
+      const [leftId, leftRows] = sources[left], [rightId, rightRows] = sources[right]
+      // Require a unique row on each side; repeated same-day merchant entries are ambiguous.
+      if (leftRows.length !== 1 || rightRows.length !== 1) continue
+      const a = leftRows[0], b = rightRows[0]
+      const conflicts = [
+        ...(a.date !== b.date ? ['data'] : []),
+        ...(a.amount !== b.amount ? ['valor'] : []),
+        ...(a.direction !== b.direction ? ['direção'] : []),
+        ...(normalizeBankDescription(a.originalDescription) !== normalizeBankDescription(b.originalDescription) ? ['descrição'] : []),
+      ]
+      if (!conflicts.length) continue
+      findings.push({ id: `DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS:CONFLICT:${key}:${leftId}:${rightId}`, code: 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS', severity: 'REVIEW', title: 'Os extratos divergem sobre a mesma movimentação', detail: `As fontes apontam para o mesmo documento, mas divergem em: ${conflicts.join(', ')}.`, technical: { sources: [{ id: leftId, name: input.bankSourceRows?.find((source) => source.sourceId === leftId)?.sourceName }, { id: rightId, name: input.bankSourceRows?.find((source) => source.sourceId === rightId)?.sourceName }], conflicts, documentReference: bankDocumentReference(a), left: { date: a.date, amount: a.amount, direction: a.direction, description: a.originalDescription }, right: { date: b.date, amount: b.amount, direction: b.direction, description: b.originalDescription } } })
+    }
+  }
   const pureStates: Record<string, string> = {}, currentStates: Record<string, string> = {}
   const onlySubjectFingerprints = input.onlySubjectFingerprints ? new Set(input.onlySubjectFingerprints) : null
   for (const entry of input.statements) for (const transaction of entry.statement.transactions.filter((tx) => tx.type === 'PURCHASE' && tx.financialStatus !== 'REFUNDED')) {

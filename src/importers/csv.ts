@@ -72,6 +72,7 @@ export function parseCsvText(text: string): CsvDocument {
     headers,
     rows,
     auxiliaryRows,
+    auxiliaryRowsStartIndex: auxiliaryStart >= 0 ? auxiliaryStart + 1 : undefined,
     auxiliarySectionLabel: auxiliaryStart >= 0 ? 'Últimos Lançamentos' : null,
     statementPeriodStart,
     statementPeriodEnd,

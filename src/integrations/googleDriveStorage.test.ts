@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { isDriveFileUnchanged, loadDriveFileIndex, loadDriveFolders, loadDriveLastSync, saveDriveFileIndex, saveDriveFolders, saveDriveLastSync } from './googleDriveStorage'
+import { isDriveFileUnchanged, loadDriveFileIndex, loadDriveFolderSnapshots, loadDriveFolders, loadDriveLastSync, missingDriveFileIds, saveDriveFileIndex, saveDriveFolderSnapshots, saveDriveFolders, saveDriveLastSync } from './googleDriveStorage'
 
 describe('metadados locais do Google Drive', () => {
   beforeEach(() => localStorage.clear())
@@ -29,5 +29,19 @@ describe('metadados locais do Google Drive', () => {
     expect(isDriveFileUnchanged(file, previous, undefined, 'statements', 'folder')).toBe(false)
     expect(isDriveFileUnchanged({ ...file, modifiedTime: 'v2' }, previous, 'v2', 'statements', 'folder')).toBe(false)
     expect(isDriveFileUnchanged(file, { ...previous, processingStatus: 'ERROR' }, 'v1', 'statements', 'folder')).toBe(false)
+  })
+
+  it('considera a primeira listagem como baseline e só conta ausências após uma listagem anterior da mesma pasta', () => {
+    expect(missingDriveFileIds(undefined, 'folder-a', ['a', 'b'])).toEqual([])
+    expect(missingDriveFileIds(undefined, 'invoice-folder', Array.from({ length: 10 }, (_, index) => `pdf-${index}`))).toEqual([])
+    expect(missingDriveFileIds({ folderId: 'folder-other', fileIds: ['old'] }, 'folder-a', ['a', 'b'])).toEqual([])
+    const snapshots = { invoices: { folderId: 'folder-a', fileIds: ['a', 'b', 'c'] } }
+    saveDriveFolderSnapshots(snapshots)
+    expect(loadDriveFolderSnapshots()).toEqual(snapshots)
+    expect(missingDriveFileIds(loadDriveFolderSnapshots().invoices, 'folder-a', ['a', 'b'])).toEqual(['c'])
+  })
+
+  it('trata renomeação como o mesmo arquivo quando o Drive mantém o ID', () => {
+    expect(missingDriveFileIds({ folderId: 'folder-a', fileIds: ['same-id'] }, 'folder-a', ['same-id'])).toEqual([])
   })
 })

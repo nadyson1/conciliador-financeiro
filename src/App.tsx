@@ -2,13 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, ReactNode } from 'react'
 import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, ColumnMap, CsvDocument, ExcludedBankRow, LedgerTransaction, ReconciliationItem, Transaction } from './domain/types'
 import { readCsvFile, initialColumnMap } from './importers/csv'
-import { parseBankRows, parseLedgerRows } from './importers/transactions'
+import { parseBankCsvSections, parseLedgerRows } from './importers/transactions'
 import { cardStatementFinancialIdentity, deriveCardPurchaseStatus, findExistingCostYearCandidates, identifyStatementPayments, readCardStatementPdf, reconcileCardStatement } from './importers/cardStatement'
 import { normalizeDate } from './importers/normalize'
 import { canonicalCompositionKey, findPlausibleLedgerCandidates, pairKey, reconcile } from './matching/reconcile'
 import { exportCardPayments, exportDuplicates, exportMissing, exportOutOfScope, exportReviews, exportSummary } from './features/export'
 import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity } from './domain/identity'
 import { auditPersistedDecisions } from './domain/decisionAudit'
+import { retainActiveInvoiceSources, retainCurrentDriveBankSources } from './domain/sourceLifecycle'
 import { auditConsistency, filterAuditFindings, summarizeAudit, type AuditFilter, type ConsistencyAuditResult } from './domain/consistencyAudit'
 import { dismissAuditFinding, isAuditFindingDismissed, loadAuditFindingVisibility, restoreAuditFinding, saveAuditFindingVisibility } from './domain/auditFindingVisibility'
 import { AuditFindingCard } from './components/AuditFindingCard'
@@ -17,28 +18,29 @@ import type { DecisionKind, PersistedDecision } from './domain/localDecisions'
 import { GoogleSheetsPanel } from './components/GoogleSheetsPanel'
 import type { GoogleSheetsConnectionInfo } from './components/GoogleSheetsPanel'
 import { GoogleDrivePanel } from './components/GoogleDrivePanel'
-import type { DriveSyncSummary } from './components/GoogleDrivePanel'
+import type { DriveStatementFileOutcome, DriveSyncSummary } from './components/GoogleDrivePanel'
+import { resolveDrivePdfFileOutcome, summarizeDriveInvoiceOutcomes, type DriveFileOutcome, type DriveFileProcessingStatus } from './integrations/googleDriveProcessing'
 import { PwaUpdateNotice } from './components/PwaUpdateNotice'
 import { AddCostYearDialog } from './components/AddCostYearDialog'
 import { BankCsvUploadCard, bankCsvRequiresManualMapping } from './components/BankCsvUploadCard'
-import { BalanceAuditPanel } from './components/BalanceAuditPanel'
+import { BalanceAuditPanel, StatementBalanceAccordion } from './components/BalanceAuditPanel'
 import { MissingSummary } from './components/MissingSummary'
-import { auditBankBalance } from './domain/bankBalanceAudit'
+import { auditBankBalance, selectMissingExpenses } from './domain/bankBalanceAudit'
 import { canAddMissingToCostYear } from './features/missingEligibility'
 import { GoogleSheetsError, appendCostYearRecord, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { addDecisionTombstone, listDecisionTombstones, readGoogleSheetDecisionsReadOnly, removeDecisionTombstone, syncGoogleSheetDecisions, syncOneGoogleSheetDecision, syncOneGoogleSheetDeletion } from './integrations/googleSheetDecisions'
 import { forgetGoogleSheetLink, GOOGLE_SHEET_TAB_NAME, loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import type { SavedGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import { downloadGoogleDriveFile, isSupportedDriveFile, listGoogleDriveFolder, selectGoogleDriveFolder, GoogleDriveError } from './integrations/googleDrive'
-import { mergeDriveBankSources } from './integrations/googleDriveMerge'
-import { isDriveFileUnchanged, loadDriveFileIndex, loadDriveFolders, loadDriveLastSync, saveDriveFileIndex, saveDriveFolders, saveDriveLastSync } from './integrations/googleDriveStorage'
-import type { DriveFileIndexEntry, DriveFolderKind, SavedDriveFolders } from './integrations/googleDriveStorage'
+import { mergeDriveBankSources, mergeDriveBankSourcesWithStats } from './integrations/googleDriveMerge'
+import { isDriveFileUnchanged, loadDriveFileIndex, loadDriveFolderSnapshots, loadDriveFolders, loadDriveLastSync, missingDriveFileIds, saveDriveFileIndex, saveDriveFolderSnapshots, saveDriveFolders, saveDriveLastSync } from './integrations/googleDriveStorage'
+import type { DriveFileIndexEntry, DriveFolderKind, DriveFolderSnapshots, SavedDriveFolders } from './integrations/googleDriveStorage'
 
 type Mode = 'sheet' | 'bank'
 type SourceStatus = 'EMPTY' | 'LOADED' | 'VALIDATED' | 'ACCEPTED'
 type Dataset = { sheet: LedgerTransaction[]; bank: BankTransaction[] }
-type UploadState = { fileName: string; csv: CsvDocument; map: ColumnMap; valid: Transaction[]; issues: { row: number; message: string }[]; rowCount: number; ignoredRows: number; excludedRows: ExcludedBankRow[]; auxiliaryTransactionCount: number } | null
-type CardPdfEntry = { key: string; fingerprint: string; fileName: string; status: 'PROCESSING' | 'PROCESSED' | 'DIVERGENCE' | 'ERROR'; statement: CardStatement | null; legacyStatementIdentity?: string; error?: string; source?: 'MANUAL' | 'DRIVE'; driveFileId?: string }
+type UploadState = { fileName: string; csv: CsvDocument; map: ColumnMap; valid: Transaction[]; issues: { row: number; message: string }[]; rowCount: number; ignoredRows: number; excludedRows: ExcludedBankRow[]; auxiliaryIncludedCount: number; auxiliaryOutsidePeriodCount: number } | null
+type CardPdfEntry = { key: string; fingerprint: string; fileName: string; status: 'PROCESSING' | 'PROCESSED' | 'DIVERGENCE' | 'ERROR'; statement: CardStatement | null; legacyStatementIdentity?: string; error?: string; source?: 'MANUAL' | 'DRIVE'; driveFileId?: string; driveFileIds?: string[]; manualSourceIds?: string[] }
 type MissingWriteTarget = { kind: 'BANK'; bank: BankTransaction } | { kind: 'STATEMENT'; statement: CardStatement; transaction: CardStatementTransaction }
 const emptyData: Dataset = { sheet: [], bank: [] }
 const currency = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' })
@@ -106,15 +108,19 @@ export default function App() {
   const [driveFolders, setDriveFolders] = useState<SavedDriveFolders>(loadDriveFolders)
   const driveFoldersRef = useRef(driveFolders)
   const driveFileIndexRef = useRef<Record<string, DriveFileIndexEntry>>(loadDriveFileIndex())
+  const driveFolderSnapshotsRef = useRef<DriveFolderSnapshots>(loadDriveFolderSnapshots())
+  const driveLastMissingSourceIds = useRef<string[]>([])
   const [driveLastSync, setDriveLastSync] = useState<string | null>(loadDriveLastSync)
   const [driveSyncSummary, setDriveSyncSummary] = useState<DriveSyncSummary | null>(null)
   const [driveSyncProgress, setDriveSyncProgress] = useState('')
   const [driveSyncError, setDriveSyncError] = useState('')
   const [driveSyncBusy, setDriveSyncBusy] = useState(false)
+  const [pendingSourceOperations, setPendingSourceOperations] = useState(0)
   const [driveConnected, setDriveConnected] = useState(false)
-  const [driveStatementFiles, setDriveStatementFiles] = useState<{ id: string; name: string }[]>([])
+  const [driveStatementFiles, setDriveStatementFiles] = useState<{ id: string; name: string; periodStart: string | null; periodEnd: string | null; transactionCount: number; overlapCount: number; excludedRows: ExcludedBankRow[] }[]>([])
   const suppressedDriveFileIds = useRef(new Set<string>())
   const driveProcessedInSession = useRef(new Map<string, string>())
+  const driveFileStatusInSession = useRef(new Map<string, DriveFileProcessingStatus>())
   const drivePdfSemanticIdentities = useRef(new Map<string, string>())
   const manualBankTransactions = useRef<BankTransaction[]>([])
   const driveBankFiles = useRef<Record<string, BankTransaction[]>>({})
@@ -172,6 +178,26 @@ export default function App() {
     }).catch(() => { if (active) setError('Não foi possível acessar as decisões salvas neste dispositivo.') }).finally(() => { if (active) setDecisionsReady(true) })
     return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    seenPdfFingerprints.current = new Set(cardPdfs.map((entry) => entry.fingerprint))
+    seenSemanticPdfFingerprints.current.clear()
+    seenSemanticPdfOrigins.current.clear()
+    drivePdfSemanticIdentities.current.clear()
+    for (const entry of cardPdfs) {
+      if (!entry.statement) continue
+      const identity = cardStatementFinancialIdentity(entry.statement)
+      if (!identity) continue
+      const layout = entry.statement.sourceLayout
+      if ((layout === 'MOBILE_APP' || layout === 'INTERNET_BANKING') && !seenSemanticPdfFingerprints.current.has(identity)) seenSemanticPdfFingerprints.current.set(identity, layout)
+      const origins = new Set<'MANUAL' | 'DRIVE'>([
+        ...((entry.driveFileIds?.length || entry.driveFileId) ? ['DRIVE' as const] : []),
+        ...((entry.manualSourceIds?.length || entry.source === 'MANUAL') ? ['MANUAL' as const] : []),
+      ])
+      if (origins.size) seenSemanticPdfOrigins.current.set(identity, origins)
+      for (const sourceId of entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : [])) drivePdfSemanticIdentities.current.set(sourceId, identity)
+    }
+  }, [cardPdfs])
 
   useEffect(() => {
     if (previousScreen.current === 'home' && screen === 'results') window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
@@ -318,6 +344,12 @@ export default function App() {
     if (googleAccessToken.current && googleSheetLink?.spreadsheetId) await synchronizeSavedDecisions(googleSheetLink.spreadsheetId, googleAccessToken.current)
   }
 
+  async function trackSourceOperation<T>(operation: () => Promise<T>): Promise<T> {
+    setPendingSourceOperations((count) => count + 1)
+    try { return await operation() }
+    finally { setPendingSourceOperations((count) => Math.max(0, count - 1)) }
+  }
+
   function updateDriveIndex(next: Record<string, DriveFileIndexEntry>) {
     driveFileIndexRef.current = next
     try { saveDriveFileIndex(next) } catch { setDriveSyncError('Arquivos processados nesta sessão, mas não foi possível salvar o índice local.') }
@@ -342,11 +374,18 @@ export default function App() {
     if (!accessToken) { setDriveSyncError('Reconecte o Google para acessar as pastas do Drive.'); return }
     setDriveSyncBusy(true); setDriveSyncError(''); setDriveSyncProgress('Consultando as pastas…')
     let invoices: Awaited<ReturnType<typeof listGoogleDriveFolder>> = []
+    let invoiceFolderFiles: Awaited<ReturnType<typeof listGoogleDriveFolder>> = []
     let statements: Awaited<ReturnType<typeof listGoogleDriveFolder>> = []
+    let statementFolderFiles: Awaited<ReturnType<typeof listGoogleDriveFolder>> = []
     let errors = 0, alreadyKnown = 0, newProcessed = 0
+    let removedFromFolders = 0
+    const missingSourceIds: string[] = []
+    const snapshots = { ...driveFolderSnapshotsRef.current }
     const listed = new Map<DriveFolderKind, Set<string>>()
     const nextIndex = { ...driveFileIndexRef.current }
     const folderErrors: string[] = []
+    const invoiceOutcomes = new Map<string, DriveFileOutcome>()
+    const statementOutcomes = new Map<string, DriveStatementFileOutcome>()
     try {
       for (const [kind, folder] of [['invoices', folders.invoices], ['statements', folders.statements]] as const) {
         if (!folder) continue
@@ -354,8 +393,26 @@ export default function App() {
           const files = await listGoogleDriveFolder(folder.id, accessToken)
           const supported = files.filter((file) => isSupportedDriveFile(file, kind))
           listed.set(kind, new Set(supported.map((file) => file.id)))
+          const missingIds = missingDriveFileIds(snapshots[kind], folder.id, supported.map((file) => file.id))
+          missingSourceIds.push(...missingIds)
+          removedFromFolders += missingIds.length
+          snapshots[kind] = { folderId: folder.id, fileIds: supported.map((file) => file.id).sort() }
           if (kind === 'invoices') invoices = supported
-          else statements = supported
+          if (kind === 'invoices') {
+            invoiceFolderFiles = files
+            for (const file of files.filter((candidate) => !isSupportedDriveFile(candidate, 'invoices'))) {
+              const outcome: DriveFileOutcome = { fileId: file.id, fileName: file.name, status: 'UNSUPPORTED' }
+              invoiceOutcomes.set(file.id, outcome)
+              driveFileStatusInSession.current.set(file.id, outcome.status)
+            }
+          }
+          else {
+            statementFolderFiles = files
+            statements = supported
+            for (const file of files.filter((candidate) => !isSupportedDriveFile(candidate, 'statements'))) {
+              statementOutcomes.set(file.id, { fileId: file.id, fileName: file.name, status: 'UNSUPPORTED', detail: 'Formato não suportado como extrato CSV.' })
+            }
+          }
         } catch (error) {
           if (error instanceof GoogleDriveError && error.code === 'AUTH') markGoogleDriveDisconnected()
           folderErrors.push(`${kind === 'invoices' ? 'Faturas' : 'Extratos'}: ${error instanceof Error ? error.message : 'falha ao listar a pasta.'}`); errors += 1
@@ -369,43 +426,77 @@ export default function App() {
       for (const { file, kind, folderId } of tasks) {
         const currentKind = kind === 'invoices' ? `Processando faturas ${++invoiceProgress} de ${invoices.length}` : `Processando extratos ${++statementProgress} de ${statements.length}`
         setDriveSyncProgress(`${currentKind}: ${file.name}`)
-        if (suppressedDriveFileIds.current.has(file.id)) { alreadyKnown += 1; continue }
+        if (suppressedDriveFileIds.current.has(file.id)) {
+          alreadyKnown += 1
+          if (kind === 'invoices') {
+            const outcome = { fileId: file.id, fileName: file.name, status: 'SKIPPED' as const }
+            invoiceOutcomes.set(file.id, outcome); driveFileStatusInSession.current.set(file.id, outcome.status)
+          } else {
+            statementOutcomes.set(file.id, { fileId: file.id, fileName: file.name, status: 'IGNORED', detail: 'Arquivo ignorado nesta sessão.' })
+          }
+          continue
+        }
         const previous = nextIndex[file.id]
         const modifiedTime = file.modifiedTime ?? ''
         if (isDriveFileUnchanged(file, previous, driveProcessedInSession.current.get(file.id), kind, folderId)) {
           alreadyKnown += 1
+          if (kind === 'invoices') {
+            const outcome: DriveFileOutcome = { fileId: file.id, fileName: file.name, status: driveFileStatusInSession.current.get(file.id) ?? 'SKIPPED', financialIdentity: drivePdfSemanticIdentities.current.get(file.id) }
+            invoiceOutcomes.set(file.id, outcome)
+          } else {
+            const loaded = driveStatementFiles.find((entry) => entry.id === file.id)
+            statementOutcomes.set(file.id, {
+              fileId: file.id, fileName: file.name, status: previous?.processingStatus === 'ERROR' ? 'ERROR' : 'PROCESSED',
+              periodStart: loaded?.periodStart, periodEnd: loaded?.periodEnd, transactionCount: loaded?.transactionCount,
+              overlapCount: loaded?.overlapCount, excludedRowCount: loaded?.excludedRows.length,
+              detail: previous?.processingStatus === 'ERROR' ? 'A última leitura deste arquivo registrou erro.' : undefined,
+            })
+          }
           continue
         }
         try {
           if (file.capabilities?.canDownload === false) throw new GoogleDriveError(`O arquivo “${file.name}” não permite download pela conta Google atual.`, 'DOWNLOAD')
           if (kind === 'invoices') {
             const old = cardPdfs.find((entry) => entry.driveFileId === file.id)
-            if (old) removeCardPdf(old.key, false)
+            if (old) removeCardPdfDriveSource(old.key, file.id)
           }
           const blob = await downloadGoogleDriveFile(file.id, accessToken)
           const localFile = new File([blob], file.name, { type: file.mimeType || (kind === 'invoices' ? 'application/pdf' : 'text/csv'), lastModified: file.modifiedTime ? Date.parse(file.modifiedTime) : Date.now() })
           let fileHadError = false
           if (kind === 'invoices') {
             const outcome = await processCardPdfFiles([{ file: localFile, driveFileId: file.id }], 'DRIVE')
-            const financialIdentity = outcome?.semanticIdentities[0]
-            if (financialIdentity) drivePdfSemanticIdentities.current.set(file.id, financialIdentity)
-            fileHadError = !outcome || outcome.errors > 0 || (outcome.processed === 0 && outcome.duplicates === 0)
+            const fileOutcome = resolveDrivePdfFileOutcome(file.id, file.name, outcome)
+            invoiceOutcomes.set(file.id, fileOutcome)
+            driveFileStatusInSession.current.set(file.id, fileOutcome.status)
+            if (fileOutcome.financialIdentity) drivePdfSemanticIdentities.current.set(file.id, fileOutcome.financialIdentity)
+            fileHadError = fileOutcome.status === 'PARSE_ERROR' || fileOutcome.status === 'PROCESSING_ERROR'
           } else {
             const csv = await readCsvFile(localFile)
             const map = initialColumnMap(csv.headers, 'bank') as ColumnMap
-            const period = csv.statementPeriodStart && csv.statementPeriodEnd ? { start: csv.statementPeriodStart, end: csv.statementPeriodEnd } : undefined
-            const parsed = parseBankRows(csv.rows, map, csv.metadataRowsIgnored, period)
-            const auxiliaryTransactions = parseBankRows(csv.auxiliaryRows, map).transactions
-            if (bankCsvRequiresManualMapping({ fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, auxiliaryTransactionCount: auxiliaryTransactions.length })) {
+            const parsed = parseBankCsvSections(csv, map)
+            if (bankCsvRequiresManualMapping({ fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, auxiliaryTransactionCount: parsed.auxiliaryIncludedCount })) {
               throw new Error('O formato precisa de configuração manual de colunas. Importe este CSV pelo seletor local para revisar o mapeamento.')
             }
             if (!parsed.transactions.length) throw new Error('Nenhuma movimentação válida foi encontrada no CSV.')
-            driveBankFiles.current = { ...driveBankFiles.current, [file.id]: parsed.transactions }
-            setDriveStatementFiles((currentFiles) => [...currentFiles.filter((item) => item.id !== file.id), { id: file.id, name: file.name }])
-            const merged = mergeDriveBankSources(manualBankTransactions.current, driveBankFiles.current)
+            const fileTransactions = parsed.transactions.map((transaction) => ({ ...transaction, statementSourceId: file.id, statementFileName: file.name }))
+            driveBankFiles.current = { ...driveBankFiles.current, [file.id]: fileTransactions }
+            const stats = mergeDriveBankSourcesWithStats(manualBankTransactions.current, driveBankFiles.current)
+            setDriveStatementFiles((currentFiles) => {
+              const previous = currentFiles.filter((item) => item.id !== file.id)
+              const next = [...previous, { id: file.id, name: file.name, periodStart: csv.statementPeriodStart, periodEnd: csv.statementPeriodEnd, transactionCount: fileTransactions.length, overlapCount: stats.overlapBySource[file.id] ?? 0, excludedRows: parsed.excludedRows ?? [] }]
+              return next.map((entry) => ({ ...entry, overlapCount: stats.overlapBySource[entry.id] ?? 0 }))
+            })
+            const merged = stats.transactions
             setData((currentData) => ({ ...currentData, bank: merged }))
             setSourceStatus((currentStatus) => ({ ...currentStatus, bank: 'ACCEPTED' }))
             fileHadError = csv.parseErrors.length > 0 || parsed.issues.length > 0
+            statementOutcomes.set(file.id, {
+              fileId: file.id, fileName: file.name, status: fileHadError ? 'WARNING' : 'PROCESSED',
+              periodStart: csv.statementPeriodStart, periodEnd: csv.statementPeriodEnd,
+              transactionCount: fileTransactions.length, ignoredRowCount: parsed.ignoredRows,
+              excludedRowCount: parsed.excludedRows?.length ?? 0, overlapCount: stats.overlapBySource[file.id] ?? 0,
+              detail: fileHadError ? `${csv.parseErrors.length + parsed.issues.length} aviso(s) na leitura; movimentações válidas foram carregadas.` : undefined,
+            })
           }
           if (fileHadError) errors += 1
           else { newProcessed += 1; driveProcessedInSession.current.set(file.id, modifiedTime) }
@@ -414,26 +505,57 @@ export default function App() {
         } catch (error) {
           if (error instanceof GoogleDriveError && error.code === 'AUTH') markGoogleDriveDisconnected()
           errors += 1
+          if (kind === 'invoices') {
+            const outcome = { fileId: file.id, fileName: file.name, status: 'PROCESSING_ERROR' as const, errorMessage: error instanceof Error ? error.message : 'Não foi possível baixar ou processar o arquivo.' }
+            invoiceOutcomes.set(file.id, outcome); driveFileStatusInSession.current.set(file.id, outcome.status)
+          } else {
+            statementOutcomes.set(file.id, { fileId: file.id, fileName: file.name, status: 'ERROR', detail: error instanceof Error ? error.message : 'Não foi possível processar este extrato.' })
+          }
           nextIndex[file.id] = { driveFileId: file.id, modifiedTime, size: file.size ?? null, mimeType: file.mimeType, kind, folderId, processingStatus: 'ERROR' }
           updateDriveIndex({ ...nextIndex })
           setDriveSyncError((currentError) => [currentError, `${file.name}: ${error instanceof Error ? error.message : 'não foi possível processar o arquivo.'}`].filter(Boolean).join(' '))
         }
       }
-      const removedFromFolders = Object.values(nextIndex).filter((entry) => {
-        const folder = folders[entry.kind]
-        const currentlyListed = listed.get(entry.kind)
-        return folder != null && entry.folderId === folder.id && currentlyListed != null && !currentlyListed.has(entry.driveFileId)
-      }).length
+      driveFolderSnapshotsRef.current = snapshots
+      driveLastMissingSourceIds.current = missingSourceIds
+      try { saveDriveFolderSnapshots(snapshots) } catch { setDriveSyncError((currentError) => [currentError, 'Não foi possível salvar a referência local das pastas.'].filter(Boolean).join(' ')) }
+      if (listed.has('invoices')) {
+        const currentIds = listed.get('invoices')!
+        setCardPdfs((current) => retainActiveInvoiceSources(current, currentIds))
+        for (const id of drivePdfSemanticIdentities.current.keys()) if (!currentIds.has(id)) drivePdfSemanticIdentities.current.delete(id)
+      }
+      if (listed.has('statements')) {
+        const currentIds = listed.get('statements')!
+        driveBankFiles.current = retainCurrentDriveBankSources(driveBankFiles.current, currentIds)
+        setDriveStatementFiles((current) => current.filter((file) => currentIds.has(file.id)))
+        const merged = mergeDriveBankSources(manualBankTransactions.current, driveBankFiles.current)
+        setData((current) => ({ ...current, bank: merged }))
+        setSourceStatus((current) => ({ ...current, bank: merged.length ? 'ACCEPTED' : manualBankTransactions.current.length ? 'ACCEPTED' : 'EMPTY' }))
+      }
+      const invoiceFileResults = invoiceFolderFiles.map((file) => invoiceOutcomes.get(file.id) ?? {
+        fileId: file.id,
+        fileName: file.name,
+        status: driveFileStatusInSession.current.get(file.id) ?? 'SKIPPED',
+        financialIdentity: drivePdfSemanticIdentities.current.get(file.id),
+      })
+      const invoiceSummary = summarizeDriveInvoiceOutcomes(invoiceFolderFiles.length, invoiceFileResults)
+      const statementFileResults = statementFolderFiles.map((file) => statementOutcomes.get(file.id) ?? {
+        fileId: file.id, fileName: file.name, status: 'IGNORED' as const, detail: 'Arquivo não foi processado nesta sincronização.',
+      })
       const timestamp = new Date().toISOString()
       setDriveLastSync(timestamp)
       try { saveDriveLastSync(timestamp) } catch { /* Timestamp is an optional local convenience. */ }
-      setDriveSyncSummary({ invoicesFound: invoices.length, statementsFound: statements.length, alreadyKnown, newProcessed, errors, removedFromFolders })
+      setDriveSyncSummary({ ...invoiceSummary, statementsFound: statements.length, statementFileOutcomes: statementFileResults, alreadyKnown, newProcessed, errors, removedFromFolders })
       setDriveSyncProgress('')
       if (folderErrors.length) setDriveSyncError((currentError) => [currentError, ...folderErrors].filter(Boolean).join(' '))
     } finally { setDriveSyncBusy(false); setDriveSyncProgress('') }
   }
 
   async function selectDriveFolder(kind: DriveFolderKind) {
+    return trackSourceOperation(() => selectDriveFolderContent(kind))
+  }
+
+  async function selectDriveFolderContent(kind: DriveFolderKind) {
     setDriveSyncError('')
     try {
       if (!googleDriveApiKey || !googleDriveProjectNumber) throw new GoogleDriveError('Configure VITE_GOOGLE_API_KEY e VITE_GOOGLE_PROJECT_NUMBER no ambiente de build para usar o seletor oficial de pastas.', 'CONFIG')
@@ -454,6 +576,10 @@ export default function App() {
   }
 
   async function syncDriveManually() {
+    return trackSourceOperation(() => syncDriveManuallyContent())
+  }
+
+  async function syncDriveManuallyContent() {
     if (!driveFoldersRef.current.invoices && !driveFoldersRef.current.statements) return
     let token = googleAccessToken.current
     try {
@@ -485,7 +611,14 @@ export default function App() {
     delete next[fileId]
     driveBankFiles.current = next
     setDriveStatementFiles((current) => current.filter((item) => item.id !== fileId))
-    const merged = mergeDriveBankSources(manualBankTransactions.current, next)
+    setDriveSyncSummary((current) => current ? {
+      ...current,
+      statementsFound: Math.max(0, current.statementsFound - 1),
+      statementFileOutcomes: current.statementFileOutcomes?.filter((item) => item.fileId !== fileId),
+    } : current)
+    const stats = mergeDriveBankSourcesWithStats(manualBankTransactions.current, next)
+    setDriveStatementFiles((current) => current.filter((item) => item.id !== fileId).map((entry) => ({ ...entry, overlapCount: stats.overlapBySource[entry.id] ?? 0 })))
+    const merged = stats.transactions
     setData((current) => ({ ...current, bank: merged }))
     setSourceStatus((current) => ({ ...current, bank: merged.length ? 'ACCEPTED' : 'EMPTY' }))
   }
@@ -500,7 +633,7 @@ export default function App() {
 
   function clearSession() {
     pdfSessionGeneration.current += 1; seenPdfFingerprints.current.clear(); seenSemanticPdfFingerprints.current.clear(); seenSemanticPdfOrigins.current.clear(); pdfEntryTokens.current.clear()
-    suppressedDriveFileIds.current.clear(); driveProcessedInSession.current.clear(); drivePdfSemanticIdentities.current.clear(); manualBankTransactions.current = []; driveBankFiles.current = {}; setDriveStatementFiles([])
+    suppressedDriveFileIds.current.clear(); driveProcessedInSession.current.clear(); driveFileStatusInSession.current.clear(); drivePdfSemanticIdentities.current.clear(); manualBankTransactions.current = []; driveBankFiles.current = {}; setDriveStatementFiles([])
     const retainedGoogleSheet = sheetSource === 'google' ? googleSheetRows : null
     setData({ sheet: retainedGoogleSheet ?? [], bank: [] }); setCardPdfs([]); setCardPdfNotice(''); setScreen('home'); setUploads({ sheet: null, bank: null }); setSourceStatus({ sheet: retainedGoogleSheet?.length ? 'ACCEPTED' : 'EMPTY', bank: 'EMPTY' }); setCsvSheetAccepted(false); setGoogleSheetRows(retainedGoogleSheet); setGoogleError(''); setFilterYear('all'); setFilterMonth('all'); setFromDate(''); setToDate('')
   }
@@ -754,9 +887,10 @@ export default function App() {
   const filteredSheet = useMemo(() => data.sheet.filter((sheet) => inPeriod(sheet, filterYear, filterMonth, fromDate, toDate)), [data.sheet, filterYear, filterMonth, fromDate, toDate])
   const shownReview = filteredItems.filter((item) => item.status === 'REVIEW')
   const shownCardDivergences = filteredItems.filter((item) => item.status === 'CARD_DIVERGENCE')
-  const shownMissing = filteredItems.filter((item) => item.status === 'MISSING')
-  const bankBalanceAudit = useMemo(() => auditBankBalance(data.bank, uploads.bank?.excludedRows ?? []), [data.bank, uploads.bank?.excludedRows])
+  const shownMissing = selectMissingExpenses(filteredItems)
+  const bankBalanceAudit = useMemo(() => auditBankBalance(manualBankTransactions.current, uploads.bank?.excludedRows ?? []), [data.bank, uploads.bank?.excludedRows])
   const shownOutOfScope = filteredItems.filter((item) => item.status === 'OUT_OF_SCOPE')
+  const shownBankRefundGroups = result.bankRefundGroups.filter((group) => [group.refundTransactionId, ...group.originalTransactionIds].some((id) => filteredItems.some((item) => item.bank.id === id)))
   const shownMatched = filteredItems.filter((item) => item.status === 'MATCHED' && item.bank.type !== 'CARD_PAYMENT')
   const costCategories = [...new Set((googleSheetRows ?? []).map((item) => item.category.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'pt-BR'))
   const investFacilYields = shownOutOfScope.filter((item) => item.bank.outOfScopeSubtype === 'INVEST_FACIL_YIELD')
@@ -764,8 +898,16 @@ export default function App() {
   const statementMatchedSheetIds = new Set(statementResults.flatMap((result) => result.matches.flatMap((match) => match.status === 'CARD_MATCHED' && match.sheet ? [match.sheet.id] : match.status === 'CARD_GROUP_MATCHED' ? match.candidates.map((row) => row.id) : [])))
   const unmatchedFilteredSheet = result.unmatchedSheet.filter((sheet) => !statementMatchedSheetIds.has(sheet.id) && inPeriod(sheet, filterYear, filterMonth, fromDate, toDate))
   const canReconcile = sourceStatus.sheet === 'ACCEPTED' && data.sheet.length > 0 && ((sourceStatus.bank === 'ACCEPTED' && data.bank.length > 0) || cardPdfs.some((entry) => entry.statement != null))
+  const isSourceProcessing = pendingSourceOperations > 0 || driveSyncBusy || googleLoading
+    || sourceStatus.sheet === 'LOADED' || sourceStatus.bank === 'LOADED'
+    || cardPdfs.some((entry) => entry.status === 'PROCESSING')
+  const canLaunchReconciliation = canReconcile && decisionsReady && !isSourceProcessing
 
   async function selectFile(mode: Mode, event: ChangeEvent<HTMLInputElement>) {
+    return trackSourceOperation(() => selectFileContent(mode, event))
+  }
+
+  async function selectFileContent(mode: Mode, event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
@@ -775,10 +917,10 @@ export default function App() {
     try {
       const csv = await readCsvFile(file)
       const map = initialColumnMap(csv.headers, mode) as ColumnMap
-      const period = csv.statementPeriodStart && csv.statementPeriodEnd ? { start: csv.statementPeriodStart, end: csv.statementPeriodEnd } : undefined
-      const parsed = mode === 'sheet' ? parseLedgerRows(csv.rows, map) : parseBankRows(csv.rows, map, csv.metadataRowsIgnored, period)
-      const auxiliaryTransactions = mode === 'bank' ? parseBankRows(csv.auxiliaryRows, map).transactions.length : 0
-      setUploads((current) => ({ ...current, [mode]: { fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, excludedRows: mode === 'bank' ? parsed.excludedRows ?? [] : [], auxiliaryTransactionCount: auxiliaryTransactions } }))
+      const parsed = mode === 'sheet' ? parseLedgerRows(csv.rows, map) : parseBankCsvSections(csv, map)
+      const auxiliaryIncludedCount = mode === 'bank' ? (parsed as ReturnType<typeof parseBankCsvSections>).auxiliaryIncludedCount : 0
+      const auxiliaryOutsidePeriodCount = mode === 'bank' ? (parsed as ReturnType<typeof parseBankCsvSections>).auxiliaryOutsidePeriodCount : 0
+      setUploads((current) => ({ ...current, [mode]: { fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, excludedRows: mode === 'bank' ? parsed.excludedRows ?? [] : [], auxiliaryIncludedCount, auxiliaryOutsidePeriodCount } }))
       setSourceStatus((current) => ({ ...current, [mode]: 'VALIDATED' }))
     } catch {
       setSourceStatus((current) => ({ ...current, [mode]: previousStatus }))
@@ -794,6 +936,10 @@ export default function App() {
   }
 
   async function processCardPdfFiles(files: { file: File; driveFileId?: string }[], source: 'MANUAL' | 'DRIVE') {
+    return trackSourceOperation(() => processCardPdfFilesContent(files, source))
+  }
+
+  async function processCardPdfFilesContent(files: { file: File; driveFileId?: string }[], source: 'MANUAL' | 'DRIVE') {
     setCardPdfNotice('')
     const generation = pdfSessionGeneration.current
     let duplicates = 0
@@ -801,17 +947,40 @@ export default function App() {
     let unreadable = 0
     let processed = 0
     const semanticIdentities: string[] = []
+    const fileOutcomes: DriveFileOutcome[] = []
+    let sessionEntries = [...cardPdfs]
     for (const item of files) {
       const { file, driveFileId } = item
+      const recordOutcome = (status: DriveFileProcessingStatus, financialIdentity?: string, errorMessage?: string) => fileOutcomes.push({ fileId: driveFileId ?? `manual-${file.name}`, fileName: file.name, status, ...(financialIdentity ? { financialIdentity } : {}), ...(errorMessage ? { errorMessage } : {}) })
       try {
         const fingerprint = await fingerprintFile(file)
         if (generation !== pdfSessionGeneration.current) return
-        if (seenPdfFingerprints.current.has(fingerprint)) { duplicates += 1; continue }
+        if (seenPdfFingerprints.current.has(fingerprint)) {
+          const existing = sessionEntries.find((entry) => entry.fingerprint === fingerprint)
+          if (existing?.statement) {
+            duplicates += 1
+            if (source === 'DRIVE' && driveFileId) {
+              const identity = existing.statement ? cardStatementFinancialIdentity(existing.statement) : undefined
+              if (identity) drivePdfSemanticIdentities.current.set(driveFileId, identity)
+              const updated = { ...existing, driveFileIds: [...new Set([...(existing.driveFileIds ?? (existing.driveFileId ? [existing.driveFileId] : [])), driveFileId])] }
+              sessionEntries = sessionEntries.map((entry) => entry.key === existing.key ? updated : entry)
+              setCardPdfs((current) => current.map((entry) => entry.key === existing.key ? updated : entry))
+            } else if (source === 'MANUAL') {
+              const updated = { ...existing, manualSourceIds: [...new Set([...(existing.manualSourceIds ?? []), fingerprint])] }
+              sessionEntries = sessionEntries.map((entry) => entry.key === existing.key ? updated : entry)
+              setCardPdfs((current) => current.map((entry) => entry.key === existing.key ? updated : entry))
+            }
+            recordOutcome('DUPLICATE_FINANCIAL', existing.statement ? cardStatementFinancialIdentity(existing.statement) ?? undefined : undefined)
+          } else { unreadable += 1; recordOutcome('PARSE_ERROR') }
+          continue
+        }
         seenPdfFingerprints.current.add(fingerprint)
         const key = `pdf-${fingerprint}`
         const entryToken = {}
         pdfEntryTokens.current.set(key, entryToken)
-        setCardPdfs((current) => [...current, { key, fingerprint, fileName: file.name, status: 'PROCESSING', statement: null, source, driveFileId }])
+        const processingEntry: CardPdfEntry = { key, fingerprint, fileName: file.name, status: 'PROCESSING', statement: null, source, driveFileId, driveFileIds: driveFileId ? [driveFileId] : [], manualSourceIds: source === 'MANUAL' ? [fingerprint] : [] }
+        sessionEntries = [...sessionEntries, processingEntry]
+        setCardPdfs((current) => [...current, processingEntry])
         try {
           const parsedStatement = await readCardStatementPdf(file)
           if (generation !== pdfSessionGeneration.current) return
@@ -822,6 +991,7 @@ export default function App() {
             || parsedStatement.sourceLayout === 'INTERNET_BANKING' && (!parsedStatement.dueDate || parsedStatement.reportedTotal == null || parsedStatement.reportedTotal <= 0 || !hasCard || !hasFinancialLine)
           if (structurallyIncomplete) {
             unreadable += 1
+            recordOutcome('PARSE_ERROR', undefined, parsedStatement.errors[0] ?? 'A estrutura da fatura está incompleta e não pode ser conciliada.')
             setCardPdfs((current) => current.map((entry) => entry.key === key ? { ...entry, status: 'ERROR', statement: null, error: parsedStatement.errors[0] ?? 'A estrutura da fatura está incompleta e não pode ser conciliada.' } : entry))
             pdfEntryTokens.current.delete(key)
             continue
@@ -833,8 +1003,21 @@ export default function App() {
           const previousOrigins = semanticFingerprint ? seenSemanticPdfOrigins.current.get(semanticFingerprint) : undefined
           if (semanticFingerprint && layout && previousLayout && (previousLayout !== layout || source === 'DRIVE' || previousOrigins?.has('DRIVE'))) {
             semanticDuplicates += 1
+            recordOutcome('DUPLICATE_FINANCIAL', semanticFingerprint)
             seenPdfFingerprints.current.delete(fingerprint)
             setCardPdfs((current) => current.filter((entry) => entry.key !== key))
+            const matching = sessionEntries.find((entry) => entry.key !== key && entry.statement && cardStatementFinancialIdentity(entry.statement) === semanticFingerprint)
+            if (source === 'DRIVE' && driveFileId) drivePdfSemanticIdentities.current.set(driveFileId, semanticFingerprint)
+            if (matching) {
+              const updated = source === 'DRIVE' && driveFileId
+                ? { ...matching, driveFileIds: [...new Set([...(matching.driveFileIds ?? (matching.driveFileId ? [matching.driveFileId] : [])), driveFileId])] }
+                : { ...matching, manualSourceIds: [...new Set([...(matching.manualSourceIds ?? []), fingerprint])] }
+              sessionEntries = [...sessionEntries.filter((entry) => entry.key !== key).map((entry) => entry.key === matching.key ? updated : entry)]
+              setCardPdfs((current) => current.filter((entry) => entry.key !== key).map((entry) => entry.key === matching.key ? updated : entry))
+            } else {
+              sessionEntries = sessionEntries.filter((entry) => entry.key !== key)
+              setCardPdfs((current) => current.filter((entry) => entry.key !== key))
+            }
             pdfEntryTokens.current.delete(key)
             continue
           }
@@ -844,18 +1027,23 @@ export default function App() {
             origins.add(source); seenSemanticPdfOrigins.current.set(semanticFingerprint, origins)
           }
           const statement: CardStatement = { ...parsedStatement, statementIdentity: `${parsedStatement.statementIdentity}-${fingerprint}`, transactions: parsedStatement.transactions.map((transaction) => ({ ...transaction, id: `${transaction.id}-${fingerprint}` })) }
-          setCardPdfs((current) => current.map((entry) => entry.key === key ? { ...entry, statement, legacyStatementIdentity: parsedStatement.statementIdentity, status: statement.errors.length ? 'DIVERGENCE' : 'PROCESSED' } : entry))
+          const processedEntry = { ...processingEntry, statement, legacyStatementIdentity: parsedStatement.statementIdentity, status: statement.errors.length ? 'DIVERGENCE' as const : 'PROCESSED' as const }
+          sessionEntries = sessionEntries.map((entry) => entry.key === key ? processedEntry : entry)
+          setCardPdfs((current) => current.map((entry) => entry.key === key ? processedEntry : entry))
           processed += 1
+          recordOutcome('PROCESSED_UNIQUE', semanticFingerprint ?? undefined)
           pdfEntryTokens.current.delete(key)
-        } catch {
+        } catch (error) {
           if (generation !== pdfSessionGeneration.current) return
           if (pdfEntryTokens.current.get(key) !== entryToken) continue
           unreadable += 1
+          recordOutcome('PARSE_ERROR', undefined, error instanceof Error ? error.message : 'Não foi possível interpretar este PDF.')
           setCardPdfs((current) => current.map((entry) => entry.key === key ? { ...entry, status: 'ERROR', error: 'Não foi possível interpretar este PDF. Os demais arquivos seguem disponíveis.' } : entry))
           pdfEntryTokens.current.delete(key)
         }
-      } catch {
-        unreadable += 1
+        } catch (error) {
+          unreadable += 1
+          recordOutcome('PROCESSING_ERROR', undefined, error instanceof Error ? error.message : 'Não foi possível preparar ou identificar o arquivo PDF.')
       }
     }
     if (duplicates || semanticDuplicates || unreadable) {
@@ -866,7 +1054,7 @@ export default function App() {
       ].filter(Boolean)
       setCardPdfNotice(`${parts.join(' e ')}.`)
     }
-    return { processed, errors: unreadable, duplicates: duplicates + semanticDuplicates, semanticIdentities }
+    return { processed, errors: unreadable, duplicates: duplicates + semanticDuplicates, semanticIdentities, fileOutcomes }
   }
 
   function removeCardPdf(key: string, suppressDrive = true) {
@@ -874,7 +1062,7 @@ export default function App() {
     if (fingerprint) seenPdfFingerprints.current.delete(fingerprint)
     pdfEntryTokens.current.delete(key)
     const removed = cardPdfs.find((entry) => entry.key === key)
-    if (suppressDrive && removed?.source === 'DRIVE' && removed.driveFileId) suppressedDriveFileIds.current.add(removed.driveFileId)
+    if (suppressDrive) (removed?.driveFileIds ?? (removed?.driveFileId ? [removed.driveFileId] : [])).forEach((id) => suppressedDriveFileIds.current.add(id))
     if (removed?.statement) {
       if (suppressDrive) {
         const removedFinancialIdentity = cardStatementFinancialIdentity(removed.statement)
@@ -901,22 +1089,32 @@ export default function App() {
     setCardPdfs((current) => current.filter((entry) => entry.key !== key))
   }
 
+  function removeCardPdfDriveSource(key: string, driveFileId: string) {
+    const entry = cardPdfs.find((item) => item.key === key)
+    if (!entry) return
+    const driveFileIds = (entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : [])).filter((id) => id !== driveFileId)
+    if (!driveFileIds.length && !(entry.manualSourceIds?.length)) { removeCardPdf(key, false); return }
+    const nextEntry = { ...entry, driveFileIds, driveFileId: driveFileIds[0] }
+    setCardPdfs((current) => current.map((item) => item.key === key ? nextEntry : item))
+    drivePdfSemanticIdentities.current.delete(driveFileId)
+  }
+
   function changeMap(mode: Mode, key: keyof ColumnMap, value: string) {
     setUploads((current) => {
       const entry = current[mode]
       if (!entry) return current
       const map = { ...entry.map, [key]: value }
-      const period = entry.csv.statementPeriodStart && entry.csv.statementPeriodEnd ? { start: entry.csv.statementPeriodStart, end: entry.csv.statementPeriodEnd } : undefined
-      const parsed = mode === 'sheet' ? parseLedgerRows(entry.csv.rows, map) : parseBankRows(entry.csv.rows, map, entry.csv.metadataRowsIgnored, period)
-      const auxiliaryTransactions = mode === 'bank' ? parseBankRows(entry.csv.auxiliaryRows, map).transactions.length : 0
-      return { ...current, [mode]: { ...entry, map, valid: parsed.transactions, issues: [...entry.csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, excludedRows: mode === 'bank' ? parsed.excludedRows ?? [] : [], auxiliaryTransactionCount: auxiliaryTransactions } }
+      const parsed = mode === 'sheet' ? parseLedgerRows(entry.csv.rows, map) : parseBankCsvSections(entry.csv, map)
+      const auxiliaryIncludedCount = mode === 'bank' ? (parsed as ReturnType<typeof parseBankCsvSections>).auxiliaryIncludedCount : 0
+      const auxiliaryOutsidePeriodCount = mode === 'bank' ? (parsed as ReturnType<typeof parseBankCsvSections>).auxiliaryOutsidePeriodCount : 0
+      return { ...current, [mode]: { ...entry, map, valid: parsed.transactions, issues: [...entry.csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, excludedRows: mode === 'bank' ? parsed.excludedRows ?? [] : [], auxiliaryIncludedCount, auxiliaryOutsidePeriodCount } }
     })
   }
 
   function acceptUpload(mode: Mode) {
     const entry = uploads[mode]
     if (!entry || !entry.valid.length) return
-    if (mode === 'bank') manualBankTransactions.current = entry.valid as BankTransaction[]
+    if (mode === 'bank') manualBankTransactions.current = (entry.valid as BankTransaction[]).map((transaction) => ({ ...transaction, statementSourceId: 'manual', statementSourceIds: ['manual'], statementFileName: uploads.bank?.fileName ?? 'Extrato local' }))
     const next = mode === 'sheet'
       ? { ...data, sheet: entry.valid as LedgerTransaction[] }
       : { ...data, bank: mergeDriveBankSources(manualBankTransactions.current, driveBankFiles.current) }
@@ -940,6 +1138,10 @@ export default function App() {
   }
 
   function runReconciliation() {
+    if (isSourceProcessing) {
+      setError('Aguarde o processamento dos arquivos antes de conciliar.')
+      return
+    }
     if (!canReconcile) {
       const missing = [sourceStatus.sheet !== 'ACCEPTED' ? 'CUSTOS ANO' : '', sourceStatus.bank !== 'ACCEPTED' && !cardPdfs.some((entry) => entry.statement) ? 'extrato bancário ou fatura PDF' : ''].filter(Boolean)
       setError(`Aceite as linhas válidas de ${missing.join(' e ')} antes de conciliar.`)
@@ -1238,6 +1440,12 @@ export default function App() {
       }
       const refreshed = auditConsistency({
         banks: data.bank,
+        bankSourceRows: [
+          ...(manualBankTransactions.current.length ? [{ sourceId: 'manual', sourceName: uploads.bank?.fileName ?? 'Extrato local', transactions: manualBankTransactions.current }] : []),
+          ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, sourceName: transactions[0]?.statementFileName ?? sourceId, transactions })),
+        ],
+        currentBankItems: result.items,
+        bankRefundGroups: result.bankRefundGroups,
         sheets: auditSheets,
         statements: [{ statement: { ...item.statement, transactions: [item.transaction] } }],
         currentCardMatches: statementResults.flatMap((entry) => entry.matches.filter((match) => match.transaction.id === item.transaction.id && entry.statement.statementIdentity === item.statement.statementIdentity).map((match) => ({ statementIdentity: entry.statement.statementIdentity, transactionId: match.transaction.id, match }))),
@@ -1286,8 +1494,28 @@ export default function App() {
         setConsistencyAuditSourceNote('Auditoria das fontes carregadas nesta sessão e das decisões locais; nenhuma alteração foi feita.')
       }
       const localDecisions = await listPersistedDecisions()
-      const result = auditConsistency({
+      const auditResult = auditConsistency({
         banks: data.bank,
+        bankSourceRows: [
+          ...(manualBankTransactions.current.length ? [{ sourceId: 'manual', sourceName: uploads.bank?.fileName ?? 'Extrato local', transactions: manualBankTransactions.current }] : []),
+          ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, sourceName: transactions[0]?.statementFileName ?? sourceId, transactions })),
+        ],
+        currentBankItems: result.items,
+        bankRefundGroups: result.bankRefundGroups,
+        missingCounterCollections: [
+          { source: 'card superior', items: selectMissingExpenses(result.items) },
+          { source: 'badge da aba', items: selectMissingExpenses(result.items) },
+          { source: 'resumo e lista', items: selectMissingExpenses(result.items) },
+        ],
+        activeDriveSourceIds: Object.keys(driveBankFiles.current),
+        currentDriveSourceIds: Object.values(driveFolderSnapshotsRef.current).flatMap((snapshot) => snapshot.fileIds),
+        missingDriveSourceIds: driveLastMissingSourceIds.current,
+        duplicateInvoiceSources: cardPdfs.flatMap((entry) => {
+          if (!entry.statement) return []
+          const identity = cardStatementFinancialIdentity(entry.statement)
+          const sourceIds = entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : [])
+          return identity && sourceIds.length > 1 ? [{ identity, sourceIds }] : []
+        }),
         sheets: auditSheets,
         statements: cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []),
         currentCardMatches: statementResults.flatMap((entry) => entry.matches.map((match) => ({ statementIdentity: entry.statement.statementIdentity, transactionId: match.transaction.id, match }))),
@@ -1297,7 +1525,7 @@ export default function App() {
         remoteTombstones,
         localTombstones: listDecisionTombstones(),
       })
-      setConsistencyAudit(result)
+      setConsistencyAudit(auditResult)
       setConsistencyAuditFilter('ALL')
       setTab('auditor')
     } catch (auditError) {
@@ -1352,6 +1580,12 @@ export default function App() {
         }
         const refreshed = auditConsistency({
           banks: data.bank,
+          bankSourceRows: [
+            ...(manualBankTransactions.current.length ? [{ sourceId: 'manual', sourceName: uploads.bank?.fileName ?? 'Extrato local', transactions: manualBankTransactions.current }] : []),
+            ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, sourceName: transactions[0]?.statementFileName ?? sourceId, transactions })),
+          ],
+          currentBankItems: result.items,
+          bankRefundGroups: result.bankRefundGroups,
           sheets: auditSheets,
           statements: cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []),
           currentCardMatches: statementResults.flatMap((entry) => entry.matches.map((match) => ({ statementIdentity: entry.statement.statementIdentity, transactionId: match.transaction.id, match }))),
@@ -1410,7 +1644,7 @@ export default function App() {
             </div>
             <div className="card-import-heading"><span className="step-label">03 / CARTÃO DE CRÉDITO</span><h3>Faturas do cartão</h3></div>
             <CardStatementUpload entries={cardPdfs} notice={cardPdfNotice} onSelect={selectCardPdfs} onRemove={removeCardPdf} onRemoveAll={() => { if (window.confirm('Remover todas as faturas PDF desta sessão? As confirmações salvas serão mantidas.')) cardPdfs.forEach((entry) => removeCardPdf(entry.key)) }}/>
-            <div className="launch-row"><div className="privacy-detail"><span className="lock-icon">⌑</span><span><strong>Processamento local</strong><small>PDF e CSV são processados neste dispositivo. As decisões ficam salvas localmente e podem sincronizar entre dispositivos.</small></span></div><div className="launch-action"><small>{!decisionsReady ? 'Carregando decisões locais…' : canReconcile ? 'Arquivos aceitos; conciliação pronta.' : sourceStatus.sheet === 'ACCEPTED' ? 'Falta aceitar as linhas válidas do extrato bancário.' : sourceStatus.bank === 'ACCEPTED' ? 'Falta aceitar as linhas válidas da CUSTOS ANO.' : 'Aceite a CUSTOS ANO e o extrato, ou importe a fatura PDF.'}</small><button ref={reconcileButtonRef} className="button button-primary button-launch" aria-hidden={showStickyReconcile} tabIndex={showStickyReconcile ? -1 : undefined} onClick={runReconciliation} disabled={!canReconcile || !decisionsReady}>Conciliar agora <span aria-hidden="true">↗</span></button></div></div>
+            <div className="launch-row"><div className="privacy-detail"><span className="lock-icon">⌑</span><span><strong>Processamento local</strong><small>PDF e CSV são processados neste dispositivo. As decisões ficam salvas localmente e podem sincronizar entre dispositivos.</small></span></div><div className="launch-action"><small>{isSourceProcessing ? 'Processando arquivos...' : !decisionsReady ? 'Carregando decisões locais…' : canReconcile ? 'Arquivos aceitos; conciliação pronta.' : sourceStatus.sheet === 'ACCEPTED' ? 'Falta aceitar as linhas válidas do extrato bancário.' : sourceStatus.bank === 'ACCEPTED' ? 'Falta aceitar as linhas válidas da CUSTOS ANO.' : 'Aceite a CUSTOS ANO e o extrato, ou importe a fatura PDF.'}</small><button ref={reconcileButtonRef} className="button button-primary button-launch" aria-label={isSourceProcessing ? 'Processando arquivos...' : 'Conciliar agora'} aria-hidden={showStickyReconcile} tabIndex={showStickyReconcile ? -1 : undefined} onClick={runReconciliation} disabled={!canLaunchReconciliation}>{isSourceProcessing ? 'Processando arquivos...' : <>Conciliar agora <span aria-hidden="true">↗</span></>}</button></div></div>
           </section>
           <section className="how-section"><span className="step-label">02 / O QUE ACONTECE</span><div className="how-grid"><HowCard number="01" title="Validar" copy="Confira cabeçalhos, linhas válidas e possíveis problemas."/><HowCard number="02" title="Comparar" copy="Valores, datas e descrições formam candidatos explicáveis."/><HowCard number="03" title="Revisar" copy="Você confirma ou ignora cada caso incerto."/></div></section>
         </> : <>
@@ -1431,7 +1665,8 @@ export default function App() {
           {tab === 'auditor' && consistencyAudit && <section className="consistency-audit"><header className="panel audit-summary"><div><span className="eyebrow">SOMENTE LEITURA</span><h2>Auditoria de consistência</h2><small>Executada em {new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(consistencyAudit.auditedAt))}</small></div><button className="button button-outline" onClick={() => void runConsistencyAudit()} disabled={consistencyAuditBusy}>{consistencyAuditBusy ? 'Auditando…' : 'Executar novamente'}</button><p>{consistencyAuditSourceNote}</p></header>{consistencyAuditError && <p className="cost-write-notice" role="status">{consistencyAuditError}</p>}<div className="audit-counts"><strong>⚠ {activeAuditSummary?.attention ?? 0} problemas que exigem atenção</strong><strong>{activeAuditSummary?.critical ?? 0} críticos</strong><strong>{activeAuditSummary?.review ?? 0} para revisão</strong><strong>{activeAuditSummary?.maintenance ?? 0} manutenções</strong><strong>{activeAuditSummary?.legacy ?? 0} legados</strong><strong>{hiddenAuditFindings.length} avisos ocultos</strong><strong>{consistencyAudit.summary.evaluatedPurchases} compras avaliadas</strong><strong>{activeAuditSummary?.informational ?? 0} informativos</strong></div><details className="panel audit-inventory"><summary>Compras avaliadas · {consistencyAudit.items.length}</summary>{consistencyAudit.items.map((item) => <div className="audit-transaction" key={item.fingerprint}><strong>{item.transaction.originalDescription}</strong><span>{dateLabel(item.transaction.purchaseDate)} · {formatCents(item.transaction.amount)}</span><details><summary>Detalhes técnicos da avaliação</summary><pre>{JSON.stringify({ diagnostico: item.diagnosis, estadoPuro: item.pure.status, estadoAtual: item.current?.status ?? null, fingerprint: item.fingerprint }, null, 2)}</pre></details></div>)}</details><div className="audit-filter"><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('ALL')}>Todos ({activeAuditFindings.length})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('CRITICAL')}>Críticos ({activeAuditSummary?.critical ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('REVIEW')}>Revisão ({activeAuditSummary?.review ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('LEGACY')}>Legado/Manutenção ({(activeAuditSummary?.maintenance ?? 0) + (activeAuditSummary?.legacy ?? 0)})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('HIDDEN')}>Ocultos ({hiddenAuditFindings.length})</button></div>{auditDisplayedFindings.length ? auditDisplayedFindings.map((finding) => <AuditFindingCard key={finding.id} finding={finding} visibility={dismissedAuditFindings} hiddenView={consistencyAuditFilter === 'HIDDEN'} onDismiss={hideAuditFinding} onRestore={restoreHiddenAuditFinding} onDiscardObsolete={(item) => void auditDiscardObsoleteDoubleClaim(item)} onViewPurchase={(item) => { if (!item.item) return; setAuditFocusTransactionId(item.item.transaction.id); setAuditFocusStatementIdentity(item.item.statement.statementIdentity); setTab('statement'); setStatementOnlyIssues(false) }} onUseCandidate={(item) => { if (item.item) void auditUseCandidate(item.item) }} onInvalidateDecision={(_item, decision, explanation) => void auditInvalidateDecision(decision, explanation)} onReanalyze={(item) => { if (item.item) void auditRecalculateItem(item.item) }}/>) : <div className="panel"><EmptyState title={consistencyAuditFilter === 'HIDDEN' ? 'Nenhum aviso oculto' : 'Nenhuma inconsistência neste filtro'} copy={consistencyAuditFilter === 'HIDDEN' ? 'Os avisos ocultados aparecerão aqui.' : 'O relatório não encontrou problemas para mostrar nesta categoria.'}/></div>}</section>}
           {tab === 'overview' && <>
             <div className="summary-grid"><section className="panel"><PanelTitle title="Movimentação no período" note="Valores apresentados em reais"/><div className="totals-list"><AmountRow label="Total de movimentações do banco" amount={filteredItems.filter((item) => item.bank.direction === 'DEBIT' || item.bank.direction === 'CREDIT').reduce((sum, item) => sum + item.bank.amount, 0)} /><AmountRow label="Saídas" amount={filteredItems.filter((item) => item.bank.direction === 'DEBIT').reduce((sum, item) => sum + item.bank.amount, 0)}/><AmountRow label="Entradas" amount={filteredItems.filter((item) => item.bank.direction === 'CREDIT').reduce((sum, item) => sum + item.bank.amount, 0)}/><AmountRow label="Lançamentos da planilha" amount={filteredSheet.reduce((sum, item) => sum + item.amount, 0)} strong/></div></section>
-              <section className="panel"><PanelTitle title="Arquivos usados" note="Dados temporários nesta sessão"/><div className="file-summary"><FileLine icon="▤" title="Tabela CUSTOS ANO" detail={`${data.sheet.length} linhas válidas`} /><FileLine icon="◈" title="Extrato bancário" detail={`${data.bank.length} movimentações válidas${uploads.bank?.csv.statementPeriodStart && uploads.bank.csv.statementPeriodEnd ? ` · ${dateLabel(uploads.bank.csv.statementPeriodStart)} a ${dateLabel(uploads.bank.csv.statementPeriodEnd)}` : ''}`} />{uploads.bank?.auxiliaryTransactionCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryTransactionCount} lançamentos recentes fora do período foram ignorados.</small> : null}</div>{result.totals.finalBalance != null && <BalanceAuditPanel audit={bankBalanceAudit}/>}</section></div>
+              <section className="panel"><PanelTitle title="Arquivos usados" note="Dados temporários nesta sessão"/><div className="file-summary"><FileLine icon="▤" title="Tabela CUSTOS ANO" detail={`${data.sheet.length} linhas válidas`} /><FileLine icon="◈" title={driveStatementFiles.length > 0 ? `Extratos bancários · ${driveStatementFiles.length + (manualBankTransactions.current.length ? 1 : 0)} arquivos` : 'Extrato bancário'} detail={`${data.bank.length} movimentações únicas${uploads.bank?.csv.statementPeriodStart && uploads.bank.csv.statementPeriodEnd ? ` · ${dateLabel(uploads.bank.csv.statementPeriodStart)} a ${dateLabel(uploads.bank.csv.statementPeriodEnd)}` : ''}`} />{uploads.bank?.auxiliaryIncludedCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryIncludedCount} lançamento(s) dentro do período foram incorporados de Últimos Lançamentos.</small> : null}{uploads.bank?.auxiliaryOutsidePeriodCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryOutsidePeriodCount} lançamento(s) auxiliares fora do período foram ignorados.</small> : null}</div>{manualBankTransactions.current.length > 0 && <BalanceAuditPanel audit={bankBalanceAudit}/>}{driveStatementFiles.map((file) => { const statementTransactions = driveBankFiles.current[file.id] ?? []; return <StatementBalanceAccordion fileName={file.name} audit={auditBankBalance(statementTransactions, file.excludedRows)} key={file.id}/> })}</section></div>
+            {shownBankRefundGroups.length > 0 && <details className="panel bank-refund-groups"><summary><strong>Devoluções bancárias · {shownBankRefundGroups.length}</strong><small>Despesas e devoluções relacionadas antes da análise de ausências</small></summary><div>{shownBankRefundGroups.map((group) => { const refund = data.bank.find((item) => item.id === group.refundTransactionId); const originals = group.originalTransactionIds.map((id) => data.bank.find((item) => item.id === id)).filter((item): item is BankTransaction => Boolean(item)); return <article className="issue-row" key={group.id}><span className={`status-icon ${group.status === 'REVIEW' ? 'amber' : 'green'}`}>{group.status === 'REVIEW' ? '!' : '✓'}</span><div><strong>{group.status === 'REFUNDED' ? 'Pagamento devolvido integralmente' : group.status === 'PARTIAL' ? 'Devolução parcial' : 'Devolução precisa de revisão'}</strong>{group.status === 'REVIEW' ? <><p>{refund ? `${dateLabel(refund.date)} · ${refund.originalDescription} · ${formatCents(refund.amount)}` : 'Devolução'} combina com mais de uma saída PIX anterior:</p>{originals.map((item) => <small key={item.id}>{dateLabel(item.date)} · {item.originalDescription} · {formatCents(item.amount)}</small>)}</> : <><p>{originals[0] ? `${originals[0].originalDescription} de ${formatCents(group.grossAmount ?? originals[0].amount)}` : 'Saída bancária'} · {originals[0] ? dateLabel(originals[0].date) : ''}{refund ? ` → devolvido em ${dateLabel(refund.date)}` : ''}</p><small>Devolução: {formatCents(group.refundAmount)} · líquido: {formatCents(group.netAmount ?? 0)}</small></>}</div></article>})}</div></details>}
             <section className="panel recent-panel"><PanelTitle title="Atividade para acompanhar" note="Os itens abaixo precisam da sua atenção" action={<button className="text-button" onClick={() => setTab('review')}>Ver revisão →</button>}/>{shownReview.length + shownMissing.length ? <div className="activity-list">{[...shownReview, ...shownMissing].slice(0, 5).map((item) => <ActivityItem key={item.bank.id} item={item}/>)}</div> : <EmptyState title="Tudo em dia por aqui" copy="Nenhuma ausência ou correspondência pendente para o período selecionado."/>}</section>
             {shownMatched.length > 0 && <details className="panel matched-details" open={shownMatched.some((item) => item.candidate?.reasons.includes('Correspondência 1:1 escolhida globalmente'))}><summary><span><strong>Correspondências encontradas · {shownMatched.length}</strong><small>Abra para ver evidências, descrição e confiança</small></span><span aria-hidden="true">⌄</span></summary><div className="matched-list">{shownMatched.map((item) => <MatchedDetail key={item.bank.id} item={item} confirmedPreviously={savedDecisions.some((record) => record.kind === 'PAIR_CONFIRMED' && record.identities[0] === bankIdentity(item.bank))} onUndo={() => { if (item.sheet) void removeDecision('PAIR_CONFIRMED', [bankIdentity(item.bank)]) }}/>)}</div></details>}
             {cardPdfs.length > 0 && <section className="panel"><PanelTitle title="Faturas PDF desta conciliação" note="Totais agregados; cada arquivo mantém sua análise independente."/>{cardPdfs.map((entry) => { const item = statementResults.find((result) => result.entry.key === entry.key); const status = entry.status === 'PROCESSING' ? 'Processando…' : entry.status === 'PROCESSED' ? '✓ Processado' : entry.status === 'DIVERGENCE' ? '⚠ Divergência' : '⚠ Erro de parsing'; return <div className="card-pdf-status" key={entry.key}><div><strong>{entry.fileName}</strong><small>{status}{item ? ` · Vencimento ${item.statement.dueDate ? dateLabel(item.statement.dueDate) : 'não identificado'} · Total ${item.statement.reportedTotal == null ? 'indisponível' : formatCents(item.statement.reportedTotal)} · ${item.matches.filter((match) => match.status === 'CARD_MISSING').length} compra(s) ausente(s)` : entry.error ? ` · ${entry.error}` : ''}</small>{item && <small>{item.payment ? `Pagamento identificado: ${dateLabel(item.payment.date)} · ${formatCents(item.payment.amount)}` : 'Pagamento bancário não identificado'}</small>}</div></div>})}</section>}
@@ -1448,7 +1683,7 @@ export default function App() {
           <footer className="results-footer"><span>▣ Confirmações salvas neste dispositivo{googleSheetLink ? ' e sincronizadas quando Google está conectado.' : '.'}</span><button className="text-button" onClick={clearSession}>Limpar dados desta sessão</button><button className="text-button" onClick={() => void clearSavedDecisions()}>Limpar confirmações salvas</button></footer>
         </>}
       </main>
-      {screen === 'home' && showStickyReconcile && <div className="sticky-reconcile" aria-label="Ação de conciliação"><button className="button button-primary button-launch" aria-label="Conciliar agora" onClick={runReconciliation} disabled={!canReconcile || !decisionsReady}>Conciliar agora <span aria-hidden="true">↗</span></button></div>}
+      {screen === 'home' && showStickyReconcile && <div className="sticky-reconcile" aria-label="Ação de conciliação"><button className="button button-primary button-launch" aria-label={isSourceProcessing ? 'Processando arquivos...' : 'Conciliar agora'} onClick={runReconciliation} disabled={!canLaunchReconciliation}>{isSourceProcessing ? 'Processando arquivos...' : <>Conciliar agora <span aria-hidden="true">↗</span></>}</button></div>}
       <PwaUpdateNotice />
       {screen === 'results' && missingToAdd && <AddCostYearDialog transaction={missingToAdd.kind === 'BANK' ? missingToAdd.bank : undefined} initial={missingToAdd.kind === 'STATEMENT' ? { description: missingToAdd.transaction.installment != null && missingToAdd.transaction.totalInstallments != null ? '(' + missingToAdd.transaction.installment + '/' + missingToAdd.transaction.totalInstallments + ') ' + missingToAdd.transaction.originalDescription : missingToAdd.transaction.originalDescription, sheetDate: missingToAdd.transaction.invoiceDueDate ?? missingToAdd.transaction.statementDueDate ?? missingToAdd.statement.dueDate ?? missingToAdd.transaction.purchaseDate, purchaseDate: missingToAdd.transaction.purchaseDate, invoiceDueDate: missingToAdd.transaction.invoiceDueDate ?? missingToAdd.transaction.statementDueDate ?? missingToAdd.statement.dueDate, amount: missingToAdd.transaction.amount, paymentSource: 'STATEMENT' } : undefined} categories={costCategories} connected={Boolean(googleSheetInfo?.connected && googleAccessToken.current)} saving={writingMissingId === (missingToAdd.kind === 'BANK' ? bankIdentity(missingToAdd.bank) : cardTransactionIdentity(missingToAdd.statement, missingToAdd.transaction)) || reconnectingForWrite} error={missingWriteError} onCancel={() => { if (!writingMissingId) { setMissingToAdd(null); setMissingWriteError('') } }} onReconnect={() => void reconnectGoogleForCostWrite()} onSubmit={(record) => void addMissingToCostYear(missingToAdd, record)} />}
       <footer className="site-footer"><span>Conciliador Financeiro <span>·</span> Extratos e PDFs permanecem no dispositivo.</span><span>Aplicação local · CSV, Google Sheets e fatura PDF</span><span>Build de teste PWA</span></footer>
@@ -1560,7 +1795,7 @@ function CardStatementUpload({ entries, notice, onSelect, onRemove, onRemoveAll 
       const total = statement?.reportedTotal ?? statement?.transactions.reduce((net, item) => net + (item.direction === 'CREDIT' ? -item.amount : item.amount), 0) ?? 0
       return <article className={`card-pdf-entry ${status.tone === 'red' || status.tone === 'amber' && status.text.startsWith('⚠') ? 'card-pdf-entry-issue' : ''}`} data-testid="card-pdf-entry" key={entry.key}>
         <header className="card-pdf-summary"><div className="card-pdf-summary-main"><strong>{statement ? titleFor(statement) : entry.status === 'ERROR' ? 'Fatura com erro de leitura' : 'Fatura sendo lida'}</strong><small>Origem: {entry.source === 'DRIVE' ? 'Google Drive' : 'arquivo local'}</small>{statement && !statement.dueDate && <small>Vencimento não identificado</small>}{!statement && <small>{status.text}</small>}{statement && <><strong>{formatShortMoney(total)} · {purchasesInStatement.length} compras{refundsInStatement.length ? ` · ${refundsInStatement.length} ${refundsInStatement.length === 1 ? 'estorno/crédito' : 'estornos/créditos'}` : ''}</strong><span className={`statement-status ${status.tone}`}>{status.text}</span></>}</div><div className="card-pdf-entry-actions"><button className="button button-outline button-small" aria-expanded={expanded} onClick={() => toggleExpanded(entry.key)}>{expanded ? 'Recolher detalhes' : 'Ver detalhes'}</button><button className="button button-quiet button-small" aria-label={`Remover ${entry.fileName}`} onClick={() => onRemove(entry.key)}>Remover da sessão</button></div></header>
-        {expanded && <div className="card-pdf-details"><small>Arquivo: {entry.fileName}</small>{statement && <><small>{statement.pageCount} páginas · {cards.length} cartões encontrados{cards.length ? ` · ${cards.map((card) => `final ${card.slice(-4)}`).join(', ')}` : ''}</small><div className="statement-totals"><AmountRow label="Compras extraídas" amount={purchasesInStatement.reduce((sum, item) => sum + item.amount, 0)}/>{adjustmentDebits > 0 && <AmountRow label="Encargos/taxas extraídos" amount={adjustmentDebits}/>}<AmountRow label="Créditos/estornos extraídos" amount={-(refundsTotal + adjustmentCredits)}/>{statement.cardSubtotals.map((subtotal) => <AmountRow key={subtotal.cardIdentifier} label={`Subtotal cartão final ${subtotal.cardIdentifier.slice(-4)}`} amount={subtotal.amount}/ >)}<AmountRow label="Total extraído / líquido" amount={purchasesInStatement.reduce((sum, item) => sum + item.amount, 0) + adjustmentDebits - refundsTotal - adjustmentCredits}/>{statement.reportedTotal != null && <AmountRow label="Total informado pela fatura" amount={statement.reportedTotal}/ >}{statement.previousBalance != null && <AmountRow label="Saldo anterior" amount={statement.previousBalance}/ >}{statement.creditsPaymentsTotal != null && <AmountRow label="Créditos/Pagamentos" amount={statement.creditsPaymentsTotal}/ >}<strong className={status.tone === 'green' ? 'good-text' : 'warning-text'}>{status.text}</strong></div><div className="card-pdf-metadata"><small>Vencimento: {statement.dueDate ? dateLabel(statement.dueDate) : 'não identificado'}</small><small>Fechamento: {statement.nextClosingDate ? dateLabel(statement.nextClosingDate) : 'não informado'}</small>{statement.previousPayment != null && <small>Pagamento anterior: {formatShortMoney(statement.previousPayment)}</small>}{statement.accountingDifference != null && <small>Diferença matemática: {formatShortMoney(statement.accountingDifference)}</small>}</div><div className="card-pdf-transactions"><strong>Compras e créditos extraídos</strong>{statement.transactions.map((transaction) => <div className="card-pdf-transaction" key={transaction.id}><span>{dateLabel(transaction.purchaseDate || transaction.date)} · {transaction.originalDescription}<small>{transaction.type === 'REFUND' ? 'Crédito/estorno' : 'Compra'} · cartão final {transaction.cardIdentifier.slice(-4)}{transaction.installment != null ? ` · parcela ${transaction.installment}/${transaction.totalInstallments}` : ''}{transaction.city ? ` · ${transaction.city}` : ''}{transaction.currency !== 'BRL' ? ` · ${transaction.currency}` : ''}{transaction.exchangeRate != null ? ` · câmbio ${transaction.exchangeRate}` : ''}</small></span><strong>{formatShortMoney(transaction.direction === 'CREDIT' ? -transaction.amount : transaction.amount)}</strong></div>)}</div>{adjustmentsInStatement.length > 0 && <div className="card-pdf-transactions"><strong>Encargos e tributos extraídos</strong>{adjustmentsInStatement.map((adjustment) => <div className="card-pdf-transaction" key={adjustment.id}><span>{dateLabel(adjustment.date)} · {adjustment.description}<small>{adjustment.kind === 'TAX' ? 'Imposto/tributo' : adjustment.kind === 'FEE' ? 'Encargo/taxa' : 'Outro ajuste financeiro'} · cartão final {adjustment.cardIdentifier.slice(-4)}</small></span><strong>{formatShortMoney(adjustment.direction === 'CREDIT' ? -adjustment.amount : adjustment.amount)}</strong></div>)}</div>}{statement.errors.map((message) => <p className="statement-warning" key={message}>{message}</p>)}</>}{entry.error && <p className="statement-warning">{entry.error}</p>}</div>}
+        {expanded && <div className="card-pdf-details"><small>Arquivo: {entry.fileName}</small>{statement && <><small>{statement.pageCount} páginas · {cards.length} cartões encontrados{cards.length ? ` · ${cards.map((card) => `final ${card.slice(-4)}`).join(', ')}` : ''}</small><div className="statement-totals"><AmountRow label="Compras extraídas" amount={purchasesInStatement.reduce((sum, item) => sum + item.amount, 0)}/>{adjustmentDebits > 0 && <AmountRow label="Encargos/taxas extraídos" amount={adjustmentDebits}/>}<AmountRow label="Créditos/estornos extraídos" amount={-(refundsTotal + adjustmentCredits)}/>{statement.cardSubtotals.map((subtotal) => <AmountRow key={subtotal.cardIdentifier} label={`Subtotal cartão final ${subtotal.cardIdentifier.slice(-4)}`} amount={subtotal.amount}/>)}<AmountRow label="Total extraído / líquido" amount={purchasesInStatement.reduce((sum, item) => sum + item.amount, 0) + adjustmentDebits - refundsTotal - adjustmentCredits}/>{statement.reportedTotal != null && <AmountRow label="Total informado pela fatura" amount={statement.reportedTotal}/>}{statement.previousBalance != null && <AmountRow label="Saldo anterior" amount={statement.previousBalance}/>}{statement.creditsPaymentsTotal != null && <AmountRow label="Créditos/Pagamentos" amount={statement.creditsPaymentsTotal}/>}<strong className={status.tone === 'green' ? 'good-text' : 'warning-text'}>{status.text}</strong></div><div className="card-pdf-metadata"><small>Vencimento: {statement.dueDate ? dateLabel(statement.dueDate) : 'não identificado'}</small><small>Fechamento: {statement.nextClosingDate ? dateLabel(statement.nextClosingDate) : 'não informado'}</small>{statement.previousPayment != null && <small>Pagamento anterior: {formatShortMoney(statement.previousPayment)}</small>}{statement.accountingDifference != null && <small>Diferença matemática: {formatShortMoney(statement.accountingDifference)}</small>}</div><div className="card-pdf-transactions"><strong>Compras e créditos extraídos</strong>{statement.transactions.map((transaction) => <div className="card-pdf-transaction" key={transaction.id}><span>{dateLabel(transaction.purchaseDate || transaction.date)} · {transaction.originalDescription}<small>{transaction.type === 'REFUND' ? 'Crédito/estorno' : 'Compra'} · cartão final {transaction.cardIdentifier.slice(-4)}{transaction.installment != null ? ` · parcela ${transaction.installment}/${transaction.totalInstallments}` : ''}{transaction.city ? ` · ${transaction.city}` : ''}{transaction.currency !== 'BRL' ? ` · ${transaction.currency}` : ''}{transaction.exchangeRate != null ? ` · câmbio ${transaction.exchangeRate}` : ''}</small></span><strong>{formatShortMoney(transaction.direction === 'CREDIT' ? -transaction.amount : transaction.amount)}</strong></div>)}</div>{adjustmentsInStatement.length > 0 && <div className="card-pdf-transactions"><strong>Encargos e tributos extraídos</strong>{adjustmentsInStatement.map((adjustment) => <div className="card-pdf-transaction" key={adjustment.id}><span>{dateLabel(adjustment.date)} · {adjustment.description}<small>{adjustment.kind === 'TAX' ? 'Imposto/tributo' : adjustment.kind === 'FEE' ? 'Encargo/taxa' : 'Outro ajuste financeiro'} · cartão final {adjustment.cardIdentifier.slice(-4)}</small></span><strong>{formatShortMoney(adjustment.direction === 'CREDIT' ? -adjustment.amount : adjustment.amount)}</strong></div>)}</div>}{statement.errors.map((message) => <p className="statement-warning" key={message}>{message}</p>)}</>}{entry.error && <p className="statement-warning">{entry.error}</p>}</div>}
       </article>
     })}
   </section>
@@ -1617,7 +1852,7 @@ function CardStatementResults({ statement, payment, matches, matchedTotal, diffe
       {!onlyIssues && matched.length > 0 && <section className="statement-collapsed-group"><strong>✓ {matched.length} compras conciliadas</strong><button className="button button-outline" onClick={() => setShowMatched((value) => !value)}>{showMatched ? 'Ocultar conciliadas' : 'Mostrar conciliadas'}</button>{showEveryPurchase && renderGroup('Conciliadas', matched)}</section>}
       {!onlyIssues && ignored.length > 0 && <section className="statement-collapsed-group"><strong>Itens ignorados · {ignored.length}</strong><button className="button button-outline" onClick={() => setShowIgnored((value) => !value)}> {showIgnored ? 'Ocultar ignorados' : 'Mostrar ignorados'}</button>{showIgnored && renderGroup('Ignoradas', ignored)}</section>}
       {!onlyIssues && showAll && refunds.length > 0 && <section className="statement-priority-group"><h3>Créditos/estornos · {refunds.length}</h3>{refunds.map((transaction) => <article className="statement-transaction" key={transaction.id}><span className="status-icon green">↩</span><div className="statement-transaction-main"><strong>{dateLabel(transaction.date)} · {transaction.originalDescription}</strong><small>Data real do crédito/estorno</small><span className="statement-status green">CRÉDITO/ESTORNO</span></div><strong className="activity-amount">{formatCents(-transaction.amount)}</strong></article>)}</section>}
-      {showAll && <section className="statement-totals"><AmountRow label="Débitos brutos das compras extraídas" amount={purchasesTotal}/>{refunded.length > 0 && <AmountRow label="Compras ativas para matching após estornos" amount={reconcilablePurchasesTotal}/ >}{adjustmentDebits > 0 && <AmountRow label="Encargos/taxas extraídos" amount={adjustmentDebits}/ >}{statement.previousBalance != null && <AmountRow label="Saldo anterior" amount={statement.previousBalance}/ >}{statement.creditsPaymentsTotal != null && <AmountRow label="Créditos/Pagamentos" amount={statement.creditsPaymentsTotal}/ >}{statement.reportedTotal != null && <AmountRow label="Total da fatura" amount={statement.reportedTotal}/ >}{statement.previousPayment != null && <p className="statement-payment-note">Pagamento anterior identificado: {formatCents(statement.previousPayment)} · excluído das compras da fatura.</p>}{statement.accountingDifference != null && <strong className={statement.accountingDifference === 0 ? 'good-text' : 'warning-text'}>{statement.accountingDifference === 0 ? '✓ Saldo anterior − créditos/pagamentos + compras/débitos = total da fatura' : '⚠ A relação matemática da fatura não fecha'}</strong>}{statement.cardSubtotals.map((subtotal) => <AmountRow key={subtotal.cardIdentifier} label={`Subtotal cartão final ${subtotal.cardIdentifier.slice(-4)}`} amount={subtotal.amount}/ >)}<AmountRow label="Compras correspondentes confirmadas em Crédito_Bradesco" amount={matchedTotal} strong/><AmountRow label="Diferença ainda não conciliada" amount={difference} strong/><p className="statement-caution">Os detalhes da fatura permanecem disponíveis para auditoria. A diferença não classifica automaticamente uma compra como esquecida.</p></section>}
+      {showAll && <section className="statement-totals"><AmountRow label="Débitos brutos das compras extraídas" amount={purchasesTotal}/>{refunded.length > 0 && <AmountRow label="Compras ativas para matching após estornos" amount={reconcilablePurchasesTotal}/>}{adjustmentDebits > 0 && <AmountRow label="Encargos/taxas extraídos" amount={adjustmentDebits}/>}{statement.previousBalance != null && <AmountRow label="Saldo anterior" amount={statement.previousBalance}/>}{statement.creditsPaymentsTotal != null && <AmountRow label="Créditos/Pagamentos" amount={statement.creditsPaymentsTotal}/>}{statement.reportedTotal != null && <AmountRow label="Total da fatura" amount={statement.reportedTotal}/>}{statement.previousPayment != null && <p className="statement-payment-note">Pagamento anterior identificado: {formatCents(statement.previousPayment)} · excluído das compras da fatura.</p>}{statement.accountingDifference != null && <strong className={statement.accountingDifference === 0 ? 'good-text' : 'warning-text'}>{statement.accountingDifference === 0 ? '✓ Saldo anterior − créditos/pagamentos + compras/débitos = total da fatura' : '⚠ A relação matemática da fatura não fecha'}</strong>}{statement.cardSubtotals.map((subtotal) => <AmountRow key={subtotal.cardIdentifier} label={`Subtotal cartão final ${subtotal.cardIdentifier.slice(-4)}`} amount={subtotal.amount}/>)}<AmountRow label="Compras correspondentes confirmadas em Crédito_Bradesco" amount={matchedTotal} strong/><AmountRow label="Diferença ainda não conciliada" amount={difference} strong/><p className="statement-caution">Os detalhes da fatura permanecem disponíveis para auditoria. A diferença não classifica automaticamente uma compra como esquecida.</p></section>}
       {isExpanded && !showAll && <button className="button button-outline" onClick={() => { setShowAll(true); setShowMatched(true); setShowIgnored(true); setExceptionLimit(Number.MAX_SAFE_INTEGER) }}>Mostrar tudo</button>}
     </div>}
   </article>
@@ -1646,7 +1881,8 @@ function ActivityItem({ item }: { item: ReconciliationItem }) { return <div clas
 function MatchReason({ reason }: { reason: string }) { const caution = /genérica|baixa similaridade|não confirmada|dia.*diferença|descrição diferente|mais de uma candidata/i.test(reason); return <span><b>{caution ? '△' : '✓'}</b> {reason}</span> }
 function MatchedDetail({ item, confirmedPreviously, onUndo }: { item: ReconciliationItem; confirmedPreviously: boolean; onUndo: () => void }) { return <article className="matched-detail"><div><strong>{dateLabel(item.bank.date)} · {item.bank.originalDescription}</strong><p>{formatCents(item.bank.amount)} · {item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} ↔ {item.sheet?.originalDescription ?? 'Planilha'}</p></div><span className="confidence">{item.candidate?.confidence ?? 96}% de confiança</span><div className="match-reasons">{item.candidate?.reasons.map((reason) => <MatchReason key={reason} reason={reason}/>)}</div><small>{confirmedPreviously ? '✓ Conciliado anteriormente; decisão salva neste dispositivo.' : item.candidate?.matchMethod === 'STRUCTURAL' ? 'Match automático: valor, data, direção e solução global 1:1.' : item.candidate?.matchMethod === 'MANUAL' ? 'Correspondência confirmada por você.' : 'Pontuação combinada de valor, data e descrição.'}</small>{confirmedPreviously && <button className="text-button" onClick={onUndo}>Desfazer confirmação</button>}</article> }
 function ReviewCard({ item, onConfirm, onReject, onIgnore }: { item: ReconciliationItem; onConfirm: () => void; onReject: () => void; onIgnore: () => void }) {
-  return <article className="review-card"><div className="review-card-title"><span className="status-icon amber">!</span><div><span className="step-label">{item.sheet ? 'POSSÍVEL CORRESPONDÊNCIA' : 'MOVIMENTAÇÃO PARA CLASSIFICAR'}</span><h2>{item.sheet ? 'Confira este par de lançamentos' : item.bank.direction === 'CREDIT' ? 'Entrada bancária fora da conciliação de despesas' : 'Movimentação para revisar'}</h2></div><span className="confidence">{item.candidate?.confidence ?? 0}% de confiança</span></div><div className="comparison-grid"><TransactionBox label="BANCO / CARTÃO" transaction={item.bank} /><span className="compare-arrow">↔</span><TransactionBox label="CUSTOS ANO" transaction={item.sheet}/></div><div className="match-reasons">{item.candidate?.reasons.map((reason) => <MatchReason key={reason} reason={reason}/>)}{!item.sheet && item.bank.direction === 'CREDIT' && <span>ℹ Entrada não tratada como despesa ausente</span>}</div><div className="review-actions">{item.sheet && <><button className="button button-primary" onClick={onConfirm}>✓ Confirmar</button><button className="button button-outline" onClick={onReject}>Não é a mesma</button></>}<button className="text-button" onClick={onIgnore}>Ignorar</button></div></article>
+  const reasonText = item.reviewReason === 'REFUND_AMBIGUITY' ? 'Há mais de uma saída anterior compatível com esta devolução. Confira o vínculo antes de decidir.' : item.reviewReason === 'ASSIGNMENT_CONFLICT' ? 'O lançamento plausível está reservado por outra movimentação que também precisa de revisão.' : item.reviewReason === 'DIRECTION_UNCERTAIN' ? 'O arquivo não informa com segurança se o valor entrou ou saiu da conta.' : ''
+  return <article className="review-card"><div className="review-card-title"><span className="status-icon amber">!</span><div><span className="step-label">{item.sheet ? 'POSSÍVEL CORRESPONDÊNCIA' : 'MOVIMENTAÇÃO PARA CLASSIFICAR'}</span><h2>{item.sheet ? 'Confira este par de lançamentos' : item.bank.direction === 'CREDIT' ? 'Entrada bancária fora da conciliação de despesas' : 'Movimentação para revisar'}</h2></div><span className="confidence">{item.candidate ? `${item.candidate.confidence}% de confiança` : 'Revisão necessária'}</span></div><div className="comparison-grid"><TransactionBox label="BANCO / CARTÃO" transaction={item.bank} /><span className="compare-arrow">↔</span><TransactionBox label="CUSTOS ANO" transaction={item.sheet}/></div><div className="match-reasons">{item.candidate?.reasons.map((reason) => <MatchReason key={reason} reason={reason}/>)}{reasonText && <span>{reasonText}</span>}{!item.sheet && item.bank.direction === 'CREDIT' && <span>ℹ Entrada não tratada como despesa ausente</span>}</div><div className="review-actions">{item.sheet && <><button className="button button-primary" onClick={onConfirm}>✓ Confirmar</button><button className="button button-outline" onClick={onReject}>Não é a mesma</button></>}<button className="text-button" onClick={onIgnore}>Ignorar</button></div></article>
 }
 function CardPaymentCard({ item, persisted, onConfirm, onIgnore, onUndo }: { item: ReconciliationItem; persisted: boolean; onConfirm: (sheetIds: string[]) => void; onIgnore: () => void; onUndo: () => void }) {
   const options = item.composition.length ? [{ items: item.composition, score: 100, reasons: ['Composição confirmada pelo usuário'] }] : item.compositionOptions
@@ -1682,7 +1918,7 @@ function CardSummaryNotice({ item }: { item: ReconciliationItem }) {
     {difference < 0 && <p>O total elegível excede o pagamento. Algumas compras podem pertencer a outro ciclo, ou pode haver crédito, estorno ou diferença de datas; isso não é classificado automaticamente como erro.</p>}
   </section>
 }
-function outOfScopeReason(type: BankTransaction['type']) { return ({ INCOME: 'Entrada identificada; não é uma despesa ausente.', INVESTMENT: 'Movimentação de investimento, como aplicação ou resgate.', INVESTMENT_INCOME: 'Rendimento de investimento; não é uma despesa ausente.', TRANSFER: 'Transferência entre contas.', OTHER: 'Natureza não confirmada; não foi presumida como despesa.', EXPENSE: 'Despesa fora da lista principal.', CARD_PAYMENT: 'Pagamento de fatura, tratado pela composição do cartão.' } as const)[type] }
+function outOfScopeReason(type: BankTransaction['type']) { return ({ INCOME: 'Entrada identificada; não é uma despesa ausente.', INVESTMENT: 'Movimentação de investimento, como aplicação ou resgate.', INVESTMENT_INCOME: 'Rendimento de investimento; não é uma despesa ausente.', TRANSFER: 'Transferência entre contas.', OTHER: 'Natureza não confirmada; não foi presumida como despesa.', EXPENSE: 'Despesa fora da lista principal.', CARD_PAYMENT: 'Pagamento de fatura, tratado pela composição do cartão.', REFUND: 'Devolução ou estorno bancário; analisado junto à saída original.' } as const)[type] }
 function TransactionBox({ label, transaction }: { label: string; transaction: BankTransaction | LedgerTransaction | null }) { return <div className="transaction-box"><span className="step-label">{label}</span>{transaction ? <><strong className="transaction-date">{dateLabel(transaction.date)}</strong><strong className="transaction-description">{transaction.originalDescription}</strong><strong className="transaction-amount">{formatCents(transaction.amount)}</strong><span className="transaction-meta">{transaction.source === 'BANK' && transaction.directionKnown === false ? 'Direção não identificada no arquivo' : transaction.direction === 'DEBIT' ? 'Saída' : 'Entrada'}{transaction.paymentMethod ? ` · Forma de pagamento: ${transaction.paymentMethod}` : ''}{transaction.source === 'SHEET' && transaction.category ? ` · ${transaction.category}` : ''}</span></> : <span className="no-candidate">Nenhum lançamento sugerido para comparar.</span>}</div> }
 function MissingCard({ item, onIgnore, onAddToSheet, canAddToSheet }: { item: ReconciliationItem; onIgnore: () => void; onAddToSheet: () => void; canAddToSheet: boolean }) { return <article className="missing-card"><span className="status-icon red">⌕</span><div className="missing-content"><span className="step-label">POSSÍVEL LANÇAMENTO AUSENTE</span><h2>{item.bank.originalDescription}</h2><p>{dateLabel(item.bank.date)} · Saída{item.bank.paymentMethod ? ` · Forma de pagamento: ${item.bank.paymentMethod}` : ''}</p><strong className="transaction-amount">{formatCents(item.bank.amount)}</strong><small>Nenhum lançamento correspondente foi encontrado na CUSTOS ANO.</small></div>{canAddToSheet && <button className="button button-primary" onClick={onAddToSheet}>Adicionar à CUSTOS ANO</button>}<button className="button button-outline" onClick={onIgnore}>Ignorar</button></article> }
 function FilterBar({ years, year, month, fromDate, toDate, onYear, onMonth, onFrom, onTo }: { years: string[]; year: string; month: string; fromDate: string; toDate: string; onYear: (value: string) => void; onMonth: (value: string) => void; onFrom: (value: string) => void; onTo: (value: string) => void }) {

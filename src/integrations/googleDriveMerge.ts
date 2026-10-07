@@ -1,20 +1,36 @@
 import type { BankTransaction } from '../domain/types'
-import { bankIdentity } from '../domain/identity'
+import { stableFingerprint } from '../domain/identity'
 
-/** Combines source files as multisets, retaining the largest occurrence count per stable bank identity. */
-export function mergeDriveBankSources(manual: BankTransaction[], drive: Record<string, BankTransaction[]>): BankTransaction[] {
-  const sources = [manual, ...Object.keys(drive).sort().map((key) => drive[key])]
-  const maxCounts = new Map<string, number>()
-  for (const source of sources) {
-    const counts = new Map<string, number>()
-    source.forEach((row) => counts.set(bankIdentity(row), (counts.get(bankIdentity(row)) ?? 0) + 1))
-    counts.forEach((count, identity) => maxCounts.set(identity, Math.max(maxCounts.get(identity) ?? 0, count)))
-  }
-  const emitted = new Map<string, number>()
+const normalized = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ')
+const semanticKey = (row: BankTransaction) => stableFingerprint([row.date, normalized(row.originalDescription), row.direction, row.amount])
+const sameMovement = (left: BankTransaction, right: BankTransaction) => semanticKey(left) === semanticKey(right)
+
+/** Union source files, suppressing only semantic overlaps across different sources. */
+export function mergeDriveBankSourcesWithStats(manual: BankTransaction[], drive: Record<string, BankTransaction[]>) {
+  const sources = [{ id: 'manual', rows: manual }, ...Object.keys(drive).sort().map((id) => ({ id, rows: drive[id] }))]
   const output: BankTransaction[] = []
-  for (const source of sources) for (const row of source) {
-    const identity = bankIdentity(row), count = (emitted.get(identity) ?? 0) + 1
-    if (count <= (maxCounts.get(identity) ?? 0)) { output.push(row); emitted.set(identity, count) }
+  const overlapBySource: Record<string, number> = {}
+  for (const source of sources) {
+    const earlierCount = output.length
+    const alreadyMatched = new Set<number>()
+    for (const row of source.rows) {
+      let duplicateIndex = -1
+      for (let index = 0; index < earlierCount; index += 1) {
+        if (!alreadyMatched.has(index) && sameMovement(output[index], row)) { duplicateIndex = index; break }
+      }
+      if (duplicateIndex >= 0) {
+        alreadyMatched.add(duplicateIndex)
+        overlapBySource[source.id] = (overlapBySource[source.id] ?? 0) + 1
+        const current = output[duplicateIndex]
+        const sourceIds = new Set([...(current.statementSourceIds ?? (current.statementSourceId ? [current.statementSourceId] : [])), source.id])
+        output[duplicateIndex] = { ...current, statementSourceIds: [...sourceIds] }
+      } else output.push({ ...row, statementSourceIds: [...new Set([...(row.statementSourceIds ?? (row.statementSourceId ? [row.statementSourceId] : [])), source.id])] })
+    }
   }
-  return output
+  const totalOverlaps = Object.values(overlapBySource).reduce((sum, count) => sum + count, 0)
+  return { transactions: output, overlapBySource, totalOverlaps }
+}
+
+export function mergeDriveBankSources(manual: BankTransaction[], drive: Record<string, BankTransaction[]>): BankTransaction[] {
+  return mergeDriveBankSourcesWithStats(manual, drive).transactions
 }
