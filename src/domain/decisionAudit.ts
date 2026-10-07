@@ -1,6 +1,6 @@
 import type { BankTransaction, CardStatement, LedgerTransaction } from './types'
 import type { PersistedDecision } from './localDecisions'
-import { bankIdentity, cardTransactionIdentityVariants, sheetIdentity } from './identity'
+import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentityVariants, sheetIdentity } from './identity'
 import { findExistingCostYearCandidates } from '../importers/cardStatement'
 import { findPlausibleLedgerCandidates } from '../matching/reconcile'
 
@@ -44,6 +44,17 @@ export function auditPersistedDecision(decision: PersistedDecision, context: Dec
     if (candidates.length) return { decision, status: 'VALID', resolved: true }
     const sameStructure = selected.amount === resolved.transaction.amount && selected.direction === 'DEBIT' && selected.paymentMethod.toLocaleLowerCase('pt-BR').replaceAll('_', ' ') === 'crédito bradesco'
     return { decision, status: sameStructure ? 'NEEDS_REVIEW' : 'STALE', resolved: true }
+  }
+  if (decision.kind === 'CARD_REVIEW_REJECTED_CANDIDATES') {
+    const resolved = context.statements.flatMap((entry) => entry.statement.transactions.map((transaction) => ({ entry, transaction })))
+      .find(({ entry, transaction }) => cardTransactionIdentityVariants(entry.statement, transaction, entry.legacyStatementIdentity).includes(decision.identities[0]))
+    if (!resolved) return { decision, status: 'NEEDS_REVIEW', resolved: false }
+    const rejectedKeys = new Set(decision.selected)
+    const candidates = findExistingCostYearCandidates(resolved.entry.statement, resolved.transaction, context.sheets)
+    if (candidates.some((row) => !rejectedKeys.has(cardReviewCandidateIdentity(row)))) return { decision, status: 'STALE', resolved: true }
+    if (candidates.some((row) => rejectedKeys.has(cardReviewCandidateIdentity(row)))) return { decision, status: 'VALID', resolved: true }
+    const rejectedRowsStillExist = decision.selected.some((key) => selectedSheet(context, key))
+    return { decision, status: rejectedRowsStillExist ? 'STALE' : 'ORPHANED', resolved: true }
   }
   if (decision.kind === 'CARD_MISSING_CONFIRMED') {
     const exists = context.statements.some((entry) => entry.statement.transactions.some((transaction) => cardTransactionIdentityVariants(entry.statement, transaction, entry.legacyStatementIdentity).includes(decision.identities[0])))

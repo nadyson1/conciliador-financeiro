@@ -31,6 +31,7 @@ export interface LedgerTransaction {
 
 export interface BankTransaction {
   id: string
+  sourceRow?: number
   source: 'BANK'
   sheetRecordId: null
   bankTransactionId: string
@@ -60,6 +61,10 @@ export type Transaction = LedgerTransaction | BankTransaction
 export interface CsvDocument {
   headers: string[]
   rows: Record<string, string>[]
+  auxiliaryRows: Record<string, string>[]
+  auxiliarySectionLabel: string | null
+  statementPeriodStart: string | null
+  statementPeriodEnd: string | null
   parseErrors: string[]
   delimiter: string
   metadataRowsIgnored: number
@@ -87,11 +92,22 @@ export interface RowIssue {
   message: string
 }
 
+export interface ExcludedBankRow {
+  row: number
+  reason: 'EMPTY' | 'REPEATED_HEADER' | 'NO_MOVEMENT' | 'FOOTER_OR_METADATA' | 'OUTSIDE_STATEMENT_PERIOD'
+  date: string | null
+  description: string
+  balanceAfter: number | null
+  amount: number | null
+  direction: Direction | null
+}
+
 export interface ParsedTransactions<T extends Transaction> {
   transactions: T[]
   issues: RowIssue[]
   rowCount: number
   ignoredRows: number
+  excludedRows?: ExcludedBankRow[]
 }
 
 export interface MatchCandidate {

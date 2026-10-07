@@ -126,6 +126,25 @@ export function transactionType(description: string, paymentMethod = ''): 'EXPEN
   return 'OTHER'
 }
 
+/** Classifies a CUSTOS ANO row with sheet semantics and payment-method precedence. */
+export function classifySheetRecord(record: { description: string; paymentMethod?: string | null }): ReturnType<typeof transactionType> {
+  const value = normalizeDescription(record.description)
+  const payment = normalizeDescription(record.paymentMethod ?? '')
+  const explicitType = transactionType(record.description)
+
+  // Explicit business events outrank a payment-method label.
+  if (explicitType === 'CARD_PAYMENT' || explicitType === 'INVESTMENT' || explicitType === 'INVESTMENT_INCOME' || explicitType === 'INCOME') return explicitType
+  if (payment === 'investimento') return 'INVESTMENT'
+  if (payment === 'transferencia' || payment === 'transfer') return 'TRANSFER'
+
+  if (payment === 'credito bradesco') {
+    const explicitOwnAccountTransfer = /(?:transferencia entre contas(?: proprias)?|movimentacao interna|pix entre contas proprias|pix para minha conta|pix para conta propria|pix enviado .{0,40}(?:conta propria|contas proprias|minha (?:outra )?conta|conta de minha titularidade|mesma titularidade))/.test(value)
+    return explicitOwnAccountTransfer ? 'TRANSFER' : 'EXPENSE'
+  }
+
+  return explicitType === 'OTHER' ? 'EXPENSE' : explicitType
+}
+
 export function investmentAction(description: string): 'APPLICATION' | 'RESCUE' | null {
   const value = normalizeDescription(description)
   if (/resg|resgate|venc(?:imento)? cdb|resg venc/.test(value)) return 'RESCUE'

@@ -1,30 +1,37 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, ReactNode } from 'react'
-import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, ColumnMap, CsvDocument, LedgerTransaction, ReconciliationItem, Transaction } from './domain/types'
+import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, ColumnMap, CsvDocument, ExcludedBankRow, LedgerTransaction, ReconciliationItem, Transaction } from './domain/types'
 import { readCsvFile, initialColumnMap } from './importers/csv'
 import { parseBankRows, parseLedgerRows } from './importers/transactions'
 import { deriveCardPurchaseStatus, findExistingCostYearCandidates, identifyStatementPayments, readCardStatementPdf, reconcileCardStatement } from './importers/cardStatement'
 import { normalizeDate } from './importers/normalize'
 import { canonicalCompositionKey, findPlausibleLedgerCandidates, pairKey, reconcile } from './matching/reconcile'
 import { exportCardPayments, exportDuplicates, exportMissing, exportOutOfScope, exportReviews, exportSummary } from './features/export'
-import { bankIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity } from './domain/identity'
+import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity } from './domain/identity'
 import { auditPersistedDecisions } from './domain/decisionAudit'
+import { auditConsistency, filterAuditFindings, summarizeAudit, type AuditFilter, type ConsistencyAuditResult } from './domain/consistencyAudit'
+import { dismissAuditFinding, isAuditFindingDismissed, loadAuditFindingVisibility, restoreAuditFinding, saveAuditFindingVisibility } from './domain/auditFindingVisibility'
+import { AuditFindingCard } from './components/AuditFindingCard'
 import { clearPersistedDecisions, decisionKey, deletePersistedDecision, listPersistedDecisions, savePersistedDecision } from './domain/localDecisions'
 import type { DecisionKind, PersistedDecision } from './domain/localDecisions'
 import { GoogleSheetsPanel } from './components/GoogleSheetsPanel'
 import type { GoogleSheetsConnectionInfo } from './components/GoogleSheetsPanel'
 import { PwaUpdateNotice } from './components/PwaUpdateNotice'
 import { AddCostYearDialog } from './components/AddCostYearDialog'
+import { BankCsvUploadCard, bankCsvRequiresManualMapping } from './components/BankCsvUploadCard'
+import { BalanceAuditPanel } from './components/BalanceAuditPanel'
+import { MissingSummary } from './components/MissingSummary'
+import { auditBankBalance } from './domain/bankBalanceAudit'
 import { canAddMissingToCostYear } from './features/missingEligibility'
 import { GoogleSheetsError, appendCostYearRecord, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
-import { addDecisionTombstone, listDecisionTombstones, removeDecisionTombstone, syncGoogleSheetDecisions, syncOneGoogleSheetDecision, syncOneGoogleSheetDeletion } from './integrations/googleSheetDecisions'
+import { addDecisionTombstone, listDecisionTombstones, readGoogleSheetDecisionsReadOnly, removeDecisionTombstone, syncGoogleSheetDecisions, syncOneGoogleSheetDecision, syncOneGoogleSheetDeletion } from './integrations/googleSheetDecisions'
 import { forgetGoogleSheetLink, GOOGLE_SHEET_TAB_NAME, loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import type { SavedGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 
 type Mode = 'sheet' | 'bank'
 type SourceStatus = 'EMPTY' | 'LOADED' | 'VALIDATED' | 'ACCEPTED'
 type Dataset = { sheet: LedgerTransaction[]; bank: BankTransaction[] }
-type UploadState = { fileName: string; csv: CsvDocument; map: ColumnMap; valid: Transaction[]; issues: { row: number; message: string }[]; rowCount: number; ignoredRows: number } | null
+type UploadState = { fileName: string; csv: CsvDocument; map: ColumnMap; valid: Transaction[]; issues: { row: number; message: string }[]; rowCount: number; ignoredRows: number; excludedRows: ExcludedBankRow[]; auxiliaryTransactionCount: number } | null
 type CardPdfEntry = { key: string; fingerprint: string; fileName: string; status: 'PROCESSING' | 'PROCESSED' | 'DIVERGENCE' | 'ERROR'; statement: CardStatement | null; legacyStatementIdentity?: string; error?: string }
 type MissingWriteTarget = { kind: 'BANK'; bank: BankTransaction } | { kind: 'STATEMENT'; statement: CardStatement; transaction: CardStatementTransaction }
 const emptyData: Dataset = { sheet: [], bank: [] }
@@ -90,6 +97,17 @@ export default function App() {
   const [cardPdfs, setCardPdfs] = useState<CardPdfEntry[]>([])
   const [cardReviewOverrides, setCardReviewOverrides] = useState<Record<string, LedgerTransaction[]>>({})
   const [statementOnlyIssues, setStatementOnlyIssues] = useState(false)
+  const [consistencyAudit, setConsistencyAudit] = useState<ConsistencyAuditResult | null>(null)
+  const [consistencyAuditBusy, setConsistencyAuditBusy] = useState(false)
+  const [consistencyAuditError, setConsistencyAuditError] = useState('')
+  const [consistencyAuditFilter, setConsistencyAuditFilter] = useState<AuditFilter>('ALL')
+  const [consistencyAuditSourceNote, setConsistencyAuditSourceNote] = useState('')
+  const [dismissedAuditFindings, setDismissedAuditFindings] = useState(loadAuditFindingVisibility)
+  const [pendingDoubleClaimRefresh, setPendingDoubleClaimRefresh] = useState<{ id: number; fingerprints: string[]; rowIdentity: string } | null>(null)
+  const handledDoubleClaimRefresh = useRef(0)
+  const pdfEntryTokens = useRef(new Map<string, object>())
+  const [auditFocusTransactionId, setAuditFocusTransactionId] = useState('')
+  const [auditFocusStatementIdentity, setAuditFocusStatementIdentity] = useState('')
   const staleMissingDecisionCleanup = useRef(new Set<string>())
   const seenPdfFingerprints = useRef(new Set<string>())
   const pdfSessionGeneration = useRef(0)
@@ -99,7 +117,7 @@ export default function App() {
   const [decisionsReady, setDecisionsReady] = useState(false)
   const decisionStateRevision = useRef(0)
   const [screen, setScreen] = useState<'home' | 'results'>('home')
-  const [tab, setTab] = useState<'overview' | 'review' | 'missing' | 'card' | 'statement' | 'duplicates' | 'outofscope' | 'flags'>('overview')
+  const [tab, setTab] = useState<'overview' | 'review' | 'missing' | 'card' | 'statement' | 'duplicates' | 'outofscope' | 'flags' | 'auditor'>('overview')
   const [filterYear, setFilterYear] = useState('all')
   const [filterMonth, setFilterMonth] = useState('all')
   const [fromDate, setFromDate] = useState('')
@@ -283,7 +301,7 @@ export default function App() {
       : 'Decisões salvas neste dispositivo'
 
   function clearSession() {
-    pdfSessionGeneration.current += 1; seenPdfFingerprints.current.clear()
+    pdfSessionGeneration.current += 1; seenPdfFingerprints.current.clear(); pdfEntryTokens.current.clear()
     const retainedGoogleSheet = sheetSource === 'google' ? googleSheetRows : null
     setData({ sheet: retainedGoogleSheet ?? [], bank: [] }); setCardPdfs([]); setCardPdfNotice(''); setScreen('home'); setUploads({ sheet: null, bank: null }); setSourceStatus({ sheet: retainedGoogleSheet?.length ? 'ACCEPTED' : 'EMPTY', bank: 'EMPTY' }); setCsvSheetAccepted(false); setGoogleSheetRows(retainedGoogleSheet); setGoogleError(''); setFilterYear('all'); setFilterMonth('all'); setFromDate(''); setToDate('')
   }
@@ -469,11 +487,21 @@ export default function App() {
         }
       }
       const ignored = new Set<string>()
+      const rejectedCandidates = new Map<string, ReadonlySet<string>>()
       for (const record of savedDecisions.filter((item) => item.kind === 'CARD_PURCHASE_IGNORED')) {
         const transaction = entry.statement.transactions.find((item) => cardTransactionIdentityVariants(entry.statement, item, entry.legacyStatementIdentity).includes(record.identities[0]))
         if (transaction) ignored.add(transaction.id)
       }
-      const result = reconcileCardStatement(entry.statement, data.sheet, confirmations)
+      for (const record of savedDecisions.filter((item) => item.kind === 'CARD_REVIEW_REJECTED_CANDIDATES')) {
+        const transaction = entry.statement.transactions.find((item) => cardTransactionIdentityVariants(entry.statement, item, entry.legacyStatementIdentity).includes(record.identities[0]))
+        if (!transaction) continue
+        const rejectedIds = new Set(record.selected.flatMap((identity) => {
+          const row = data.sheet.find((item) => cardReviewCandidateIdentity(item) === identity)
+          return row ? [row.id] : []
+        }))
+        rejectedCandidates.set(transaction.id, rejectedIds)
+      }
+      const result = reconcileCardStatement(entry.statement, data.sheet, confirmations, rejectedCandidates)
       const matches = result.matches.map((match) => {
         let derived = deriveCardPurchaseStatus(match, { ignored: ignored.has(match.transaction.id), consumedSheetIds: usedSheetIds })
         const editedCandidate = editedConfirmationRows.get(match.transaction.id)
@@ -513,6 +541,7 @@ export default function App() {
   const shownReview = filteredItems.filter((item) => item.status === 'REVIEW')
   const shownCardDivergences = filteredItems.filter((item) => item.status === 'CARD_DIVERGENCE')
   const shownMissing = filteredItems.filter((item) => item.status === 'MISSING')
+  const bankBalanceAudit = useMemo(() => auditBankBalance(data.bank, uploads.bank?.excludedRows ?? []), [data.bank, uploads.bank?.excludedRows])
   const shownOutOfScope = filteredItems.filter((item) => item.status === 'OUT_OF_SCOPE')
   const shownMatched = filteredItems.filter((item) => item.status === 'MATCHED' && item.bank.type !== 'CARD_PAYMENT')
   const costCategories = [...new Set((googleSheetRows ?? []).map((item) => item.category.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'pt-BR'))
@@ -532,8 +561,10 @@ export default function App() {
     try {
       const csv = await readCsvFile(file)
       const map = initialColumnMap(csv.headers, mode) as ColumnMap
-      const parsed = mode === 'sheet' ? parseLedgerRows(csv.rows, map) : parseBankRows(csv.rows, map)
-      setUploads((current) => ({ ...current, [mode]: { fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows } }))
+      const period = csv.statementPeriodStart && csv.statementPeriodEnd ? { start: csv.statementPeriodStart, end: csv.statementPeriodEnd } : undefined
+      const parsed = mode === 'sheet' ? parseLedgerRows(csv.rows, map) : parseBankRows(csv.rows, map, csv.metadataRowsIgnored, period)
+      const auxiliaryTransactions = mode === 'bank' ? parseBankRows(csv.auxiliaryRows, map).transactions.length : 0
+      setUploads((current) => ({ ...current, [mode]: { fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, excludedRows: mode === 'bank' ? parsed.excludedRows ?? [] : [], auxiliaryTransactionCount: auxiliaryTransactions } }))
       setSourceStatus((current) => ({ ...current, [mode]: 'VALIDATED' }))
     } catch {
       setSourceStatus((current) => ({ ...current, [mode]: previousStatus }))
@@ -548,6 +579,7 @@ export default function App() {
     setCardPdfNotice('')
     const generation = pdfSessionGeneration.current
     let duplicates = 0
+    let unreadable = 0
     for (const file of files) {
       try {
         const fingerprint = await fingerprintFile(file)
@@ -555,24 +587,49 @@ export default function App() {
         if (seenPdfFingerprints.current.has(fingerprint)) { duplicates += 1; continue }
         seenPdfFingerprints.current.add(fingerprint)
         const key = `pdf-${fingerprint}`
+        const entryToken = {}
+        pdfEntryTokens.current.set(key, entryToken)
         setCardPdfs((current) => [...current, { key, fingerprint, fileName: file.name, status: 'PROCESSING', statement: null }])
         try {
           const parsedStatement = await readCardStatementPdf(file)
           if (generation !== pdfSessionGeneration.current) return
+          if (pdfEntryTokens.current.get(key) !== entryToken) continue
           const statement: CardStatement = { ...parsedStatement, statementIdentity: `${parsedStatement.statementIdentity}-${fingerprint}`, transactions: parsedStatement.transactions.map((transaction) => ({ ...transaction, id: `${transaction.id}-${fingerprint}` })) }
           setCardPdfs((current) => current.map((entry) => entry.key === key ? { ...entry, statement, legacyStatementIdentity: parsedStatement.statementIdentity, status: statement.errors.length ? 'DIVERGENCE' : 'PROCESSED' } : entry))
+          pdfEntryTokens.current.delete(key)
         } catch {
           if (generation !== pdfSessionGeneration.current) return
+          if (pdfEntryTokens.current.get(key) !== entryToken) continue
+          unreadable += 1
           setCardPdfs((current) => current.map((entry) => entry.key === key ? { ...entry, status: 'ERROR', error: 'Não foi possível interpretar este PDF. Os demais arquivos seguem disponíveis.' } : entry))
+          pdfEntryTokens.current.delete(key)
         }
       } catch {
-        duplicates += 1
+        unreadable += 1
       }
     }
-    if (duplicates) setCardPdfNotice(`${duplicates} PDF(s) duplicado(s) ou ilegível(is) foram ignorados; os demais arquivos foram processados.`)
+    if (duplicates || unreadable) {
+      const parts = [
+        duplicates ? `${duplicates} PDF${duplicates === 1 ? '' : 's'} duplicado${duplicates === 1 ? '' : 's'} ${duplicates === 1 ? 'foi ignorado' : 'foram ignorados'}` : '',
+        unreadable ? `${unreadable} PDF${unreadable === 1 ? '' : 's'} ${unreadable === 1 ? 'não pôde ser lido' : 'não puderam ser lidos'}` : '',
+      ].filter(Boolean)
+      setCardPdfNotice(`${parts.join(' e ')}.`)
+    }
   }
 
   function removeCardPdf(key: string) {
+    const fingerprint = key.startsWith('pdf-') ? key.slice(4) : ''
+    if (fingerprint) seenPdfFingerprints.current.delete(fingerprint)
+    pdfEntryTokens.current.delete(key)
+    const removed = cardPdfs.find((entry) => entry.key === key)
+    if (removed?.statement) {
+      const transactionIdentities = new Set(removed.statement.transactions.map((transaction) => cardTransactionIdentity(removed.statement!, transaction)))
+      setCardReviewOverrides((current) => Object.fromEntries(Object.entries(current).filter(([identity]) => !transactionIdentities.has(identity))))
+      if (auditFocusStatementIdentity === removed.statement.statementIdentity) {
+        setAuditFocusStatementIdentity('')
+        setAuditFocusTransactionId('')
+      }
+    }
     setCardPdfs((current) => current.filter((entry) => entry.key !== key))
   }
 
@@ -581,8 +638,10 @@ export default function App() {
       const entry = current[mode]
       if (!entry) return current
       const map = { ...entry.map, [key]: value }
-      const parsed = mode === 'sheet' ? parseLedgerRows(entry.csv.rows, map) : parseBankRows(entry.csv.rows, map)
-      return { ...current, [mode]: { ...entry, map, valid: parsed.transactions, issues: [...entry.csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows } }
+      const period = entry.csv.statementPeriodStart && entry.csv.statementPeriodEnd ? { start: entry.csv.statementPeriodStart, end: entry.csv.statementPeriodEnd } : undefined
+      const parsed = mode === 'sheet' ? parseLedgerRows(entry.csv.rows, map) : parseBankRows(entry.csv.rows, map, entry.csv.metadataRowsIgnored, period)
+      const auxiliaryTransactions = mode === 'bank' ? parseBankRows(entry.csv.auxiliaryRows, map).transactions.length : 0
+      return { ...current, [mode]: { ...entry, map, valid: parsed.transactions, issues: [...entry.csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, excludedRows: mode === 'bank' ? parsed.excludedRows ?? [] : [], auxiliaryTransactionCount: auxiliaryTransactions } }
     })
   }
 
@@ -702,13 +761,24 @@ export default function App() {
             const row = latest.transactions.find((item) => sheetIdentity(item) === decision.selected[0])
             if (transaction && row) confirmations.set(transaction.id, row.id)
           }
-          const freshResult = reconcileCardStatement(entry.statement, latest.transactions, confirmations)
+          const rejectedCandidates = new Map<string, ReadonlySet<string>>()
+          for (const decision of savedDecisions.filter((item) => item.kind === 'CARD_REVIEW_REJECTED_CANDIDATES')) {
+            const transaction = entry.statement.transactions.find((item) => cardTransactionIdentityVariants(entry.statement!, item, entry.legacyStatementIdentity).includes(decision.identities[0]))
+            if (!transaction) continue
+            const rejectedIds = new Set(decision.selected.flatMap((identity) => {
+              const row = latest.transactions.find((item) => cardReviewCandidateIdentity(item) === identity)
+              return row ? [row.id] : []
+            }))
+            rejectedCandidates.set(transaction.id, rejectedIds)
+          }
+          const freshResult = reconcileCardStatement(entry.statement, latest.transactions, confirmations, rejectedCandidates)
           const freshMatches = freshResult.matches.map((match) => deriveCardPurchaseStatus(match, { consumedSheetIds: usedSheetIds }))
           freshMatches.filter((match) => match.status === 'CARD_MATCHED' && match.sheet).forEach((match) => usedSheetIds.add(match.sheet!.id))
           freshMatches.filter((match) => match.status === 'CARD_GROUP_MATCHED').flatMap((match) => match.candidates).forEach((row) => usedSheetIds.add(row.id))
           if (entry.statement.statementIdentity === target.statement.statementIdentity) {
             latestTargetMatch = freshMatches.find((match) => match.transaction.id === target.transaction.id)
-            latestTargetCandidates = findExistingCostYearCandidates(entry.statement, target.transaction, latest.transactions)
+            const rejectedIds = rejectedCandidates.get(target.transaction.id)
+            latestTargetCandidates = findExistingCostYearCandidates(entry.statement, target.transaction, latest.transactions).filter((row) => !rejectedIds?.has(row.id))
           }
         }
         if (latestTargetMatch && (['CARD_MATCHED', 'CARD_GROUP_MATCHED', 'CARD_REVIEW'].includes(latestTargetMatch.status) || latestTargetCandidates.length > 0)) {
@@ -762,13 +832,26 @@ export default function App() {
     void persistDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), statementIdentity ?? 'no-statement'], identities)
   }
 
-  function confirmStatementMatch(statement: CardStatement, transactionId: string, sheetId: string) {
+  async function confirmStatementMatch(statement: CardStatement, transactionId: string, sheetId: string) {
     const transaction = statement.transactions.find((item) => item.id === transactionId), sheet = data.sheet.find((item) => item.id === sheetId)
     if (transaction && sheet) {
       const identity = cardTransactionIdentity(statement, transaction)
+      const rejectedDecision = savedDecisions.find((record) => record.kind === 'CARD_REVIEW_REJECTED_CANDIDATES'
+        && cardTransactionIdentityVariants(statement, transaction, cardPdfs.find((entry) => entry.statement === statement)?.legacyStatementIdentity).includes(record.identities[0]))
+      if (rejectedDecision) await removeDecision(rejectedDecision.kind, rejectedDecision.identities)
       setCardReviewOverrides((current) => { const next = { ...current }; delete next[identity]; return next })
-      void persistDecision('STATEMENT_MATCH_CONFIRMED', [identity], [sheetIdentity(sheet)])
+      await persistDecision('STATEMENT_MATCH_CONFIRMED', [identity], [sheetIdentity(sheet)])
     }
+  }
+
+  function rejectCardReviewCandidates(statement: CardStatement, transactionId: string, sheetIds: string[]) {
+    const transaction = statement.transactions.find((item) => item.id === transactionId)
+    if (!transaction || !sheetIds.length) return
+    const selected = sheetIds.flatMap((id) => {
+      const row = data.sheet.find((item) => item.id === id || sheetIdentity(item) === id)
+      return row ? [cardReviewCandidateIdentity(row)] : []
+    })
+    if (selected.length) void persistDecision('CARD_REVIEW_REJECTED_CANDIDATES', [cardTransactionIdentity(statement, transaction)], selected)
   }
 
   function ignoreCardPurchase(statement: CardStatement, transactionId: string) {
@@ -791,6 +874,235 @@ export default function App() {
   function savedCompositionIdentity(item: ReconciliationItem) {
     return savedDecisions.find((record) => record.kind === 'COMPOSITION_CONFIRMED' && record.identities[0] === bankIdentity(item.bank))?.identities[1] ?? 'no-statement'
   }
+
+  async function auditInvalidateDecision(decision: PersistedDecision, reason: string) {
+    if (!window.confirm(`Esta ação invalidará somente ${decision.kind} desta compra e registrará uma exclusão nas decisões locais${googleAccessToken.current ? ' e sincronizadas' : ''}. Motivo: ${reason}\n\nContinuar?`)) return
+    await removeDecision(decision.kind, decision.identities)
+    setConsistencyAuditError('Decisão invalidada para este item. Execute a auditoria novamente para atualizar o relatório.')
+  }
+
+  async function auditDiscardObsoleteDoubleClaim(finding: NonNullable<ConsistencyAuditResult['findings'][number]>) {
+    const safe = finding.technical?.safeInvalidation as {
+      decision: PersistedDecision
+      decisionId: string
+      decisionKey: string
+      obsoleteSubject: { description: string; date: string; fingerprint: string }
+      winningSubject: { description: string; date: string; fingerprint: string }
+      row: { id: string; sheetIdentity: string; description: string; date: string }
+      separateMatch: { description: string; date: string; amount: number; id: string } | null
+    } | undefined
+    if (!safe || safe.decision.key !== safe.decisionKey) return
+    const separateMatch = safe.separateMatch
+      ? `O matching atual associa esse lançamento à compra de ${dateLabel(safe.winningSubject.date)} e encontrou outro lançamento válido (${safe.separateMatch.description}, ${dateLabel(safe.separateMatch.date)}, ${formatCents(safe.separateMatch.amount)}) para a compra de ${dateLabel(safe.obsoleteSubject.date)}.`
+      : `O matching atual associa esse lançamento à compra de ${dateLabel(safe.winningSubject.date)}; o vínculo antigo está incompatível com as fontes atuais.`
+    const confirmation = `Uma decisão antiga associa a compra ${safe.obsoleteSubject.description} de ${dateLabel(safe.obsoleteSubject.date)} ao lançamento ${safe.row.description} de ${dateLabel(safe.row.date)}.\n\n${separateMatch}\n\nEsta ação removerá apenas o vínculo histórico obsoleto.\n\nNenhuma linha da CUSTOS ANO será alterada.\n\nDescartar vínculo antigo?`
+    if (!window.confirm(confirmation)) return
+    const decision = safe.decision
+    const affectedFingerprints = [safe.obsoleteSubject.fingerprint, safe.winningSubject.fingerprint]
+    try {
+      addDecisionTombstone(decision)
+      await deletePersistedDecision(decision.key)
+      decisionStateRevision.current += 1
+      setSavedDecisions(await listPersistedDecisions())
+      setCardReviewOverrides((current) => {
+        const next = { ...current }
+        affectedFingerprints.forEach((fingerprint) => delete next[fingerprint])
+        return next
+      })
+      const spreadsheetId = googleSheetLink?.spreadsheetId
+      if (spreadsheetId) {
+        markDecisionPending(decision.key, true)
+        if (googleAccessToken.current) {
+          try {
+            await syncOneGoogleSheetDeletion(spreadsheetId, googleAccessToken.current, decision, listDecisionTombstones()[decision.key].updatedAt)
+            removeDecisionTombstone(decision.key)
+            markDecisionPending(decision.key, false)
+            setGoogleDecisionStatus('Decisão antiga descartada e sincronizada.')
+          } catch {
+            setGoogleDecisionStatus('Decisão descartada neste dispositivo; sincronização pendente.')
+          }
+        }
+      }
+      setPendingDoubleClaimRefresh({ id: decisionStateRevision.current, fingerprints: affectedFingerprints, rowIdentity: safe.row.sheetIdentity })
+      setConsistencyAuditError('Vínculo antigo descartado. Recalculando os subjects relacionados; nenhuma linha da CUSTOS ANO foi alterada.')
+    } catch (error) {
+      setConsistencyAuditError(error instanceof Error ? error.message : 'Não foi possível descartar o vínculo antigo.')
+    }
+  }
+
+  async function auditUseCandidate(item: NonNullable<ReturnType<typeof auditConsistency>['items'][number]>) {
+    const candidate = item.candidates[0]
+    if (!candidate) return
+    if (!window.confirm(`Salvar vínculo desta compra com “${candidate.originalDescription}” (${dateLabel(candidate.date)}, ${formatCents(candidate.amount)})? Isso altera somente a decisão de conciliação; CUSTOS ANO não será editada.`)) return
+    const rejectedDecision = savedDecisions.find((record) => record.kind === 'CARD_REVIEW_REJECTED_CANDIDATES' && item.aliases.includes(record.identities[0]))
+    if (rejectedDecision) await removeDecision(rejectedDecision.kind, rejectedDecision.identities)
+    setCardReviewOverrides((current) => { const next = { ...current }; delete next[item.fingerprint]; return next })
+    await persistDecision('STATEMENT_MATCH_CONFIRMED', [item.fingerprint], [sheetIdentity(candidate)])
+    setConsistencyAuditError('Vínculo salvo para este item. Execute a auditoria novamente para atualizar o relatório.')
+  }
+
+  async function auditRecalculateItem(item: NonNullable<ReturnType<typeof auditConsistency>['items'][number]>) {
+    if (!window.confirm('Reanalisar somente esta compra com os documentos e a CUSTOS ANO carregados? Nenhuma decisão será apagada e nenhuma linha será criada ou excluída.')) return
+    try {
+      const localDecisions = await listPersistedDecisions()
+      let auditSheets = data.sheet
+      let remoteDecisions: PersistedDecision[] = []
+      let remoteTombstones: PersistedDecision[] = []
+      if (sheetSource === 'google' && googleSheetLink?.spreadsheetId && googleAccessToken.current) {
+        const [ledger, decisions] = await Promise.all([
+          readGoogleSheetLedger(googleSheetLink.spreadsheetId, googleAccessToken.current),
+          readGoogleSheetDecisionsReadOnly(googleSheetLink.spreadsheetId, googleAccessToken.current),
+        ])
+        auditSheets = ledger.transactions
+        remoteDecisions = decisions.active
+        remoteTombstones = decisions.tombstones
+      }
+      const refreshed = auditConsistency({
+        banks: data.bank,
+        sheets: auditSheets,
+        statements: [{ statement: { ...item.statement, transactions: [item.transaction] } }],
+        currentCardMatches: statementResults.flatMap((entry) => entry.matches.filter((match) => match.transaction.id === item.transaction.id && entry.statement.statementIdentity === item.statement.statementIdentity).map((match) => ({ statementIdentity: entry.statement.statementIdentity, transactionId: match.transaction.id, match }))),
+        currentSheets: data.sheet,
+        localDecisions,
+        remoteDecisions,
+        remoteTombstones,
+        localTombstones: listDecisionTombstones(),
+      })
+      setConsistencyAudit((previous) => {
+        if (!previous) return previous
+        const items = [...previous.items.filter((existing) => existing.fingerprint !== item.fingerprint), ...refreshed.items]
+        const findings = [...previous.findings.filter((finding) => finding.item?.fingerprint !== item.fingerprint), ...refreshed.findings]
+        const pureStates = { ...previous.pureStates, ...refreshed.pureStates }
+        const currentStates = { ...previous.currentStates, ...refreshed.currentStates }
+        return { ...previous, auditedAt: refreshed.auditedAt, items, findings, pureStates, currentStates, summary: summarizeAudit(findings, items) }
+      })
+      setConsistencyAuditError(refreshed.items[0]?.diagnosis ?? 'Reanálise concluída. Nenhuma decisão ou lançamento foi alterado.')
+    } catch (error) { setConsistencyAuditError(error instanceof Error ? error.message : 'Não foi possível reanalisar esta compra.') }
+  }
+
+  async function runConsistencyAudit() {
+    setConsistencyAuditBusy(true)
+    setConsistencyAuditError('')
+    setConsistencyAuditSourceNote('')
+    try {
+      let auditSheets = data.sheet
+      let remoteDecisions: PersistedDecision[] = []
+      let remoteTombstones: PersistedDecision[] = []
+      if (sheetSource === 'google' && googleSheetLink?.spreadsheetId && googleAccessToken.current) {
+        try {
+          const [ledger, decisions] = await Promise.all([
+            readGoogleSheetLedger(googleSheetLink.spreadsheetId, googleAccessToken.current),
+            readGoogleSheetDecisionsReadOnly(googleSheetLink.spreadsheetId, googleAccessToken.current),
+          ])
+          auditSheets = ledger.transactions
+          remoteDecisions = decisions.active
+          remoteTombstones = decisions.tombstones
+          setConsistencyAuditSourceNote(`Leitura atualizada de CUSTOS ANO e _CONCILIADOR · ${ledger.rowCount} linhas. Nenhuma alteração foi feita.`)
+        } catch (remoteError) {
+          setConsistencyAuditSourceNote(`Não foi possível reler as fontes remotas (${remoteError instanceof Error ? remoteError.message : 'erro de leitura'}). Relatório parcial usando fontes atuais carregadas e decisões locais; nenhuma alteração foi feita.`)
+        }
+      } else if (sheetSource === 'google' && googleSheetLink?.spreadsheetId) {
+        setConsistencyAuditSourceNote('Google precisa ser reconectado para reler as fontes remotas. Auditoria parcial usando os dados já carregados nesta sessão; nenhuma alteração foi feita.')
+      } else {
+        setConsistencyAuditSourceNote('Auditoria das fontes carregadas nesta sessão e das decisões locais; nenhuma alteração foi feita.')
+      }
+      const localDecisions = await listPersistedDecisions()
+      const result = auditConsistency({
+        banks: data.bank,
+        sheets: auditSheets,
+        statements: cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []),
+        currentCardMatches: statementResults.flatMap((entry) => entry.matches.map((match) => ({ statementIdentity: entry.statement.statementIdentity, transactionId: match.transaction.id, match }))),
+        currentSheets: data.sheet,
+        localDecisions,
+        remoteDecisions,
+        remoteTombstones,
+        localTombstones: listDecisionTombstones(),
+      })
+      setConsistencyAudit(result)
+      setConsistencyAuditFilter('ALL')
+      setTab('auditor')
+    } catch (auditError) {
+      setConsistencyAuditError(auditError instanceof Error ? auditError.message : 'Não foi possível concluir a auditoria.')
+    } finally { setConsistencyAuditBusy(false) }
+  }
+
+  const activeAuditFindings = consistencyAudit?.findings.filter((finding) => !isAuditFindingDismissed(finding, dismissedAuditFindings)) ?? []
+  const hiddenAuditFindings = consistencyAudit?.findings.filter((finding) => isAuditFindingDismissed(finding, dismissedAuditFindings)) ?? []
+  const activeAuditSummary = consistencyAudit ? summarizeAudit(activeAuditFindings, consistencyAudit.items) : null
+  const auditDisplayedFindings = consistencyAudit
+    ? consistencyAuditFilter === 'HIDDEN'
+      ? hiddenAuditFindings
+      : filterAuditFindings(activeAuditFindings, consistencyAuditFilter)
+    : []
+
+  function hideAuditFinding(finding: import('./domain/consistencyAudit').AuditFinding) {
+    if (!window.confirm('Ocultar este aviso?\n\nEste diagnóstico deixará de aparecer entre os problemas ativos nas próximas auditorias enquanto continuar essencialmente igual. Você poderá encontrá-lo novamente na aba Ocultos. Se o problema mudar ou ficar mais grave, ele poderá aparecer novamente.')) return
+    const next = dismissAuditFinding(finding, dismissedAuditFindings)
+    saveAuditFindingVisibility(next)
+    setDismissedAuditFindings(next)
+  }
+
+  function restoreHiddenAuditFinding(finding: import('./domain/consistencyAudit').AuditFinding) {
+    const next = restoreAuditFinding(finding, dismissedAuditFindings)
+    saveAuditFindingVisibility(next)
+    setDismissedAuditFindings(next)
+    setConsistencyAuditFilter(finding.severity === 'CRITICAL' ? 'CRITICAL' : finding.severity === 'REVIEW' ? 'REVIEW' : finding.severity === 'LEGACY' || finding.severity === 'MAINTENANCE' ? 'LEGACY' : 'ALL')
+  }
+
+  useEffect(() => {
+    const pending = pendingDoubleClaimRefresh
+    if (!pending || !consistencyAudit || handledDoubleClaimRefresh.current === pending.id) return
+    handledDoubleClaimRefresh.current = pending.id
+    let active = true
+    void (async () => {
+      try {
+        const localDecisions = await listPersistedDecisions()
+        let auditSheets = data.sheet
+        let remoteDecisions: PersistedDecision[] = []
+        let remoteTombstones: PersistedDecision[] = []
+        if (sheetSource === 'google' && googleSheetLink?.spreadsheetId && googleAccessToken.current) {
+          try {
+            const [ledger, decisionRows] = await Promise.all([
+              readGoogleSheetLedger(googleSheetLink.spreadsheetId, googleAccessToken.current),
+              readGoogleSheetDecisionsReadOnly(googleSheetLink.spreadsheetId, googleAccessToken.current),
+            ])
+            auditSheets = ledger.transactions
+            remoteDecisions = decisionRows.active
+            remoteTombstones = decisionRows.tombstones
+          } catch { /* preserve current data and the local tombstone if a refresh is unavailable */ }
+        }
+        const refreshed = auditConsistency({
+          banks: data.bank,
+          sheets: auditSheets,
+          statements: cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []),
+          currentCardMatches: statementResults.flatMap((entry) => entry.matches.map((match) => ({ statementIdentity: entry.statement.statementIdentity, transactionId: match.transaction.id, match }))),
+          currentSheets: data.sheet,
+          localDecisions,
+          remoteDecisions,
+          remoteTombstones,
+          localTombstones: listDecisionTombstones(),
+          onlySubjectFingerprints: pending.fingerprints,
+        })
+        if (!active) return
+        const affected = new Set(pending.fingerprints)
+        const relatedFindings = refreshed.findings.filter((finding) => affected.has(finding.item?.fingerprint ?? '')
+          || finding.code === 'DOUBLE_CLAIM' && (finding.technical?.row as Record<string, unknown> | undefined)?.sheetIdentity === pending.rowIdentity)
+        setConsistencyAudit((previous) => {
+          if (!previous) return previous
+          const items = [...previous.items.filter((item) => !affected.has(item.fingerprint)), ...refreshed.items.filter((item) => affected.has(item.fingerprint))]
+          const findings = [...previous.findings.filter((finding) => !affected.has(finding.item?.fingerprint ?? '')
+            && !(finding.code === 'DOUBLE_CLAIM' && (finding.technical?.row as Record<string, unknown> | undefined)?.sheetIdentity === pending.rowIdentity)), ...relatedFindings]
+          return { ...previous, auditedAt: refreshed.auditedAt, items, findings, decisionAudit: refreshed.decisionAudit, pureStates: { ...previous.pureStates, ...refreshed.pureStates }, currentStates: { ...previous.currentStates, ...refreshed.currentStates }, summary: summarizeAudit(findings, items) }
+        })
+        setConsistencyAuditError('Reanálise dos subjects relacionados concluída. A decisão foi tombstonada; nenhuma linha da CUSTOS ANO foi alterada.')
+      } catch (error) {
+        if (active) setConsistencyAuditError(error instanceof Error ? error.message : 'Não foi possível recalcular os subjects relacionados.')
+      } finally {
+        if (active) setPendingDoubleClaimRefresh((current) => current?.id === pending.id ? null : current)
+      }
+    })()
+    return () => { active = false }
+  }, [pendingDoubleClaimRefresh, consistencyAudit, savedDecisions, statementResults, data, sheetSource, googleSheetLink, cardPdfs])
 
   return (
     <div className={`app-shell ${screen === 'home' && showStickyReconcile ? 'app-shell-sticky' : ''}`}>
@@ -817,12 +1129,12 @@ export default function App() {
               <div className="import-step"><span className="step-label">02 / EXTRATO</span><UploadCard title="Importar extrato" subtitle="CSV do banco ou cartão" mode="bank" status={sourceStatus.bank} upload={uploads.bank} onSelect={selectFile} onMapChange={changeMap} onAccept={() => acceptUpload('bank')} onClear={() => removeUpload('bank')} /></div>
             </div>
             <div className="card-import-heading"><span className="step-label">03 / CARTÃO DE CRÉDITO</span><h3>Faturas do cartão</h3></div>
-            <CardStatementUpload entries={cardPdfs} notice={cardPdfNotice} onSelect={selectCardPdfs} onRemove={removeCardPdf}/>
+            <CardStatementUpload entries={cardPdfs} notice={cardPdfNotice} onSelect={selectCardPdfs} onRemove={removeCardPdf} onRemoveAll={() => { if (window.confirm('Remover todas as faturas PDF desta sessão? As confirmações salvas serão mantidas.')) cardPdfs.forEach((entry) => removeCardPdf(entry.key)) }}/>
             <div className="launch-row"><div className="privacy-detail"><span className="lock-icon">⌑</span><span><strong>Processamento local</strong><small>PDF e CSV são processados neste dispositivo. As decisões ficam salvas localmente e podem sincronizar entre dispositivos.</small></span></div><div className="launch-action"><small>{!decisionsReady ? 'Carregando decisões locais…' : canReconcile ? 'Arquivos aceitos; conciliação pronta.' : sourceStatus.sheet === 'ACCEPTED' ? 'Falta aceitar as linhas válidas do extrato bancário.' : sourceStatus.bank === 'ACCEPTED' ? 'Falta aceitar as linhas válidas da CUSTOS ANO.' : 'Aceite a CUSTOS ANO e o extrato, ou importe a fatura PDF.'}</small><button ref={reconcileButtonRef} className="button button-primary button-launch" aria-hidden={showStickyReconcile} tabIndex={showStickyReconcile ? -1 : undefined} onClick={runReconciliation} disabled={!canReconcile || !decisionsReady}>Conciliar agora <span aria-hidden="true">↗</span></button></div></div>
           </section>
           <section className="how-section"><span className="step-label">02 / O QUE ACONTECE</span><div className="how-grid"><HowCard number="01" title="Validar" copy="Confira cabeçalhos, linhas válidas e possíveis problemas."/><HowCard number="02" title="Comparar" copy="Valores, datas e descrições formam candidatos explicáveis."/><HowCard number="03" title="Revisar" copy="Você confirma ou ignora cada caso incerto."/></div></section>
         </> : <>
-          <section className="results-heading"><div><span className="eyebrow">CONCILIAÇÃO LOCAL</span><h1>Visão geral</h1><p>Compare o resultado, refine o período e revise os casos sinalizados.</p></div><button className="button button-outline" onClick={() => setScreen('home')}>← Voltar aos arquivos</button></section>
+          <section className="results-heading"><div><span className="eyebrow">CONCILIAÇÃO LOCAL</span><h1>Visão geral</h1><p>Compare o resultado, refine o período e revise os casos sinalizados.</p></div><div className="audit-global-actions"><button className="button button-outline" onClick={() => void runConsistencyAudit()} disabled={consistencyAuditBusy}>{consistencyAuditBusy ? 'Auditando…' : 'Auditar consistência'}</button><button className="button button-outline" onClick={() => setScreen('home')}>← Voltar aos arquivos</button></div></section>
           <section className="results-sync-bar" aria-label="Sincronização das decisões"><div><strong role={googleDecisionStatus.startsWith('Decisões mantidas') ? 'alert' : 'status'} aria-live={googleDecisionStatus.startsWith('Decisões mantidas') ? 'assertive' : 'polite'}>{decisionSyncSummary}</strong><small>{googleSheetLink ? 'As decisões ficam neste dispositivo e sincronizam pela planilha vinculada.' : 'As decisões ficam salvas neste dispositivo.'}</small></div>{googleSheetInfo?.connected ? <button className="button button-outline" disabled={googleDecisionStatus === 'Sincronizando decisões…'} onClick={syncDecisionsManually}>{googleDecisionStatus === 'Sincronizando decisões…' ? 'Sincronizando…' : 'Sincronizar decisões'}</button> : googleSheetLink ? <button className="button button-outline" onClick={() => setScreen('home')}>Reconectar Google</button> : null}</section>
           <FilterBar years={years} year={filterYear} month={filterMonth} fromDate={fromDate} toDate={toDate} onYear={setFilterYear} onMonth={setFilterMonth} onFrom={setFromDate} onTo={setToDate}/>
           {missingWriteNotice && <p className="cost-write-notice" role="status">{missingWriteNotice}</p>}
@@ -835,19 +1147,20 @@ export default function App() {
             <Metric label="Duplicidades" value={filteredDuplicates.length} tone="orange" icon="Ⅱ" onClick={() => setTab('duplicates')}/>
             <Metric label="Fora do escopo" value={shownOutOfScope.length} tone="blue" icon="ℹ" onClick={() => setTab('outofscope')}/>
           </div>
-          <div className="tab-row" role="tablist" aria-label="Seções da conciliação"><Tab active={tab === 'overview'} onClick={() => setTab('overview')}>Resumo</Tab><Tab active={tab === 'review'} onClick={() => setTab('review')}>Revisão <span className="tab-count">{shownReview.length}</span></Tab><Tab active={tab === 'missing'} onClick={() => setTab('missing')}>Ausentes <span className="tab-count">{shownMissing.length}</span></Tab><Tab active={tab === 'card'} onClick={() => setTab('card')}>Faturas <span className="tab-count">{shownCardDivergences.length}</span></Tab>{statementResults.length > 0 && <Tab active={tab === 'statement'} onClick={() => setTab('statement')}>Faturas PDF <span className="tab-count">{statementResults.reduce((sum, result) => sum + result.matches.filter((match) => match.status === 'CARD_MISSING').length, 0)}</span></Tab>}<Tab active={tab === 'duplicates'} onClick={() => setTab('duplicates')}>Duplicidades <span className="tab-count">{filteredDuplicates.length}</span></Tab><Tab active={tab === 'outofscope'} onClick={() => setTab('outofscope')}>Fora do escopo <span className="tab-count">{shownOutOfScope.length}</span></Tab><Tab active={tab === 'flags'} onClick={() => setTab('flags')}>Sinalizações</Tab></div>
+          <div className="tab-row" role="tablist" aria-label="Seções da conciliação"><Tab active={tab === 'overview'} onClick={() => setTab('overview')}>Resumo</Tab><Tab active={tab === 'review'} onClick={() => setTab('review')}>Revisão <span className="tab-count">{shownReview.length}</span></Tab><Tab active={tab === 'missing'} onClick={() => setTab('missing')}>Ausentes <span className="tab-count">{shownMissing.length}</span></Tab><Tab active={tab === 'card'} onClick={() => setTab('card')}>Faturas <span className="tab-count">{shownCardDivergences.length}</span></Tab>{statementResults.length > 0 && <Tab active={tab === 'statement'} onClick={() => setTab('statement')}>Faturas PDF <span className="tab-count">{statementResults.reduce((sum, result) => sum + result.matches.filter((match) => match.status === 'CARD_MISSING').length, 0)}</span></Tab>}{consistencyAudit && <Tab active={tab === 'auditor'} onClick={() => setTab('auditor')}>Auditoria <span className="tab-count">{activeAuditSummary?.attention ?? 0}</span></Tab>}<Tab active={tab === 'duplicates'} onClick={() => setTab('duplicates')}>Duplicidades <span className="tab-count">{filteredDuplicates.length}</span></Tab><Tab active={tab === 'outofscope'} onClick={() => setTab('outofscope')}>Fora do escopo <span className="tab-count">{shownOutOfScope.length}</span></Tab><Tab active={tab === 'flags'} onClick={() => setTab('flags')}>Sinalizações</Tab></div>
+          {tab === 'auditor' && consistencyAudit && <section className="consistency-audit"><header className="panel audit-summary"><div><span className="eyebrow">SOMENTE LEITURA</span><h2>Auditoria de consistência</h2><small>Executada em {new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(consistencyAudit.auditedAt))}</small></div><button className="button button-outline" onClick={() => void runConsistencyAudit()} disabled={consistencyAuditBusy}>{consistencyAuditBusy ? 'Auditando…' : 'Executar novamente'}</button><p>{consistencyAuditSourceNote}</p></header>{consistencyAuditError && <p className="cost-write-notice" role="status">{consistencyAuditError}</p>}<div className="audit-counts"><strong>⚠ {activeAuditSummary?.attention ?? 0} problemas que exigem atenção</strong><strong>{activeAuditSummary?.critical ?? 0} críticos</strong><strong>{activeAuditSummary?.review ?? 0} para revisão</strong><strong>{activeAuditSummary?.maintenance ?? 0} manutenções</strong><strong>{activeAuditSummary?.legacy ?? 0} legados</strong><strong>{hiddenAuditFindings.length} avisos ocultos</strong><strong>{consistencyAudit.summary.evaluatedPurchases} compras avaliadas</strong><strong>{activeAuditSummary?.informational ?? 0} informativos</strong></div><details className="panel audit-inventory"><summary>Compras avaliadas · {consistencyAudit.items.length}</summary>{consistencyAudit.items.map((item) => <div className="audit-transaction" key={item.fingerprint}><strong>{item.transaction.originalDescription}</strong><span>{dateLabel(item.transaction.purchaseDate)} · {formatCents(item.transaction.amount)}</span><details><summary>Detalhes técnicos da avaliação</summary><pre>{JSON.stringify({ diagnostico: item.diagnosis, estadoPuro: item.pure.status, estadoAtual: item.current?.status ?? null, fingerprint: item.fingerprint }, null, 2)}</pre></details></div>)}</details><div className="audit-filter"><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('ALL')}>Todos ({activeAuditFindings.length})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('CRITICAL')}>Críticos ({activeAuditSummary?.critical ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('REVIEW')}>Revisão ({activeAuditSummary?.review ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('LEGACY')}>Legado/Manutenção ({(activeAuditSummary?.maintenance ?? 0) + (activeAuditSummary?.legacy ?? 0)})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('HIDDEN')}>Ocultos ({hiddenAuditFindings.length})</button></div>{auditDisplayedFindings.length ? auditDisplayedFindings.map((finding) => <AuditFindingCard key={finding.id} finding={finding} visibility={dismissedAuditFindings} hiddenView={consistencyAuditFilter === 'HIDDEN'} onDismiss={hideAuditFinding} onRestore={restoreHiddenAuditFinding} onDiscardObsolete={(item) => void auditDiscardObsoleteDoubleClaim(item)} onViewPurchase={(item) => { if (!item.item) return; setAuditFocusTransactionId(item.item.transaction.id); setAuditFocusStatementIdentity(item.item.statement.statementIdentity); setTab('statement'); setStatementOnlyIssues(false) }} onUseCandidate={(item) => { if (item.item) void auditUseCandidate(item.item) }} onInvalidateDecision={(_item, decision, explanation) => void auditInvalidateDecision(decision, explanation)} onReanalyze={(item) => { if (item.item) void auditRecalculateItem(item.item) }}/>) : <div className="panel"><EmptyState title={consistencyAuditFilter === 'HIDDEN' ? 'Nenhum aviso oculto' : 'Nenhuma inconsistência neste filtro'} copy={consistencyAuditFilter === 'HIDDEN' ? 'Os avisos ocultados aparecerão aqui.' : 'O relatório não encontrou problemas para mostrar nesta categoria.'}/></div>}</section>}
           {tab === 'overview' && <>
             <div className="summary-grid"><section className="panel"><PanelTitle title="Movimentação no período" note="Valores apresentados em reais"/><div className="totals-list"><AmountRow label="Total de movimentações do banco" amount={filteredItems.filter((item) => item.bank.direction === 'DEBIT' || item.bank.direction === 'CREDIT').reduce((sum, item) => sum + item.bank.amount, 0)} /><AmountRow label="Saídas" amount={filteredItems.filter((item) => item.bank.direction === 'DEBIT').reduce((sum, item) => sum + item.bank.amount, 0)}/><AmountRow label="Entradas" amount={filteredItems.filter((item) => item.bank.direction === 'CREDIT').reduce((sum, item) => sum + item.bank.amount, 0)}/><AmountRow label="Lançamentos da planilha" amount={filteredSheet.reduce((sum, item) => sum + item.amount, 0)} strong/></div></section>
-              <section className="panel"><PanelTitle title="Arquivos usados" note="Dados temporários nesta sessão"/><div className="file-summary"><FileLine icon="▤" title="Tabela CUSTOS ANO" detail={`${data.sheet.length} linhas válidas`} /><FileLine icon="◈" title="Extrato bancário" detail={`${data.bank.length} movimentações válidas`} /></div>{result.totals.finalBalance != null && <div className="balance-box"><span>Saldo inicial</span><strong>{formatCents(result.totals.initialBalance ?? 0)}</strong><span>Saldo final informado</span><strong>{formatCents(result.totals.finalBalance)}</strong><span>Saldo calculado</span><strong>{formatCents(result.totals.calculatedFinalBalance ?? 0)}</strong><span>Diferença</span><strong className={result.totals.balanceDifference === 0 ? 'good-text' : 'warning-text'}>{formatCents(result.totals.balanceDifference ?? 0)}</strong></div>}</section></div>
+              <section className="panel"><PanelTitle title="Arquivos usados" note="Dados temporários nesta sessão"/><div className="file-summary"><FileLine icon="▤" title="Tabela CUSTOS ANO" detail={`${data.sheet.length} linhas válidas`} /><FileLine icon="◈" title="Extrato bancário" detail={`${data.bank.length} movimentações válidas${uploads.bank?.csv.statementPeriodStart && uploads.bank.csv.statementPeriodEnd ? ` · ${dateLabel(uploads.bank.csv.statementPeriodStart)} a ${dateLabel(uploads.bank.csv.statementPeriodEnd)}` : ''}`} />{uploads.bank?.auxiliaryTransactionCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryTransactionCount} lançamentos recentes fora do período foram ignorados.</small> : null}</div>{result.totals.finalBalance != null && <BalanceAuditPanel audit={bankBalanceAudit}/>}</section></div>
             <section className="panel recent-panel"><PanelTitle title="Atividade para acompanhar" note="Os itens abaixo precisam da sua atenção" action={<button className="text-button" onClick={() => setTab('review')}>Ver revisão →</button>}/>{shownReview.length + shownMissing.length ? <div className="activity-list">{[...shownReview, ...shownMissing].slice(0, 5).map((item) => <ActivityItem key={item.bank.id} item={item}/>)}</div> : <EmptyState title="Tudo em dia por aqui" copy="Nenhuma ausência ou correspondência pendente para o período selecionado."/>}</section>
-            {shownMatched.length > 0 && <details className="panel matched-details" open={shownMatched.some((item) => item.candidate?.matchMethod === 'STRUCTURAL')}><summary><span><strong>Correspondências encontradas · {shownMatched.length}</strong><small>Abra para ver evidências, descrição e confiança</small></span><span aria-hidden="true">⌄</span></summary><div className="matched-list">{shownMatched.map((item) => <MatchedDetail key={item.bank.id} item={item} confirmedPreviously={savedDecisions.some((record) => record.kind === 'PAIR_CONFIRMED' && record.identities[0] === bankIdentity(item.bank))} onUndo={() => { if (item.sheet) void removeDecision('PAIR_CONFIRMED', [bankIdentity(item.bank)]) }}/>)}</div></details>}
+            {shownMatched.length > 0 && <details className="panel matched-details" open={shownMatched.some((item) => item.candidate?.reasons.includes('Correspondência 1:1 escolhida globalmente'))}><summary><span><strong>Correspondências encontradas · {shownMatched.length}</strong><small>Abra para ver evidências, descrição e confiança</small></span><span aria-hidden="true">⌄</span></summary><div className="matched-list">{shownMatched.map((item) => <MatchedDetail key={item.bank.id} item={item} confirmedPreviously={savedDecisions.some((record) => record.kind === 'PAIR_CONFIRMED' && record.identities[0] === bankIdentity(item.bank))} onUndo={() => { if (item.sheet) void removeDecision('PAIR_CONFIRMED', [bankIdentity(item.bank)]) }}/>)}</div></details>}
             {cardPdfs.length > 0 && <section className="panel"><PanelTitle title="Faturas PDF desta conciliação" note="Totais agregados; cada arquivo mantém sua análise independente."/>{cardPdfs.map((entry) => { const item = statementResults.find((result) => result.entry.key === entry.key); const status = entry.status === 'PROCESSING' ? 'Processando…' : entry.status === 'PROCESSED' ? '✓ Processado' : entry.status === 'DIVERGENCE' ? '⚠ Divergência' : '⚠ Erro de parsing'; return <div className="card-pdf-status" key={entry.key}><div><strong>{entry.fileName}</strong><small>{status}{item ? ` · Vencimento ${item.statement.dueDate ? dateLabel(item.statement.dueDate) : 'não identificado'} · Total ${item.statement.reportedTotal == null ? 'indisponível' : formatCents(item.statement.reportedTotal)} · ${item.matches.filter((match) => match.status === 'CARD_MISSING').length} compra(s) ausente(s)` : entry.error ? ` · ${entry.error}` : ''}</small>{item && <small>{item.payment ? `Pagamento identificado: ${dateLabel(item.payment.date)} · ${formatCents(item.payment.amount)}` : 'Pagamento bancário não identificado'}</small>}</div></div>})}</section>}
             {filteredItems.some((item) => item.compositionStatus === 'MATCHED') && <section className="review-list"><PanelTitle title="Pagamentos de cartão conciliados" note="Uma saída bancária pode corresponder a vários lançamentos Crédito_Bradesco"/>{filteredItems.filter((item) => item.compositionStatus === 'MATCHED').map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}</section>}
           </>}
           {tab === 'review' && <div className="review-list">{shownReview.map((item) => item.bank.type === 'CARD_PAYMENT' ? <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/> : <ReviewCard key={item.bank.id} item={item} onConfirm={() => decide(item, 'confirm')} onReject={() => decide(item, 'reject')} onIgnore={() => decide(item, 'ignore')}/>)}{!shownReview.length && <EmptyState title="Nenhum item para revisar" copy="A conciliação não encontrou itens pendentes neste período."/>}</div>}
-          {tab === 'missing' && <div className="review-list">{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')} onAddToSheet={() => openBankMissing(item)} canAddToSheet={bankAddEligibility(item).eligible} />)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
+          {tab === 'missing' && <div className="review-list"><MissingSummary items={shownMissing}/>{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')} onAddToSheet={() => openBankMissing(item)} canAddToSheet={bankAddEligibility(item).eligible} />)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
           {tab === 'card' && <div className="review-list">{shownCardDivergences.map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}{!shownCardDivergences.length && <EmptyState title="Nenhuma divergência de cartão" copy="Todas as faturas têm uma composição confirmada ou não há pagamentos de cartão neste período."/>}</div>}
-          {tab === 'statement' && <><section className="statement-filter panel" aria-label="Filtro das faturas"><strong>Exibição</strong><button className={`button ${statementOnlyIssues ? 'button-outline' : 'button-primary'}`} onClick={() => setStatementOnlyIssues(false)}>Todas</button><button className={`button ${statementOnlyIssues ? 'button-primary' : 'button-outline'}`} onClick={() => setStatementOnlyIssues(true)}>Só pendências</button></section>{visibleStatementResults.map((item) => <CardStatementResults key={item.entry.key} statement={item.statement} payment={item.payment} matches={item.matches} matchedTotal={item.matchedTotal} difference={item.difference} confirmations={item.confirmations} onlyIssues={statementOnlyIssues} onConfirm={(transactionId, sheetId) => confirmStatementMatch(item.statement, transactionId, sheetId)} onIgnore={(transactionId) => ignoreCardPurchase(item.statement, transactionId)} onAddMissing={(match) => openCardMissing(item.statement, match)} onUndo={(kind, identities) => { void undoStatementDecision(kind, item.statement, identities) }}/>) }{!visibleStatementResults.length && <EmptyState title="Nenhuma pendência nas faturas" copy="As faturas conciliadas foram ocultadas pelo filtro Só pendências."/>}</>}
+          {tab === 'statement' && <><section className="statement-filter panel" aria-label="Filtro das faturas"><strong>Exibição</strong><button className={`button ${statementOnlyIssues ? 'button-outline' : 'button-primary'}`} onClick={() => setStatementOnlyIssues(false)}>Todas</button><button className={`button ${statementOnlyIssues ? 'button-primary' : 'button-outline'}`} onClick={() => setStatementOnlyIssues(true)}>Só pendências</button></section>{visibleStatementResults.map((item) => <CardStatementResults key={item.entry.key} statement={item.statement} payment={item.payment} matches={item.matches} matchedTotal={item.matchedTotal} difference={item.difference} confirmations={item.confirmations} onlyIssues={statementOnlyIssues} focusTransactionId={item.statement.statementIdentity === auditFocusStatementIdentity ? auditFocusTransactionId : ''} onConfirm={(transactionId, sheetId) => confirmStatementMatch(item.statement, transactionId, sheetId)} onRejectCandidates={(transactionId, sheetIds) => rejectCardReviewCandidates(item.statement, transactionId, sheetIds)} onIgnore={(transactionId) => ignoreCardPurchase(item.statement, transactionId)} onAddMissing={(match) => openCardMissing(item.statement, match)} onUndo={(kind, identities) => { void undoStatementDecision(kind, item.statement, identities) }}/>) }{!visibleStatementResults.length && <EmptyState title="Nenhuma pendência nas faturas" copy="As faturas conciliadas foram ocultadas pelo filtro Só pendências."/>}</>}
           {tab === 'outofscope' && <div className="issue-columns"><section className="panel"><PanelTitle title="Movimentações fora da conciliação de despesas" note="Entradas, investimentos, transferências e tipos sem natureza confirmada"/>{shownOutOfScope.length ? <>{investFacilYields.length > 0 && <details className="investment-yield-group"><summary><strong>Rendimentos Invest Fácil</strong><span>{investFacilYields.length} créditos · total {formatCents(investFacilYields.reduce((sum, item) => sum + item.bank.amount, 0))}</span><small>Créditos de rendimento agrupados; não são lançados em CUSTOS ANO.</small></summary><div>{investFacilYields.map((item) => <p key={item.bank.id}>{dateLabel(item.bank.date)} · {item.bank.originalDescription} · {formatCents(item.bank.amount)}</p>)}</div></details>}{otherOutOfScope.map((item) => <div className="issue-row" key={item.bank.id}><span className="status-icon blue">ℹ</span><div><strong>{item.bank.originalDescription}</strong><p>{dateLabel(item.bank.date)} · {item.bank.directionKnown === false ? 'Direção não identificada' : item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} · {formatCents(item.bank.amount)}</p><small>{item.sheet ? `Correspondência de investimento: ${item.sheet.originalDescription} · ${formatCents(item.sheet.amount)}` : outOfScopeReason(item.bank.type)}</small></div></div>)}</> : <EmptyState title="Nenhuma movimentação fora do escopo" copy="Todas as movimentações deste período estão em outras seções."/>}</section></div>}
           {tab === 'duplicates' && <section className="panel"><PanelTitle title="Possíveis duplicidades na CUSTOS ANO" note="Sugestões baseadas em lançamentos da planilha; nada é removido automaticamente"/>{filteredDuplicates.length ? filteredDuplicates.map((group, index) => <div className="issue-row duplicate-group" key={`${group.source}-${index}`}><span className="status-icon orange">Ⅱ</span><div><strong>Confira este grupo · {group.transactionIds.length} lançamentos</strong>{group.transactionIds.map((id) => { const sheet = data.sheet.find((entry) => entry.id === id); return sheet ? <p className="duplicate-entry" key={id}>{dateLabel(sheet.date)} · {sheet.originalDescription} · {formatCents(sheet.amount)}{sheet.paymentMethod ? ` · ${sheet.paymentMethod}` : ''}</p> : null })}<small>Possíveis duplicidades precisam de confirmação manual.</small></div></div>) : <EmptyState title="Nenhuma duplicidade sugerida" copy="Nenhuma linha da CUSTOS ANO com data, valor e descrição parecida foi encontrada."/>}</section>}
           {tab === 'flags' && <section className="panel"><PanelTitle title="Lançamentos da planilha não encontrados no extrato" note="Podem pertencer a outra conta, período ou meio de pagamento"/>{unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).length ? unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).map((sheet) => <div className="issue-row" key={sheet.id}><span className="status-icon blue">↗</span><div><strong>{sheet.originalDescription}</strong><p>{dateLabel(sheet.date)} · {formatCents(sheet.amount)} · {sheet.category || 'Sem categoria'}</p><small>Não encontrado no extrato importado.</small><button className="text-button" onClick={() => ignoreSheet(sheet.id)}>Ignorar este lançamento</button></div></div>) : <EmptyState title="Sem sinalizações" copy="Não há lançamentos da planilha pendentes neste período."/>}</section>}
@@ -885,7 +1198,9 @@ function UploadCard({ title, subtitle, mode, status, upload, onSelect, onMapChan
   onMapChange: (mode: Mode, key: keyof ColumnMap, value: string) => void; onAccept: () => void; onClear: () => void
 }) {
   const [showAllIssues, setShowAllIssues] = useState(false)
+  const [showBankPreview, setShowBankPreview] = useState(false)
   const accepted = status === 'ACCEPTED' && upload
+  if (mode === 'bank' && upload && !bankCsvRequiresManualMapping(upload)) return <BankCsvUploadCard upload={upload} accepted={Boolean(accepted)} onMapChange={(key, value) => onMapChange(mode, key, value)} onAccept={onAccept} onClear={onClear} onSelect={(event) => onSelect(mode, event)} fieldTitles={fieldTitles} requiredFields={requiredFields[mode]} optionalFields={optionalFields[mode]}/>
   return <article className={`upload-card ${upload ? 'upload-card-loaded' : ''} ${accepted ? 'upload-card-accepted' : ''}`}><div className="upload-top"><span className={`upload-icon ${mode}`}>{mode === 'sheet' ? '▤' : '◈'}</span><span className="upload-state">{accepted ? '✓ Fonte aceita' : status === 'LOADED' ? 'Lendo arquivo…' : upload ? 'CSV validado' : 'CSV · Seleção local'}</span></div><h3>{title}</h3><p className="upload-subtitle">{subtitle}</p>
     {!upload && status === 'LOADED' ? <div className="file-drop" role="status">Lendo o arquivo neste dispositivo…</div> : !upload ? <label className="file-drop"><input type="file" aria-label="Selecionar arquivo CSV" accept=".csv,text/csv" onChange={(event) => onSelect(mode, event)}/><span className="file-plus">＋</span><strong>Selecionar arquivo CSV</strong><small>Separador vírgula ou ponto e vírgula · UTF-8</small></label> : accepted ? <>
       <div className="accepted-file"><span className="accepted-check" aria-hidden="true">✓</span><div><strong>{upload.fileName}</strong><small>{upload.valid.length} movimentações carregadas</small><small>{upload.issues.length === 1 ? '1 linha com problema não importada' : `${upload.issues.length} linhas com problemas não importadas`}</small></div></div>
@@ -893,41 +1208,87 @@ function UploadCard({ title, subtitle, mode, status, upload, onSelect, onMapChan
       {upload.issues.length > 0 && <div className="issue-preview"><div><span className="status-icon amber">!</span><span><strong>{upload.issues.length} problema(s) preservados para consulta</strong><small>Somente as linhas válidas foram aceitas.</small></span><button className="text-button" onClick={() => setShowAllIssues(!showAllIssues)}>{showAllIssues ? 'Recolher' : 'Detalhes'}</button></div>{showAllIssues && <ul>{upload.issues.slice(0, 8).map((issue, index) => <li key={index}>Linha {issue.row}: {issue.message}</li>)}</ul>}</div>}
       <div className="accepted-actions"><label className="button button-outline replace-file"><input type="file" aria-label="Selecionar arquivo CSV" accept=".csv,text/csv" onChange={(event) => onSelect(mode, event)}/>Substituir arquivo</label><button className="button button-quiet button-small" onClick={onClear}>Remover</button></div>
     </> : <>
-      <div className="selected-file"><span>▤</span><div><strong>{upload.fileName}</strong><small>{upload.rowCount} linhas detectadas · delimitador {upload.csv.delimiter === ',' ? 'vírgula' : upload.csv.delimiter === ';' ? 'ponto e vírgula' : upload.csv.delimiter || 'automático'}</small>{upload.csv.metadataRowsIgnored > 0 && <small>{upload.csv.metadataRowsIgnored} linha(s) de metadados ignorada(s) antes do cabeçalho</small>}</div><button className="icon-button" aria-label="Remover arquivo" onClick={onClear}>×</button></div>
+      <div className="selected-file"><span>▤</span><div><strong>{upload.fileName}</strong><small>{upload.rowCount} linhas detectadas · delimitador {upload.csv.delimiter === ',' ? 'vírgula' : upload.csv.delimiter === ';' ? 'ponto e vírgula' : upload.csv.delimiter || 'automático'}</small></div><button className="icon-button" aria-label="Remover arquivo" onClick={onClear}>×</button></div>
+      {mode === 'bank' && <p className="bank-needs-confirmation">Precisamos confirmar algumas colunas</p>}
       <div className="mapping-grid"><strong className="mapping-heading">Confira o mapeamento das colunas</strong>{[...requiredFields[mode], ...optionalFields[mode]].map((key) => <label className="map-field" key={key}><span>{fieldTitles[key]}{requiredFields[mode].includes(key) && <i> · obrigatório</i>}</span><select value={upload.map[key] ?? ''} onChange={(event) => onMapChange(mode, key, event.target.value)}><option value="">{requiredFields[mode].includes(key) ? 'Selecione uma coluna' : 'Não disponível'}</option>{upload.csv.headers.map((header) => <option key={header} value={header}>{header}</option>)}</select></label>)}</div>
-      <div className="preview-heading"><strong>Prévia</strong><span>{upload.valid.length} válidas · {upload.issues.length} problemas</span></div>
-      {upload.ignoredRows > 0 && <small className="ignored-row-note">{upload.ignoredRows} linha(s) ignoradas por não conterem movimentação ou serem cabeçalho/rodapé.</small>}
-      <div className="preview-table-wrap"><table className="preview-table"><thead><tr>{upload.csv.headers.slice(0, 6).map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{upload.csv.rows.slice(0, 4).map((row, index) => <tr key={index}>{upload.csv.headers.slice(0, 6).map((header) => <td key={header}>{row[header]}</td>)}</tr>)}</tbody></table></div>
+      {mode === 'bank' ? <><details className="csv-preview" open={showBankPreview} onToggle={(event) => setShowBankPreview(event.currentTarget.open)}><summary>Ver prévia ▸ <span>{upload.valid.length} válidas · {upload.ignoredRows} ignoradas · {upload.issues.length} problemas</span></summary><div className="preview-table-wrap"><table className="preview-table"><thead><tr>{upload.csv.headers.slice(0, 6).map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{upload.csv.rows.slice(0, 4).map((row, index) => <tr key={index}>{upload.csv.headers.slice(0, 6).map((header) => <td key={header}>{row[header]}</td>)}</tr>)}</tbody></table></div></details>{upload.csv.metadataRowsIgnored > 0 && <details className="csv-metadata"><summary>Detalhes do arquivo</summary><small>{upload.csv.metadataRowsIgnored} linha(s) de metadados ignoradas antes do cabeçalho.</small></details>}</> : <><div className="preview-heading"><strong>Prévia</strong><span>{upload.valid.length} válidas · {upload.issues.length} problemas</span></div>{upload.ignoredRows > 0 && <small className="ignored-row-note">{upload.ignoredRows} linha(s) ignoradas por não conterem movimentação ou serem cabeçalho/rodapé.</small>}<div className="preview-table-wrap"><table className="preview-table"><thead><tr>{upload.csv.headers.slice(0, 6).map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{upload.csv.rows.slice(0, 4).map((row, index) => <tr key={index}>{upload.csv.headers.slice(0, 6).map((header) => <td key={header}>{row[header]}</td>)}</tr>)}</tbody></table></div></>}
       {upload.issues.length > 0 && <div className="issue-preview"><div><span className="status-icon amber">!</span><span><strong>{upload.issues.length} problema(s) para conferir</strong><small>As linhas inválidas não serão descartadas sem aviso.</small></span><button className="text-button" onClick={() => setShowAllIssues(!showAllIssues)}>{showAllIssues ? 'Recolher' : 'Detalhes'}</button></div>{showAllIssues && <ul>{upload.issues.slice(0, 8).map((issue, index) => <li key={index}>Linha {issue.row}: {issue.message}</li>)}</ul>}</div>}
       <button className="button button-secondary full-button" disabled={!upload.valid.length} onClick={onAccept}>Usar {upload.valid.length} linha(s) válidas <span aria-hidden="true">→</span></button>
     </>}
   </article>
 }
 
-function CardStatementUpload({ entries, notice, onSelect, onRemove }: { entries: CardPdfEntry[]; notice: string; onSelect: (event: ChangeEvent<HTMLInputElement>) => void; onRemove: (key: string) => void }) {
+function CardStatementUpload({ entries, notice, onSelect, onRemove, onRemoveAll }: { entries: CardPdfEntry[]; notice: string; onSelect: (event: ChangeEvent<HTMLInputElement>) => void; onRemove: (key: string) => void; onRemoveAll: () => void }) {
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(() => new Set())
+  const manuallyChanged = useRef(new Set<string>())
+  useEffect(() => {
+    const needsAttention = entries.filter((entry) => entry.status === 'ERROR' || entry.status === 'DIVERGENCE'
+      || Boolean(entry.statement && (!entry.statement.dueDate || entry.statement.reportedTotal == null || entry.statement.errors.length > 0 || entry.statement.accountingDifference != null && entry.statement.accountingDifference !== 0)))
+    if (needsAttention.length) setExpandedKeys((current) => {
+      const next = new Set(current)
+      needsAttention.forEach((entry) => { if (!manuallyChanged.current.has(entry.key)) next.add(entry.key) })
+      return next
+    })
+  }, [entries])
+
+  const sortedEntries = [...entries].sort((a, b) => (a.statement?.dueDate ?? '9999-99-99').localeCompare(b.statement?.dueDate ?? '9999-99-99') || a.key.localeCompare(b.key))
+  const statements = entries.flatMap((entry) => entry.statement ? [entry.statement] : [])
+  const purchases = statements.flatMap((statement) => statement.transactions.filter((item) => item.type === 'PURCHASE'))
+  const refunds = statements.flatMap((statement) => statement.transactions.filter((item) => item.type === 'REFUND'))
+  const issueCount = entries.filter((entry) => entry.status === 'ERROR' || entry.status === 'DIVERGENCE'
+    || Boolean(entry.statement && (!entry.statement.dueDate || entry.statement.reportedTotal == null || entry.statement.errors.length > 0 || entry.statement.accountingDifference != null && entry.statement.accountingDifference !== 0))).length
+  const processingCount = entries.filter((entry) => entry.status === 'PROCESSING').length
+  const netTotal = statements.reduce((sum, statement) => sum + (statement.reportedTotal ?? statement.transactions.reduce((net, item) => net + (item.direction === 'CREDIT' ? -item.amount : item.amount), 0)), 0)
+  const formatShortMoney = (amount: number) => formatCents(amount)
+  const toggleExpanded = (key: string) => {
+    manuallyChanged.current.add(key)
+    setExpandedKeys((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next })
+  }
+  const setAllExpanded = (expanded: boolean) => {
+    manuallyChanged.current = new Set(entries.map((entry) => entry.key))
+    setExpandedKeys(expanded ? new Set(entries.map((entry) => entry.key)) : new Set())
+  }
+  const statusFor = (entry: CardPdfEntry) => {
+    if (entry.status === 'PROCESSING') return { text: 'Lendo PDF…', tone: 'amber' }
+    if (entry.status === 'ERROR') return { text: '⚠ Erro de parsing', tone: 'red' }
+    if (entry.statement && !entry.statement.dueDate) return { text: '⚠ Vencimento não identificado', tone: 'amber' }
+    if (entry.statement && (entry.statement.errors.length > 0 || entry.statement.reportedTotal == null || entry.statement.accountingDifference != null && entry.statement.accountingDifference !== 0)) return { text: '⚠ Valores não conferem', tone: 'amber' }
+    return { text: '✓ Valores conferem', tone: 'green' }
+  }
+  const titleFor = (statement: CardStatement) => {
+    const cardIds = [...new Set(statement.transactions.map((item) => item.cardIdentifier))]
+    const due = statement.dueDate ? dateLabel(statement.dueDate) : 'vencimento não identificado'
+    const cards = cardIds.length === 1 ? `Cartão •••• ${cardIds[0].slice(-4)}` : `${cardIds.length} cartões`
+    return `Fatura ${due} · ${cards}`
+  }
+
   return <section className="card-pdf-import panel"><div className="panel-heading"><div><span className="step-label">03 / CARTÃO DE CRÉDITO</span><h2>Importar faturas PDF</h2><p>Cada fatura é lida separadamente neste navegador; os arquivos não são enviados nem guardados.</p></div></div>
-    <label className="file-drop card-pdf-drop"><input type="file" aria-label="Selecionar fatura PDF" accept="application/pdf,.pdf" multiple onChange={onSelect}/><span className="file-plus">＋</span><strong>Adicionar faturas PDF</strong><small>Selecione um ou vários PDFs; você também pode adicionar mais depois.</small></label>
+    <label className={`file-drop card-pdf-drop ${entries.length ? 'card-pdf-drop-compact' : ''}`}><input type="file" aria-label="Selecionar fatura PDF" accept="application/pdf,.pdf" multiple onChange={onSelect}/><span className="file-plus">＋</span><strong>{entries.length ? 'Adicionar mais faturas' : 'Adicionar faturas PDF'}</strong><small>Selecione PDFs ou arraste-os aqui. Você pode adicionar mais depois.</small></label>
     {notice && <div className="alert alert-error" role="status">{notice}</div>}
-    {entries.map((entry) => {
+    {entries.length > 1 && <section className="card-pdf-batch" aria-label="Resumo das faturas"><div><strong>{entries.length} faturas carregadas</strong><small>{purchases.length} compras{refunds.length ? ` · ${refunds.length} ${refunds.length === 1 ? 'estorno/crédito' : 'estornos/créditos'}` : ''}</small><strong>Total líquido: {formatShortMoney(netTotal)}</strong><small className={issueCount ? 'warning-text' : 'good-text'}>{issueCount ? `⚠ ${issueCount} ${issueCount === 1 ? 'fatura precisa' : 'faturas precisam'} de atenção${processingCount ? ` · ${processingCount} em processamento` : ''}` : processingCount ? `${processingCount} ${processingCount === 1 ? 'fatura sendo lida' : 'faturas sendo lidas'}…` : '✓ Todas as faturas foram lidas corretamente'}</small></div><div className="card-pdf-batch-actions"><button className="text-button" onClick={() => setAllExpanded(true)}>Expandir todas</button><button className="text-button" onClick={() => setAllExpanded(false)}>Recolher todas</button><button className="text-button card-pdf-remove-all" onClick={onRemoveAll}>Remover todas</button></div></section>}
+    {sortedEntries.map((entry) => {
       const statement = entry.statement
-      const purchases = statement?.transactions.filter((transaction) => transaction.type === 'PURCHASE') ?? []
-      const refunds = statement?.transactions.filter((transaction) => transaction.type === 'REFUND') ?? []
-      const status = entry.status === 'PROCESSING' ? 'Processando…' : entry.status === 'PROCESSED' ? '✓ Processado' : entry.status === 'DIVERGENCE' ? '⚠ Divergência' : '⚠ Erro de parsing'
-      return <article className="card-pdf-entry" key={entry.key}>
-        <div className="card-pdf-status"><div><strong>{entry.fileName}</strong><small>{status}{statement ? ` · PDF lido · ${statement.pageCount} páginas · ${new Set(statement.transactions.map((item) => item.cardIdentifier)).size} cartões · ${purchases.length} compras · ${refunds.length} crédito(s)/estorno(s)` : ''}</small></div><button className="button button-quiet button-small" aria-label={`Remover ${entry.fileName}`} onClick={() => onRemove(entry.key)}>Remover</button></div>
-        {statement && <><div className="statement-totals"><AmountRow label="Compras/Débitos extraídos" amount={purchases.reduce((sum, transaction) => sum + transaction.amount, 0)}/><AmountRow label="Créditos/estornos extraídos" amount={-refunds.reduce((sum, item) => sum + item.amount, 0)}/><AmountRow label="Total informado pela fatura" amount={statement.reportedTotal ?? 0}/><strong className={statement.errors.length ? 'warning-text' : 'good-text'}>{statement.errors.length ? '⚠ Divergência encontrada' : '✓ Valores conferem'}</strong></div>{statement.errors.map((message) => <p className="statement-warning" key={message}>{message}</p>)}</>}
-        {entry.error && <p className="statement-warning">{entry.error}</p>}
+      const purchasesInStatement = statement?.transactions.filter((item) => item.type === 'PURCHASE') ?? []
+      const refundsInStatement = statement?.transactions.filter((item) => item.type === 'REFUND') ?? []
+      const cards = statement ? [...new Set(statement.transactions.map((item) => item.cardIdentifier))] : []
+      const status = statusFor(entry)
+      const expanded = expandedKeys.has(entry.key)
+      const total = statement?.reportedTotal ?? statement?.transactions.reduce((net, item) => net + (item.direction === 'CREDIT' ? -item.amount : item.amount), 0) ?? 0
+      return <article className={`card-pdf-entry ${status.tone === 'red' || status.tone === 'amber' && status.text.startsWith('⚠') ? 'card-pdf-entry-issue' : ''}`} data-testid="card-pdf-entry" key={entry.key}>
+        <header className="card-pdf-summary"><div className="card-pdf-summary-main"><strong>{statement ? titleFor(statement) : entry.status === 'ERROR' ? 'Fatura com erro de leitura' : 'Fatura sendo lida'}</strong>{statement && !statement.dueDate && <small>Vencimento não identificado</small>}{!statement && <small>{status.text}</small>}{statement && <><strong>{formatShortMoney(total)} · {purchasesInStatement.length} compras{refundsInStatement.length ? ` · ${refundsInStatement.length} ${refundsInStatement.length === 1 ? 'estorno/crédito' : 'estornos/créditos'}` : ''}</strong><span className={`statement-status ${status.tone}`}>{status.text}</span></>}</div><div className="card-pdf-entry-actions"><button className="button button-outline button-small" aria-expanded={expanded} onClick={() => toggleExpanded(entry.key)}>{expanded ? 'Recolher detalhes' : 'Ver detalhes'}</button><button className="button button-quiet button-small" aria-label={`Remover ${entry.fileName}`} onClick={() => onRemove(entry.key)}>Remover</button></div></header>
+        {expanded && <div className="card-pdf-details"><small>Arquivo: {entry.fileName}</small>{statement && <><small>{statement.pageCount} páginas · {cards.length} cartões encontrados{cards.length ? ` · ${cards.map((card) => `final ${card.slice(-4)}`).join(', ')}` : ''}</small><div className="statement-totals"><AmountRow label="Compras/Débitos extraídos" amount={purchasesInStatement.reduce((sum, item) => sum + item.amount, 0)}/><AmountRow label="Créditos/estornos extraídos" amount={-refundsInStatement.reduce((sum, item) => sum + item.amount, 0)}/>{statement.cardSubtotals.map((subtotal) => <AmountRow key={subtotal.cardIdentifier} label={`Subtotal cartão final ${subtotal.cardIdentifier.slice(-4)}`} amount={subtotal.amount}/ >)}<AmountRow label="Total extraído / líquido" amount={statement.purchasesDebitsTotal != null ? statement.purchasesDebitsTotal - refundsInStatement.reduce((sum, item) => sum + item.amount, 0) : total}/>{statement.reportedTotal != null && <AmountRow label="Total informado pela fatura" amount={statement.reportedTotal}/ >}{statement.previousBalance != null && <AmountRow label="Saldo anterior" amount={statement.previousBalance}/ >}{statement.creditsPaymentsTotal != null && <AmountRow label="Créditos/Pagamentos" amount={statement.creditsPaymentsTotal}/ >}<strong className={status.tone === 'green' ? 'good-text' : 'warning-text'}>{status.text}</strong></div><div className="card-pdf-metadata"><small>Vencimento: {statement.dueDate ? dateLabel(statement.dueDate) : 'não identificado'}</small><small>Fechamento: {statement.nextClosingDate ? dateLabel(statement.nextClosingDate) : 'não informado'}</small>{statement.previousPayment != null && <small>Pagamento anterior: {formatShortMoney(statement.previousPayment)}</small>}{statement.accountingDifference != null && <small>Diferença matemática: {formatShortMoney(statement.accountingDifference)}</small>}</div><div className="card-pdf-transactions"><strong>Compras e créditos extraídos</strong>{statement.transactions.map((transaction) => <div className="card-pdf-transaction" key={transaction.id}><span>{dateLabel(transaction.purchaseDate || transaction.date)} · {transaction.originalDescription}<small>{transaction.type === 'REFUND' ? 'Crédito/estorno' : 'Compra'} · cartão final {transaction.cardIdentifier.slice(-4)}{transaction.installment != null ? ` · parcela ${transaction.installment}/${transaction.totalInstallments}` : ''}{transaction.city ? ` · ${transaction.city}` : ''}{transaction.currency !== 'BRL' ? ` · ${transaction.currency}` : ''}{transaction.exchangeRate != null ? ` · câmbio ${transaction.exchangeRate}` : ''}</small></span><strong>{formatShortMoney(transaction.direction === 'CREDIT' ? -transaction.amount : transaction.amount)}</strong></div>)}</div>{statement.errors.map((message) => <p className="statement-warning" key={message}>{message}</p>)}</>}{entry.error && <p className="statement-warning">{entry.error}</p>}</div>}
       </article>
     })}
   </section>
 }
 
-function CardStatementResults({ statement, payment, matches, matchedTotal, difference, confirmations, onlyIssues, onConfirm, onIgnore, onAddMissing, onUndo }: { statement: CardStatement; payment: BankTransaction | null; matches: CardStatementMatch[]; matchedTotal: number; difference: number; confirmations: Map<string, string>; onlyIssues: boolean; onConfirm: (transactionId: string, sheetId: string) => void; onIgnore: (transactionId: string) => void; onAddMissing: (match: CardStatementMatch) => void; onUndo: (kind: DecisionKind, identities: string[]) => void }) {
+function CardStatementResults({ statement, payment, matches, matchedTotal, difference, confirmations, onlyIssues, focusTransactionId, onConfirm, onRejectCandidates, onIgnore, onAddMissing, onUndo }: { statement: CardStatement; payment: BankTransaction | null; matches: CardStatementMatch[]; matchedTotal: number; difference: number; confirmations: Map<string, string>; onlyIssues: boolean; focusTransactionId?: string; onConfirm: (transactionId: string, sheetId: string) => void; onRejectCandidates: (transactionId: string, sheetIds: string[]) => void; onIgnore: (transactionId: string) => void; onAddMissing: (match: CardStatementMatch) => void; onUndo: (kind: DecisionKind, identities: string[]) => void }) {
   const [expanded, setExpanded] = useState<boolean | null>(null)
   const [showMatched, setShowMatched] = useState(false)
   const [showIgnored, setShowIgnored] = useState(false)
   const [showAll, setShowAll] = useState(false)
   const [exceptionLimit, setExceptionLimit] = useState(5)
+  useEffect(() => { if (focusTransactionId) { setExpanded(true); setShowAll(true); setShowMatched(true); setExceptionLimit(Number.MAX_SAFE_INTEGER) } }, [focusTransactionId])
   const purchases = matches.filter((match) => match.transaction.type === 'PURCHASE')
   const refunds = statement.transactions.filter((item) => item.type === 'REFUND')
   const purchasesTotal = purchases.reduce((sum, match) => sum + match.transaction.amount, 0)
@@ -944,7 +1305,7 @@ function CardStatementResults({ statement, payment, matches, matchedTotal, diffe
     const cardMatches = entries.filter((match) => match.transaction.cardIdentifier === cardIdentifier)
     if (!cardMatches.length) return null
     const subtotal = statement.cardSubtotals.find((item) => item.cardIdentifier === cardIdentifier)?.amount
-    return <section className="statement-card-group" key={`${heading}-${cardIdentifier}`}><h4>Cartão final {cardIdentifier.slice(-4)}{cardIds.length > 1 && subtotal != null ? ` · subtotal ${formatCents(subtotal)}` : ''}</h4>{cardMatches.map((match) => <CardStatementRow key={match.transaction.id} match={match} statementIdentity={statement.statementIdentity} invoiceDueDate={statement.dueDate} nextClosingDate={statement.nextClosingDate} confirmedPreviously={confirmations.has(match.transaction.id)} onConfirm={onConfirm} onIgnore={onIgnore} onAddMissing={onAddMissing} onUndo={onUndo}/>)}</section>
+    return <section className="statement-card-group" key={`${heading}-${cardIdentifier}`}><h4>Cartão final {cardIdentifier.slice(-4)}{cardIds.length > 1 && subtotal != null ? ` · subtotal ${formatCents(subtotal)}` : ''}</h4>{cardMatches.map((match) => <CardStatementRow key={match.transaction.id} match={match} statementIdentity={statement.statementIdentity} invoiceDueDate={statement.dueDate} nextClosingDate={statement.nextClosingDate} confirmedPreviously={confirmations.has(match.transaction.id)} auditFocus={focusTransactionId === match.transaction.id} onConfirm={onConfirm} onRejectCandidates={onRejectCandidates} onIgnore={onIgnore} onAddMissing={onAddMissing} onUndo={onUndo}/>)}</section>
   })}</section>
   const exceptionMatches = [...missing, ...review]
   const visibleExceptions = showAll ? exceptionMatches : exceptionMatches.slice(0, exceptionLimit)
@@ -969,7 +1330,9 @@ function CardStatementResults({ statement, payment, matches, matchedTotal, diffe
     </div>}
   </article>
 }
-function CardStatementRow({ match, statementIdentity, invoiceDueDate, nextClosingDate, confirmedPreviously, onConfirm, onIgnore, onAddMissing, onUndo }: { match: CardStatementMatch; statementIdentity: string; invoiceDueDate: string | null; nextClosingDate: string | null; confirmedPreviously: boolean; onConfirm: (transactionId: string, sheetId: string) => void; onIgnore: (transactionId: string) => void; onAddMissing: (match: CardStatementMatch) => void; onUndo: (kind: DecisionKind, identities: string[]) => void }) {
+function CardStatementRow({ match, statementIdentity, invoiceDueDate, nextClosingDate, confirmedPreviously, auditFocus, onConfirm, onRejectCandidates, onIgnore, onAddMissing, onUndo }: { match: CardStatementMatch; statementIdentity: string; invoiceDueDate: string | null; nextClosingDate: string | null; confirmedPreviously: boolean; auditFocus?: boolean; onConfirm: (transactionId: string, sheetId: string) => void; onRejectCandidates: (transactionId: string, sheetIds: string[]) => void; onIgnore: (transactionId: string) => void; onAddMissing: (match: CardStatementMatch) => void; onUndo: (kind: DecisionKind, identities: string[]) => void }) {
+  const rowRef = useRef<HTMLElement | null>(null)
+  useEffect(() => { if (auditFocus && rowRef.current && typeof rowRef.current.scrollIntoView === 'function') rowRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' }) }, [auditFocus])
   const { transaction, status, candidates } = match
   const purchaseDate = transaction.purchaseDate || transaction.date
   const dueDate = transaction.invoiceDueDate ?? transaction.statementDueDate ?? invoiceDueDate
@@ -977,7 +1340,7 @@ function CardStatementRow({ match, statementIdentity, invoiceDueDate, nextClosin
   const label = status === 'CARD_REFUNDED' ? 'ESTORNADA · NÃO É COMPRA AUSENTE' : status === 'CARD_GROUP_MATCHED' ? `CONCILIADO POR MULTIPLICIDADE · GRUPO DE ${candidates.length}` : status === 'CARD_MATCHED' ? confirmedPreviously ? 'CONCILIADO ANTERIORMENTE' : 'MATCHED · Crédito_Bradesco' : status === 'CARD_MISSING' ? 'COMPRA DE CARTÃO NÃO REGISTRADA' : status === 'CARD_IGNORED' ? 'COMPRA IGNORADA' : 'REVISAR CORRESPONDÊNCIA'
   const tone = status === 'CARD_MATCHED' || status === 'CARD_GROUP_MATCHED' || status === 'CARD_REFUNDED' ? 'green' : status === 'CARD_MISSING' ? 'red' : 'amber'
   const addDecision = canAddMissingToCostYear({ source: 'STATEMENT', status, direction: transaction.direction, type: transaction.type })
-  return <article className="statement-transaction"><span className={`status-icon ${tone}`}>{status === 'CARD_MATCHED' || status === 'CARD_GROUP_MATCHED' || status === 'CARD_REFUNDED' ? '✓' : status === 'CARD_MISSING' ? '⌕' : '!'}</span><div className="statement-transaction-main"><strong>{dateLabel(purchaseDate)} · {transaction.originalDescription}</strong><p>Data real da compra · {transaction.city || 'Cidade não informada'}{transaction.installment != null ? ` · Parcela ${transaction.installment}/${transaction.totalInstallments}` : ''}</p><div className="statement-invoice-date-context"><small>{dueDate ? `Vencimento da fatura: ${dateLabel(dueDate)} · data sugerida para CUSTOS ANO` : 'Vencimento não identificado; a data da compra será usada como alternativa.'}</small><small>{nextClosingDate ? `Próximo fechamento previsto: ${dateLabel(nextClosingDate)}` : 'Fechamento não informado.'}</small></div>{status === 'CARD_MATCHED' && match.sheet && <small>Planilha: {dateLabel(match.sheet.date)} · {match.sheet.originalDescription} · {formatCents(match.sheet.amount)} · Forma de pagamento: {match.sheet.paymentMethod}</small>}{(status === 'CARD_REVIEW' || status === 'CARD_GROUP_MATCHED') && candidates.map((candidate) => <div className="statement-candidate" key={candidate.id}><small>CUSTOS ANO: {dateLabel(candidate.date)} · {candidate.originalDescription} · {formatCents(candidate.amount)} · Forma de pagamento: {candidate.paymentMethod}</small>{status === 'CARD_REVIEW' && <button className="text-button" onClick={() => onConfirm(transaction.id, candidate.id)}>Usar este lançamento</button>}</div>)}{match.evidence && <div className="statement-match-evidence" aria-label="Evidências do matching">{match.evidence.map((item) => <small key={item}>✓ {item}</small>)}</div>}<span className={`statement-status ${tone}`}>{label}</span>{addDecision.eligible && <button className="text-button" onClick={() => onAddMissing(match)}>Adicionar à CUSTOS ANO</button>}{status === 'CARD_MISSING' && <button className="text-button" onClick={() => onIgnore(transaction.id)}>Ignorar</button>}{confirmedPreviously && match.sheet && <button className="text-button" onClick={() => onUndo('STATEMENT_MATCH_CONFIRMED', [identity])}>Desfazer confirmação</button>}</div><strong className="activity-amount">{formatCents(transaction.direction === 'CREDIT' ? -transaction.amount : transaction.amount)}</strong></article>
+  return <article ref={rowRef} className={`statement-transaction ${auditFocus ? 'audit-row-focus' : ''}`}><span className={`status-icon ${tone}`}>{status === 'CARD_MATCHED' || status === 'CARD_GROUP_MATCHED' || status === 'CARD_REFUNDED' ? '✓' : status === 'CARD_MISSING' ? '⌕' : '!'}</span><div className="statement-transaction-main"><strong>{dateLabel(purchaseDate)} · {transaction.originalDescription}</strong><p>Data real da compra · {transaction.city || 'Cidade não informada'}{transaction.installment != null ? ` · Parcela ${transaction.installment}/${transaction.totalInstallments}` : ''}</p><div className="statement-invoice-date-context"><small>{dueDate ? `Vencimento da fatura: ${dateLabel(dueDate)} · data sugerida para CUSTOS ANO` : 'Vencimento não identificado; a data da compra será usada como alternativa.'}</small><small>{nextClosingDate ? `Próximo fechamento previsto: ${dateLabel(nextClosingDate)}` : 'Fechamento não informado.'}</small></div>{status === 'CARD_MATCHED' && match.sheet && <small>Planilha: {dateLabel(match.sheet.date)} · {match.sheet.originalDescription} · {formatCents(match.sheet.amount)} · Forma de pagamento: {match.sheet.paymentMethod}</small>}{(status === 'CARD_REVIEW' || status === 'CARD_GROUP_MATCHED') && candidates.map((candidate) => <div className="statement-candidate" key={candidate.id}><small>CUSTOS ANO: {dateLabel(candidate.date)} · {candidate.originalDescription} · {formatCents(candidate.amount)} · Forma de pagamento: {candidate.paymentMethod}</small>{status === 'CARD_REVIEW' && <button className="text-button" onClick={() => onConfirm(transaction.id, candidate.id)}>Usar este lançamento</button>}</div>)}{status === 'CARD_REVIEW' && candidates.length > 0 && <div className="statement-reject-candidates"><button className="text-button" onClick={() => onRejectCandidates(transaction.id, candidates.map((candidate) => candidate.id))}>Nenhum desses — está ausente</button><small>Use esta opção se nenhum lançamento acima corresponder a esta compra.</small></div>}{match.evidence && <div className="statement-match-evidence" aria-label="Evidências do matching">{match.evidence.map((item) => <small key={item}>{auditFocus ? '★' : '✓'} {item}</small>)}</div>}<span className={`statement-status ${tone}`}>{label}</span>{addDecision.eligible && <button className="text-button" onClick={() => onAddMissing(match)}>Adicionar à CUSTOS ANO</button>}{status === 'CARD_MISSING' && <button className="text-button" onClick={() => onIgnore(transaction.id)}>Ignorar</button>}{confirmedPreviously && match.sheet && <button className="text-button" onClick={() => onUndo('STATEMENT_MATCH_CONFIRMED', [identity])}>Desfazer confirmação</button>}</div><strong className="activity-amount">{formatCents(transaction.direction === 'CREDIT' ? -transaction.amount : transaction.amount)}</strong></article>
 }
 
 function HowCard({ number, title, copy }: { number: string; title: string; copy: string }) { return <article className="how-card"><span>{number}</span><div><strong>{title}</strong><p>{copy}</p></div></article> }
@@ -996,17 +1359,22 @@ function ReviewCard({ item, onConfirm, onReject, onIgnore }: { item: Reconciliat
 function CardPaymentCard({ item, persisted, onConfirm, onIgnore, onUndo }: { item: ReconciliationItem; persisted: boolean; onConfirm: (sheetIds: string[]) => void; onIgnore: () => void; onUndo: () => void }) {
   const options = item.composition.length ? [{ items: item.composition, score: 100, reasons: ['Composição confirmada pelo usuário'] }] : item.compositionOptions
   const [selected, setSelected] = useState<number | null>(options.length === 1 ? 0 : null)
+  const [expanded, setExpanded] = useState(item.compositionStatus !== 'MATCHED')
+  useEffect(() => setExpanded(item.compositionStatus !== 'MATCHED'), [item.compositionStatus])
   const selectedIndex = selected != null && selected < options.length ? selected : options.length === 1 ? 0 : null
   const displayed = selectedIndex == null ? null : options[selectedIndex]
   const summary = item.cardSummary
+  const title = item.compositionStatus === 'MATCHED' ? 'Liquidação da fatura' : item.compositionStatus === 'NO_MATCH' ? 'Nenhuma composição exata encontrada' : item.compositionStatus === 'LIMITED' ? 'Busca de composição incompleta' : 'Revisão de fatura'
+  const status = item.compositionStatus === 'MATCHED' ? 'Composição confirmada' : item.compositionStatus === 'LIMITED' ? 'Busca incompleta' : item.compositionStatus === 'NO_MATCH' ? 'Diferença de fatura' : 'Revisão necessária'
   return <article className="review-card card-payment-card">
-    <div className="review-card-title"><span className="status-icon blue">◈</span><div><span className="step-label">{item.compositionStatus === 'MATCHED' ? 'PAGAMENTO DE CARTÃO CONCILIADO' : 'DIVERGÊNCIA DE FATURA'}</span><h2>{item.compositionStatus === 'MATCHED' ? 'Liquidação da fatura' : item.compositionStatus === 'NO_MATCH' ? 'Nenhuma composição exata encontrada' : item.compositionStatus === 'LIMITED' ? 'Busca de composição incompleta' : 'Revisão de fatura'}</h2></div><span className="confidence">{item.compositionStatus === 'MATCHED' ? 'Composição confirmada' : item.compositionStatus === 'LIMITED' ? 'Busca incompleta' : item.compositionStatus === 'NO_MATCH' ? 'Diferença de fatura' : 'Revisão necessária'}</span></div>
-    <div className="comparison-grid"><TransactionBox label="BANCO" transaction={item.bank}/><span className="compare-arrow">→</span><div className="transaction-box"><span className="step-label">COMPOSIÇÃO Crédito_Bradesco</span>{displayed?.items.length ? <><div className="card-composition-list">{displayed.items.map((sheet) => <div className="card-composition-row" key={sheet.id}><span>{dateLabel(sheet.date)} · {sheet.originalDescription}<small>{sheet.paymentMethod}</small></span><strong>{formatCents(sheet.amount)}</strong></div>)}</div><div className="card-composition-total"><span>TOTAL DA COMPOSIÇÃO</span><strong>{formatCents(displayed.items.reduce((sum, sheet) => sum + sheet.amount, 0))}</strong></div></> : <span className="no-candidate">Nenhuma composição exata está pronta para confirmação.</span>}</div></div>
-    {summary && <CardSummaryNotice item={item}/>}
-    {options.length > 1 && <fieldset className="composition-options"><legend>Alternativas exatas, ordenadas por plausibilidade. Escolha uma para confirmar:</legend>{options.map((option, index) => <label className="composition-option" key={canonicalCompositionKey(option.items)}><input type="radio" name={`composition-${item.bank.id}`} checked={selectedIndex === index} onChange={() => setSelected(index)}/><span><strong>Opção {index + 1} · {option.items.length} lançamentos · {formatCents(option.items.reduce((sum, sheet) => sum + sheet.amount, 0))}</strong><small>Plausibilidade {option.score}/100 · {option.reasons.join(' · ')}</small></span></label>)}</fieldset>}
-    {item.compositionStatus === 'MATCHED' && <div className="match-reasons"><span><b>✓</b> Soma exata em centavos</span><span><b>✓</b> Vínculo confirmado; itens bloqueados para outras faturas</span>{persisted && <span><b>✓</b> Decisão salva neste dispositivo</span>}</div>}
-    {item.compositionStatus === 'LIMITED' && <div className="match-reasons"><span>ℹ A busca atingiu um limite de complexidade. As sugestões são parciais e a composição não pôde ser determinada com segurança.</span></div>}
-    <div className="review-actions">{item.compositionStatus === 'MATCHED' ? <button className="button button-outline" onClick={onUndo}>Desfazer confirmação</button> : <button className="button button-primary" disabled={!displayed} onClick={() => displayed && onConfirm(displayed.items.map((sheet) => sheet.sheetRecordId || sheet.id))}>✓ Confirmar composição</button>}<button className="button button-outline" onClick={onIgnore}>Ignorar</button></div>
+    <div className="review-card-title"><span className="status-icon blue">◈</span><div><span className="step-label">{item.compositionStatus === 'MATCHED' ? 'PAGAMENTO DE CARTÃO CONCILIADO' : 'DIVERGÊNCIA DE FATURA'}</span><h2>{title}</h2></div><button className="button button-outline button-small card-payment-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? 'Recolher detalhes' : 'Ver detalhes'}</button><span className="confidence">{status}</span></div>
+    {expanded && <div className="card-payment-details"><div className="comparison-grid"><TransactionBox label="BANCO" transaction={item.bank}/><span className="compare-arrow">→</span><div className="transaction-box"><span className="step-label">COMPOSIÇÃO Crédito_Bradesco</span>{displayed?.items.length ? <><div className="card-composition-list">{displayed.items.map((sheet) => <div className="card-composition-row" key={sheet.id}><span>{dateLabel(sheet.date)} · {sheet.originalDescription}<small>{sheet.paymentMethod}</small></span><strong>{formatCents(sheet.amount)}</strong></div>)}</div><div className="card-composition-total"><span>TOTAL DA COMPOSIÇÃO</span><strong>{formatCents(displayed.items.reduce((sum, sheet) => sum + sheet.amount, 0))}</strong></div></> : <span className="no-candidate">Nenhuma composição exata está pronta para confirmação.</span>}</div></div>
+      {summary && <CardSummaryNotice item={item}/>}
+      {options.length > 1 && <fieldset className="composition-options"><legend>Alternativas exatas, ordenadas por plausibilidade. Escolha uma para confirmar:</legend>{options.map((option, index) => <label className="composition-option" key={canonicalCompositionKey(option.items)}><input type="radio" name={`composition-${item.bank.id}`} checked={selectedIndex === index} onChange={() => setSelected(index)}/><span><strong>Opção {index + 1} · {option.items.length} lançamentos · {formatCents(option.items.reduce((sum, sheet) => sum + sheet.amount, 0))}</strong><small>Plausibilidade {option.score}/100 · {option.reasons.join(' · ')}</small></span></label>)}</fieldset>}
+      {item.compositionStatus === 'MATCHED' && <div className="match-reasons"><span><b>✓</b> Soma exata em centavos</span><span><b>✓</b> Vínculo confirmado; itens bloqueados para outras faturas</span>{persisted && <span><b>✓</b> Decisão salva neste dispositivo</span>}</div>}
+      {item.compositionStatus === 'LIMITED' && <div className="match-reasons"><span>ℹ A busca atingiu um limite de complexidade. As sugestões são parciais e a composição não pôde ser determinada com segurança.</span></div>}
+      <div className="review-actions">{item.compositionStatus === 'MATCHED' ? <button className="button button-outline" onClick={onUndo}>Desfazer confirmação</button> : <button className="button button-primary" disabled={!displayed} onClick={() => displayed && onConfirm(displayed.items.map((sheet) => sheet.sheetRecordId || sheet.id))}>✓ Confirmar composição</button>}<button className="button button-outline" onClick={onIgnore}>Ignorar</button></div>
+    </div>}
   </article>
 }
 function CardSummaryNotice({ item }: { item: ReconciliationItem }) {

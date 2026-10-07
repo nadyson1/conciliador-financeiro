@@ -14,6 +14,8 @@ export function stableFingerprint(parts: Array<string | number | null | undefine
 }
 
 export const sheetIdentity = (item: LedgerTransaction) => item.sheetRecordId || `sheet:${stableFingerprint([item.date, item.originalDescription, item.amount, item.direction, item.installment, item.totalInstallments])}`
+/** Candidate rejection is tied to both the stable row ID and the reviewed semantics. */
+export const cardReviewCandidateIdentity = (item: LedgerTransaction) => `${sheetIdentity(item)}:${stableFingerprint([item.date, item.originalDescription, item.amount, item.direction, item.paymentMethod, item.installment, item.totalInstallments])}`
 export const bankIdentity = (item: BankTransaction) => item.bankTransactionId || `bank:${stableFingerprint([item.date, item.originalDescription, item.amount, item.direction, item.balanceAfter, item.type])}`
 export const cardTransactionIdentity = (statement: CardStatement | string, item: CardStatementTransaction) => `${typeof statement === 'string' ? statement : statement.statementIdentity}:${stableFingerprint([item.cardIdentifier, item.date, item.originalDescription, item.amount, item.direction, item.installment, item.totalInstallments])}`
 

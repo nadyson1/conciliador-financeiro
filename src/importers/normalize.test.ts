@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { descriptionSimilarity, investmentAction, normalizeAmount, normalizeDate, normalizeDescription, transactionType } from './normalize'
+import { classifySheetRecord, descriptionSimilarity, investmentAction, normalizeAmount, normalizeDate, normalizeDescription, transactionType } from './normalize'
 import { parseCsvText } from './csv'
 import { parseBankRows, parseLedgerRows } from './transactions'
 import { initialColumnMap } from './csv'
@@ -100,6 +100,23 @@ describe('CSV local e formatos brasileiros', () => {
     expect(parsed.transactions[0]).toMatchObject({ type: 'INVESTMENT', direction: 'DEBIT', amount: 450000, paymentMethod: 'Investimento' })
   })
 
+  it('prioriza Crédito_Bradesco como despesa em CUSTOS ANO sem deixar heurística ampla sobrescrever a forma', () => {
+    expect(classifySheetRecord({ description: 'Compra de merchant desconhecido', paymentMethod: 'Crédito_Bradesco' })).toBe('EXPENSE')
+    expect(classifySheetRecord({ description: 'Assinatura Kindle unlimited (2 meses)', paymentMethod: 'Crédito_Bradesco' })).toBe('EXPENSE')
+    expect(classifySheetRecord({ description: 'Transferencia para CC Nubank', paymentMethod: 'Crédito_Bradesco' })).toBe('EXPENSE')
+    expect(classifySheetRecord({ description: 'Transferência entre contas', paymentMethod: 'Transferência' })).toBe('TRANSFER')
+    expect(classifySheetRecord({ description: 'PIX ENTRE CONTAS PROPRIAS', paymentMethod: 'Pix' })).toBe('TRANSFER')
+    expect(classifySheetRecord({ description: 'PIX ENVIADO PARA MINHA OUTRA CONTA', paymentMethod: 'Crédito_Bradesco' })).toBe('TRANSFER')
+  })
+
+  it('usa a classificação centralizada ao importar CUSTOS ANO e mantém transferências explícitas', () => {
+    const parsed = parseLedgerRows([
+      { Data: '12/03/2026', Descrição: 'Assinatura Kindle unlimited (2 meses)', Custo: '2,99', 'Forma de pagamento': 'Crédito_Bradesco' },
+      { Data: '12/03/2026', Descrição: 'Transferência entre contas', Custo: '200,00', 'Forma de pagamento': 'Transferência' },
+    ], { date: 'Data', description: 'Descrição', amount: 'Custo', paymentMethod: 'Forma de pagamento' })
+    expect(parsed.transactions.map((item) => item.type)).toEqual(['EXPENSE', 'TRANSFER'])
+  })
+
   it('não inventa a direção nem cria ausência quando CSV não informa a direção da movimentação', () => {
     const parsed = parseBankRows([{ Data: '08/01/2026', Descrição: 'Loja sem contexto', Valor: '45,00' }], { date: 'Data', description: 'Descrição', amount: 'Valor' })
     expect(parsed.transactions[0]).toMatchObject({ direction: 'DEBIT', directionKnown: false, type: 'OTHER' })
@@ -124,22 +141,23 @@ describe('CSV local e formatos brasileiros', () => {
     expect(document.headers).toEqual(['Data', 'Histórico', 'Docto.', 'Crédito (R$)', 'Débito (R$)', 'Saldo (R$)'])
     const map = initialColumnMap(document.headers, 'bank')
     expect(map).toMatchObject({ date: 'Data', description: 'Histórico', id: 'Docto.', credit: 'Crédito (R$)', debit: 'Débito (R$)', balance: 'Saldo (R$)' })
-    const parsed = parseBankRows(document.rows, map)
-    expect(parsed.transactions).toHaveLength(4)
-    expect(parsed.ignoredRows).toBe(3)
+    const parsed = parseBankRows(document.rows, map, document.metadataRowsIgnored)
+    expect(parsed.transactions).toHaveLength(3)
+    expect(parsed.ignoredRows).toBe(4)
+    expect(parsed.excludedRows?.map(({ reason }) => reason)).toEqual(['NO_MOVEMENT', 'NO_MOVEMENT', 'REPEATED_HEADER', 'FOOTER_OR_METADATA'])
+    expect(parsed.excludedRows?.[1]).toMatchObject({ date: '2026-02-03', description: 'Sem valor', balanceAfter: 296173 })
+    expect(parsed.excludedRows?.map(({ row }) => row)).toEqual([3, 7, 8, 9])
     expect(parsed.issues).toHaveLength(0)
     expect(parsed.transactions.map(({ direction, amount, balanceAfter }) => ({ direction, amount, balanceAfter }))).toEqual([
-      { direction: 'DEBIT', amount: 0, balanceAfter: 190823 },
       { direction: 'CREDIT', amount: 1200, balanceAfter: 192023 },
       { direction: 'CREDIT', amount: 117500, balanceAfter: 309523 },
       { direction: 'DEBIT', amount: 13350, balanceAfter: 296173 },
     ])
-    expect(parsed.transactions.slice(1, 3).map((transaction) => transaction.type)).toEqual(['INCOME', 'INCOME'])
-    expect(parsed.transactions[3]).toMatchObject({ type: 'EXPENSE', description: 'COMPRA CARTAO VISA', originalDescription: 'COMPRA CARTAO VISA' })
-    expect(new Set(parsed.transactions.map((transaction) => transaction.bankTransactionId)).size).toBe(4)
-    expect(parsed.transactions[0].original['Docto.']).toBe('0')
-    expect(parsed.transactions[1].original['Docto.']).toBe(parsed.transactions[2].original['Docto.'])
-    expect(parsed.transactions[1].bankTransactionId).not.toBe(parsed.transactions[2].bankTransactionId)
+    expect(parsed.transactions.slice(0, 2).map((transaction) => transaction.type)).toEqual(['INCOME', 'INCOME'])
+    expect(parsed.transactions[2]).toMatchObject({ type: 'EXPENSE', description: 'COMPRA CARTAO VISA', originalDescription: 'COMPRA CARTAO VISA' })
+    expect(new Set(parsed.transactions.map((transaction) => transaction.bankTransactionId)).size).toBe(3)
+    expect(parsed.transactions[0].original['Docto.']).toBe(parsed.transactions[1].original['Docto.'])
+    expect(parsed.transactions[0].bankTransactionId).not.toBe(parsed.transactions[1].bankTransactionId)
     const ledger = parseLedgerRows([{ Data: '02/02/2026', Descrição: 'COMPRA CARTAO VISA', Custo: '133,50' }], { date: 'Data', description: 'Descrição', amount: 'Custo' })
     const result = reconcile(parsed.transactions, ledger.transactions)
     expect(result.items.find((item) => item.bank.originalDescription === 'COMPRA CARTAO VISA')?.status).toBe('MATCHED')
@@ -199,6 +217,7 @@ describe('CSV local e formatos brasileiros', () => {
     expect(parsed.transactions[0]).toMatchObject({ direction: 'CREDIT', type: 'INVESTMENT_INCOME', outOfScopeSubtype: 'INVEST_FACIL_YIELD', amount: 3, balanceAfter: 164572, description: 'RENTAB.INVEST FACILCRED*' })
     expect(reconcile(parsed.transactions, []).items[0].status).toBe('OUT_OF_SCOPE')
     expect(parsed.issues).toEqual([])
-    expect(parsed.ignoredRows).toBe(3)
+    expect(parsed.ignoredRows).toBe(0)
+    expect(parseBankRows(document.auxiliaryRows, initialColumnMap(document.headers, 'bank')).ignoredRows).toBe(2)
   })
 })

@@ -22,11 +22,33 @@ export function parseCsvText(text: string): CsvDocument {
     transformHeader: (header) => header.replace(/^\uFEFF/, '').trim(),
   })
   const headers = result.meta.fields ?? []
-  const rows = (result.data ?? []).map((row) => {
+  const allRows = (result.data ?? []).map((row) => {
     const clean: Record<string, string> = {}
     for (const header of headers) clean[header] = String(row[header] ?? '').trim()
     return clean
   }).filter((row) => Object.values(row).some(Boolean))
+  const bradescoLike = Boolean(detectColumn(headers, 'date') && detectColumn(headers, 'description')
+    && (detectColumn(headers, 'debit') || detectColumn(headers, 'credit')) && detectColumn(headers, 'balance'))
+  let auxiliaryStart = -1
+  let principalEnd = allRows.length
+  let statementPeriodStart: string | null = null
+  let statementPeriodEnd: string | null = null
+  for (let index = 0; index < allRows.length; index += 1) {
+    const values = Object.values(allRows[index])
+    const latestMarker = bradescoLike && values.some((value) => normalizeHeader(value) === 'ultimos lancamentos')
+    const filterPeriod = bradescoLike ? values.map(readStatementPeriod).find((period) => period != null) : null
+    if (filterPeriod) {
+      statementPeriodStart = filterPeriod.start
+      statementPeriodEnd = filterPeriod.end
+      principalEnd = Math.min(principalEnd, index)
+    }
+    if (latestMarker) {
+      auxiliaryStart = index
+      principalEnd = Math.min(principalEnd, index)
+    }
+  }
+  const rows = allRows.slice(0, principalEnd)
+  const auxiliaryRows = auxiliaryStart >= 0 ? allRows.slice(auxiliaryStart + 1) : []
   const physicalLines = source.split(/\r?\n/)
   const firstDataLine = metadataRowsIgnored + 1
   const nonEmptyDataLineNumbers = physicalLines
@@ -49,10 +71,25 @@ export function parseCsvText(text: string): CsvDocument {
   return {
     headers,
     rows,
+    auxiliaryRows,
+    auxiliarySectionLabel: auxiliaryStart >= 0 ? 'Últimos Lançamentos' : null,
+    statementPeriodStart,
+    statementPeriodEnd,
     parseErrors,
     delimiter: result.meta.delimiter,
     metadataRowsIgnored,
   }
+}
+
+function readStatementPeriod(value: string): { start: string; end: string } | null {
+  const normalized = value.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  const match = normalized.match(/movimentacao\s+entre\s*:?\s*(\d{1,2}\/\d{1,2}\/\d{4})\s+e\s+(\d{1,2}\/\d{1,2}\/\d{4})/i)
+  if (!match) return null
+  const toIso = (date: string) => {
+    const [day, month, year] = date.split('/')
+    return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`
+  }
+  return { start: toIso(match[1]), end: toIso(match[2]) }
 }
 
 function headerScore(cells: string[]): number {

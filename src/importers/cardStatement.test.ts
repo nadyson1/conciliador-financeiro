@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { BankTransaction, CardStatement, LedgerTransaction } from '../domain/types'
 import { deriveCardPurchaseStatus, findExistingCostYearCandidates, identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
 import { findDuplicateGroups, reconcile } from '../matching/reconcile'
+import { parseLedgerRows } from './transactions'
 
 const syntheticPages = [
   [
@@ -390,7 +391,7 @@ describe('PDF de fatura do cartão', () => {
     statement.transactions[0].installment = null
     statement.transactions[0].totalInstallments = null
     expect(reconcileCardStatement(statement, [ledger('same-day', '2026-05-12', 'ASAAS OFICINA CR', 9450)]).matches[0].status).toBe('CARD_MATCHED')
-    expect(reconcileCardStatement(statement, [ledger('old-date', '2026-02-12', 'ASAAS OFICINA CR', 9450)]).matches[0].status).toBe('CARD_REVIEW')
+    expect(reconcileCardStatement(statement, [ledger('old-date', '2026-02-12', 'ASAAS OFICINA CR', 9450)]).matches[0].status).toBe('CARD_MISSING')
   })
 
   it('aceita candidato único por valor, vencimento e Crédito_Bradesco mesmo com descrição humana diferente (PETZ)', () => {
@@ -410,6 +411,16 @@ describe('PDF de fatura do cartão', () => {
     statement.transactions = [{ ...statement.transactions[0], id: 'kindle-pdf', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', originalDescription: 'Amazon Kindle Unltd', description: 'Amazon Kindle Unltd', amount: 299, installment: null, totalInstallments: null }]
     const kindle = ledger('kindle-sheet', '2026-03-12', 'Assinatura Kindle unlimited (2 meses)', 299)
     expect(reconcileCardStatement(statement, [kindle]).matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: kindle })
+  })
+
+  it('classifica uma linha Kindle da planilha como EXPENSE e a concilia sem falso MISSING', () => {
+    const parsed = parseLedgerRows([{ Data: '12/03/2026', Descrição: 'Assinatura Kindle unlimited (2 meses)', Custo: '2,99', 'Forma de pagamento': 'Crédito_Bradesco', ID: '131b043e' }], { date: 'Data', description: 'Descrição', amount: 'Custo', paymentMethod: 'Forma de pagamento', id: 'ID' })
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-03-12'
+    statement.transactions = [{ ...statement.transactions[0], id: 'kindle-pdf', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', originalDescription: 'Amazon Kindle Unltd', description: 'Amazon Kindle Unltd', amount: 299, installment: null, totalInstallments: null }]
+    expect(parsed.transactions[0]).toMatchObject({ type: 'EXPENSE', paymentMethod: 'Crédito_Bradesco', amount: 299, date: '2026-03-12' })
+    expect(findExistingCostYearCandidates(statement, statement.transactions[0], parsed.transactions)).toEqual([parsed.transactions[0]])
+    expect(reconcileCardStatement(statement, parsed.transactions).matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: parsed.transactions[0] })
   })
 
   it('mantém EDZIA PIRES COBDE como candidata à parcela 1/4 apesar da descrição humana diferente', () => {
@@ -485,6 +496,43 @@ describe('PDF de fatura do cartão', () => {
     const afterGlobalAssignment = deriveCardPurchaseStatus(initiallyMatched, { consumedSheetIds: new Set([row.id]) })
     expect(afterGlobalAssignment).toMatchObject({ status: 'CARD_REVIEW', sheet: null, candidates: [row] })
     expect(afterGlobalAssignment.status).not.toBe('CARD_MISSING')
+  })
+
+  it('mantém a mensalidade do ciclo anterior em REVIEW, nunca como match forte', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-06-12'
+    statement.transactions = [{ ...statement.transactions[0], id: 'ifood-june', date: '2026-05-14', purchaseDate: '2026-05-14', invoiceDueDate: '2026-06-12', statementDueDate: '2026-06-12', amount: 795, originalDescription: 'IFD*iFood', description: 'IFD*iFood', installment: null, totalInstallments: null }]
+    const previousCycle = ledger('ifood-may-cycle', '2026-05-12', 'Mensalidade ifood', 795)
+    const result = reconcileCardStatement(statement, [previousCycle])
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_REVIEW', candidates: [previousCycle] })
+  })
+
+  it('não oferece mensalidades antigas como equivalentes à compra Selfit do ciclo atual', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-07-12'
+    statement.transactions = [{ ...statement.transactions[0], id: 'selfit-july', date: '2026-06-08', purchaseDate: '2026-06-08', invoiceDueDate: '2026-07-12', statementDueDate: '2026-07-12', amount: 12990, originalDescription: 'SELFITHOMEROCASTELOBRA', description: 'SELFITHOMEROCASTELOBRA', installment: null, totalInstallments: null }]
+    const oldMonths = [
+      ledger('selfit-may', '2026-05-12', 'Mensalidade Selfit', 12990),
+      ledger('selfit-april', '2026-04-12', 'Mensalidade Selfit', 12990),
+      ledger('selfit-march', '2026-03-12', 'Mensalidade Selfit', 12990),
+      ledger('selfit-february', '2026-02-01', 'Mensalidade Selfit', 12990),
+      ledger('selfit-january', '2026-01-01', 'Mensalidade Selfit', 12990),
+    ]
+    const result = reconcileCardStatement(statement, oldMonths)
+    expect(result.matches[0]).toMatchObject({ status: 'CARD_MISSING', candidates: [] })
+  })
+
+  it('rejeita os candidatos desta compra, mas permite uma nova linha correta posteriormente', () => {
+    const statement = parseCardStatementPages(syntheticPages)
+    statement.dueDate = '2026-06-12'
+    statement.transactions = [{ ...statement.transactions[0], id: 'ifood-review', date: '2026-05-14', purchaseDate: '2026-05-14', invoiceDueDate: '2026-06-12', statementDueDate: '2026-06-12', amount: 795, originalDescription: 'IFD*iFood', description: 'IFD*iFood', installment: null, totalInstallments: null }]
+    const rejected = ledger('ifood-wrong-cycle', '2026-05-12', 'Mensalidade ifood', 795)
+    const rejectedOnly = reconcileCardStatement(statement, [rejected], new Map(), new Map([[statement.transactions[0].id, new Set([rejected.id])]]))
+    expect(rejectedOnly.matches[0]).toMatchObject({ status: 'CARD_MISSING', candidates: [] })
+    const correct = ledger('ifood-correct-cycle', '2026-06-12', 'IFD iFood', 795)
+    const withNewCandidate = reconcileCardStatement(statement, [rejected, correct], new Map(), new Map([[statement.transactions[0].id, new Set([rejected.id])]]))
+    expect(withNewCandidate.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: correct })
+    expect(reconcileCardStatement(statement, [rejected, correct]).matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: correct })
   })
 
   it('permite resolver candidatos da compra e concilia o pagamento agregado 1:N sem criar outra despesa', () => {

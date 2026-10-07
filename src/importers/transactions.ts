@@ -1,5 +1,5 @@
-import type { BankTransaction, ColumnMap, LedgerTransaction, ParsedTransactions, RowIssue, TransactionType } from '../domain/types'
-import { investmentAction, normalizeAmount, normalizeDate, parseBoolean, transactionType } from './normalize'
+import type { BankTransaction, ColumnMap, ExcludedBankRow, LedgerTransaction, ParsedTransactions, RowIssue } from '../domain/types'
+import { classifySheetRecord, investmentAction, normalizeAmount, normalizeDate, parseBoolean, transactionType } from './normalize'
 import { stableFingerprint } from '../domain/identity'
 
 const cell = (row: Record<string, string>, key?: string) => key ? String(row[key] ?? '').trim() : ''
@@ -7,13 +7,6 @@ const installmentFrom = (description: string) => {
   const match = description.match(/\b(\d{1,2})\s*\/\s*(\d{1,2})\b/)
   return match ? { installment: Number(match[1]), totalInstallments: Number(match[2]) } : { installment: null, totalInstallments: null }
 }
-const sheetType = (description: string, payment: string): TransactionType => {
-  const type = transactionType(description, payment)
-  // CUSTOS ANO é uma tabela de despesas; só promovemos para fora dessa natureza
-  // quando há um sinal explícito, como a forma de pagamento Investimento.
-  return type === 'OTHER' ? 'EXPENSE' : type
-}
-
 export function parseLedgerRows(rows: Record<string, string>[], map: ColumnMap): ParsedTransactions<LedgerTransaction> {
   const transactions: LedgerTransaction[] = []
   const issues: RowIssue[] = []
@@ -41,7 +34,7 @@ export function parseLedgerRows(rows: Record<string, string>[], map: ColumnMap):
     transactions.push({
       id: `sheet-${stableFingerprint([sheetRecordId])}`, source: 'SHEET', sheetRecordId, bankTransactionId: null,
       date, description: originalDescription, originalDescription, amount, direction: 'DEBIT',
-      type: sheetType(originalDescription, paymentMethod), investmentAction: investmentAction(originalDescription), paymentMethod,
+      type: classifySheetRecord({ description: originalDescription, paymentMethod }), investmentAction: investmentAction(originalDescription), paymentMethod,
       category: cell(row, map.category), month: cell(row, map.month), year: cell(row, map.year),
       isFixed: parseBoolean(cell(row, map.isFixed)), isEssential: parseBoolean(cell(row, map.isEssential)),
       ...installment, balanceAfter: null, original,
@@ -50,10 +43,28 @@ export function parseLedgerRows(rows: Record<string, string>[], map: ColumnMap):
   return { transactions, issues, rowCount: rows.length, ignoredRows: 0 }
 }
 
-export function parseBankRows(rows: Record<string, string>[], map: ColumnMap): ParsedTransactions<BankTransaction> {
+export function parseBankRows(rows: Record<string, string>[], map: ColumnMap, physicalRowsBeforeHeader = 0, statementPeriod?: { start: string; end: string }): ParsedTransactions<BankTransaction> {
   const transactions: BankTransaction[] = []
   const issues: RowIssue[] = []
+  const excludedRows: ExcludedBankRow[] = []
   let ignoredRows = 0
+  const exclude = (row: Record<string, string>, index: number, reason: ExcludedBankRow['reason']) => {
+    ignoredRows += 1
+    const debitText = cell(row, map.debit), creditText = cell(row, map.credit)
+    const debit = debitText ? normalizeAmount(debitText) : null
+    const credit = creditText ? normalizeAmount(creditText) : null
+    const genericAmount = map.amount ? normalizeAmount(cell(row, map.amount)) : null
+    const excludedAmount = debitText || creditText ? debit ?? credit : genericAmount
+    excludedRows.push({
+      row: index + physicalRowsBeforeHeader + 2,
+      reason,
+      date: normalizeDate(cell(row, map.date)),
+      description: cell(row, map.description),
+      balanceAfter: map.balance ? normalizeSignedBalance(cell(row, map.balance)) : null,
+      amount: excludedAmount == null ? null : Math.abs(excludedAmount),
+      direction: debitText ? 'DEBIT' : creditText ? 'CREDIT' : null,
+    })
+  }
   rows.forEach((row, index) => {
     const date = normalizeDate(cell(row, map.date))
     const originalDescription = cell(row, map.description)
@@ -63,14 +74,15 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap): P
     const debit = debitPresent ? normalizeAmount(debitText) : null
     const credit = creditPresent ? normalizeAmount(creditText) : null
     const genericAmountText = cell(row, map.amount)
-    const rowNumber = index + 2
-    if (isRepeatedHeader(row, map)) { ignoredRows += 1; return }
-    if (!date && !originalDescription && !debitText && !creditText && !genericAmountText) { ignoredRows += 1; return }
-    if (splitColumns && !debitPresent && !creditPresent && !genericAmountText) { ignoredRows += 1; return }
-    if (!date && !debitPresent && !creditPresent && !genericAmountText) { ignoredRows += 1; return }
+    const rowNumber = index + physicalRowsBeforeHeader + 2
+    if (isRepeatedHeader(row, map)) { exclude(row, index, 'REPEATED_HEADER'); return }
+    if (!date && !originalDescription && !debitText && !creditText && !genericAmountText) { exclude(row, index, 'EMPTY'); return }
+    if (date && statementPeriod && (date < statementPeriod.start || date > statementPeriod.end)) { exclude(row, index, 'OUTSIDE_STATEMENT_PERIOD'); return }
+    if (splitColumns && !debitPresent && !creditPresent && !genericAmountText) { exclude(row, index, date && originalDescription ? 'NO_MOVEMENT' : 'FOOTER_OR_METADATA'); return }
+    if (!date && !debitPresent && !creditPresent && !genericAmountText) { exclude(row, index, 'EMPTY'); return }
     // Totais e outras linhas de rodapé podem preencher débito e crédito ao mesmo tempo,
     // mas sem data e histórico não representam uma transação individual.
-    if (!date && !originalDescription) { ignoredRows += 1; return }
+    if (!date && !originalDescription) { exclude(row, index, 'FOOTER_OR_METADATA'); return }
     if (!date || !originalDescription) {
       issues.push({ row: rowNumber, message: `Data ou descrição inválida em linha com valor (data: ${cell(row, map.date) || 'vazia'}; descrição: ${originalDescription || 'vazia'}).` })
       return
@@ -79,12 +91,13 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap): P
       issues.push({ row: rowNumber, message: 'Débito e crédito preenchidos na mesma linha; confira os valores antes de importar.' })
       return
     }
+    if (splitColumns && debitPresent && creditPresent && (debit ?? 0) === 0 && (credit ?? 0) === 0) { exclude(row, index, 'NO_MOVEMENT'); return }
     const rawAmount = splitColumns && (debitPresent || creditPresent)
       ? debitPresent ? debit : credit
       : normalizeAmount(genericAmountText)
     const amount = rawAmount == null ? null : Math.abs(rawAmount)
     if (amount == null) {
-      if (!date && !debitPresent && !creditPresent && !genericAmountText) { ignoredRows += 1; return }
+      if (!date && !debitPresent && !creditPresent && !genericAmountText) { exclude(row, index, 'FOOTER_OR_METADATA'); return }
       issues.push({ row: rowNumber, message: `Data, descrição ou valor inválido (data: ${cell(row, map.date) || 'vazia'}; valor: ${debitText || creditText || genericAmountText || 'vazio'}).` })
       return
     }
@@ -106,7 +119,7 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap): P
     const outOfScopeSubtype = /^rentab invest facilcred(?: |$)/.test(originalDescription.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()) ? 'INVEST_FACIL_YIELD' as const : undefined
     const installment = installmentFrom(originalDescription)
     transactions.push({
-      id: `bank-${index + 1}`, source: 'BANK', sheetRecordId: null,
+      id: `bank-${index + 1}`, sourceRow: rowNumber, source: 'BANK', sheetRecordId: null,
       bankTransactionId: cell(row, map.id) || '',
       date, description: originalDescription, originalDescription, amount, direction, directionKnown,
       type, investmentAction: investmentAction(originalDescription),
@@ -134,7 +147,7 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap): P
       transaction.id = `bank-${stableFingerprint([transaction.bankTransactionId])}`
     }
   }
-  return { transactions, issues, rowCount: rows.length, ignoredRows }
+  return { transactions, issues, rowCount: rows.length, ignoredRows, excludedRows }
 }
 
 function isRepeatedHeader(row: Record<string, string>, map: ColumnMap): boolean {

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { addDecisionTombstone, listDecisionTombstones, removeDecisionTombstone, syncGoogleSheetDecisions } from './googleSheetDecisions'
+import { addDecisionTombstone, listDecisionTombstones, readGoogleSheetDecisionsReadOnly, removeDecisionTombstone, syncGoogleSheetDecisions } from './googleSheetDecisions'
 import type { PersistedDecision } from '../domain/localDecisions'
 import { stableFingerprint } from '../domain/identity'
 
@@ -13,6 +13,17 @@ function remoteRow(value: PersistedDecision, status = 'ACTIVE') { return [stable
 
 describe('sincronização de decisões no Google Sheets', () => {
   beforeEach(() => { localStoreMocks.put.mockReset(); localStoreMocks.remove.mockReset() })
+  it('audita _CONCILIADOR estritamente em modo somente leitura', async () => {
+    const deleted = { ...decision, updatedAt: '2026-01-04T00:00:00.000Z' }
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(decision), remoteRow(deleted, 'DELETED')] }))
+    const result = await readGoogleSheetDecisionsReadOnly('spreadsheet-id-12345', 'token', fetcher)
+    expect(result).toMatchObject({ exists: true, active: [decision], tombstones: [deleted] })
+    expect(fetcher.mock.calls.every(([, init]) => !init?.method || init.method === 'GET')).toBe(true)
+    expect(localStoreMocks.put).not.toHaveBeenCalled()
+    expect(localStoreMocks.remove).not.toHaveBeenCalled()
+  })
   it('cria somente _CONCILIADOR, grava o esquema e faz upsert local sem escrever em CUSTOS ANO', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO', sheetId: 1 } }] }))
@@ -51,6 +62,16 @@ describe('sincronização de decisões no Google Sheets', () => {
     expect(result).toEqual([added])
     expect(localStoreMocks.put).toHaveBeenCalledWith(added)
     expect(fetcher.mock.calls.slice(2).every(([url]) => decodeURIComponent(String(url)).includes('_CONCILIADOR'))).toBe(true)
+  })
+
+  it('restaura entre dispositivos a rejeição dos candidatos atuais de uma compra PDF', async () => {
+    const rejected: PersistedDecision = { key: 'CARD_REVIEW_REJECTED_CANDIDATES:["card:purchase"]', schemaVersion: 1, kind: 'CARD_REVIEW_REJECTED_CANDIDATES', identities: ['card:purchase'], selected: ['sheet:old-cycle'], updatedAt: '2026-01-04T00:00:00.000Z' }
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(rejected)] }))
+    const result = await syncGoogleSheetDecisions('spreadsheet-id-12345', 'token', [], {}, fetcher)
+    expect(result).toEqual([rejected])
+    expect(localStoreMocks.put).toHaveBeenCalledWith(rejected)
   })
 
   it('envia decisão local mais recente para a linha existente', async () => {

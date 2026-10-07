@@ -77,7 +77,7 @@ function toRow(decision: PersistedDecision, status: 'ACTIVE' | 'DELETED' = 'ACTI
 
 function fromRow(row: unknown[]): DecisionRow | null {
   const [decisionId, kind, subjectFingerprint, statusValue, relatedIds, metadata, createdAtValue, updatedAt, version] = row
-  const validKinds: DecisionKind[] = ['PAIR_CONFIRMED', 'PAIR_REJECTED', 'BANK_IGNORED', 'SHEET_IGNORED', 'COMPOSITION_CONFIRMED', 'STATEMENT_MATCH_CONFIRMED', 'CARD_MISSING_CONFIRMED', 'CARD_PURCHASE_IGNORED', 'MISSING_ADDED_TO_SHEET']
+  const validKinds: DecisionKind[] = ['PAIR_CONFIRMED', 'PAIR_REJECTED', 'BANK_IGNORED', 'SHEET_IGNORED', 'COMPOSITION_CONFIRMED', 'STATEMENT_MATCH_CONFIRMED', 'CARD_MISSING_CONFIRMED', 'CARD_PURCHASE_IGNORED', 'CARD_REVIEW_REJECTED_CANDIDATES', 'MISSING_ADDED_TO_SHEET']
   if (typeof decisionId !== 'string' || typeof kind !== 'string' || !validKinds.includes(kind as DecisionKind)) return null
   if (Number(version) !== 1 || (statusValue !== 'ACTIVE' && statusValue !== DELETED_STATUS)) return null
   try {
@@ -90,6 +90,27 @@ function fromRow(row: unknown[]): DecisionRow | null {
     const createdAt = typeof createdAtValue === 'string' && !Number.isNaN(Date.parse(createdAtValue)) ? createdAtValue : stamp
     return { status: statusValue === DELETED_STATUS ? 'DELETED' : 'ACTIVE', createdAt, decision: { key, kind: kind as DecisionKind, identities, selected: parsedMetadata.selected as string[], updatedAt: stamp, schemaVersion: 1 } }
   } catch { return null }
+}
+
+export type ReadOnlyGoogleDecisions = { exists: boolean; active: PersistedDecision[]; tombstones: PersistedDecision[] }
+
+/** Read-only audit access. Unlike syncGoogleSheetDecisions this never creates a tab, writes rows, or updates IndexedDB. */
+export async function readGoogleSheetDecisionsReadOnly(id: string, token: string, fetcher: typeof fetch = fetch): Promise<ReadOnlyGoogleDecisions> {
+  const base = spreadsheetBase(id)
+  const metadata = await api(`${base}?fields=${encodeURIComponent('sheets.properties(sheetId,title)')}`, token, {}, fetcher)
+  const sheets = metadata.sheets as { properties?: { title?: string } }[] | undefined
+  if (!sheets?.some((sheet) => sheet.properties?.title === 'CUSTOS ANO')) throw new Error('A aba CUSTOS ANO não foi encontrada; a auditoria não modificou a planilha.')
+  if (!sheets?.some((sheet) => sheet.properties?.title === GOOGLE_DECISIONS_TAB)) return { exists: false, active: [], tombstones: [] }
+  const valuesUrl = `${base}/values/${rangePath(`'${GOOGLE_DECISIONS_TAB}'!A:I`)}?valueRenderOption=UNFORMATTED_VALUE&majorDimension=ROWS`
+  const values = await api(valuesUrl, token, {}, fetcher)
+  const rows = (values.values as unknown[][] | undefined) ?? []
+  if (!rows.length) return { exists: true, active: [], tombstones: [] }
+  const headers = rows[0].map((value) => String(value ?? ''))
+  if (GOOGLE_DECISIONS_HEADERS.some((header, index) => headers[index] !== header)) throw new Error(`A aba ${GOOGLE_DECISIONS_TAB} tem cabeçalhos incompatíveis; a auditoria não modificou dados.`)
+  const parsed = rows.slice(1).filter((row) => row.some((value) => value !== '' && value != null)).map(fromRow)
+  if (parsed.some((item) => item == null)) throw new Error(`Há decisão inválida em ${GOOGLE_DECISIONS_TAB}; a auditoria não modificou dados.`)
+  const records = parsed as DecisionRow[]
+  return { exists: true, active: records.filter((item) => item.status === 'ACTIVE').map((item) => item.decision), tombstones: records.filter((item) => item.status === 'DELETED').map((item) => item.decision) }
 }
 
 async function upsertRows(id: string, token: string, decisions: { decision: PersistedDecision; status: 'ACTIVE' | 'DELETED' }[], existingRows: unknown[][], fetcher: typeof fetch) {

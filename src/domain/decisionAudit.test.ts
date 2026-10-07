@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { BankTransaction, CardStatement, LedgerTransaction } from './types'
 import type { PersistedDecision } from './localDecisions'
 import { auditPersistedDecision } from './decisionAudit'
-import { bankIdentity, cardTransactionIdentity, sheetIdentity } from './identity'
+import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, sheetIdentity } from './identity'
 import { reconcileCardStatement } from '../importers/cardStatement'
 
 function sheet(overrides: Partial<LedgerTransaction> = {}): LedgerTransaction {
@@ -49,5 +49,28 @@ describe('auditoria resiliente das decisões vinculadas à CUSTOS ANO', () => {
     const bank: BankTransaction = { id: 'bank-1', source: 'BANK', sheetRecordId: null, bankTransactionId: 'bank-1', date: '2026-01-08', description: 'PIX ENVIADO MERCADO', originalDescription: 'PIX ENVIADO MERCADO', amount: 4500, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: 'Pix', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
     const record = decision('MISSING_ADDED_TO_SHEET', [bankIdentity(bank)], ['sheet:deleted-row'])
     expect(auditPersistedDecision(record, { banks: [bank], sheets: [], statements: [] }).status).toBe('ORPHANED')
+  })
+
+  it('mantém a rejeição de candidatos enquanto não surgir outra linha plausível', () => {
+    const stmt = cardStatement()
+    const rejected = sheet({ id: 'old-cycle', sheetRecordId: 'old-cycle', date: '2026-02-02' })
+    const record = decision('CARD_REVIEW_REJECTED_CANDIDATES', [cardTransactionIdentity(stmt, stmt.transactions[0])], [cardReviewCandidateIdentity(rejected)])
+    expect(auditPersistedDecision(record, { banks: [], sheets: [rejected], statements: [{ statement: stmt }] }).status).toBe('VALID')
+  })
+
+  it('marca rejeição como obsoleta quando a CUSTOS ANO recebe novo candidato plausível', () => {
+    const stmt = cardStatement()
+    const rejected = sheet({ id: 'old-cycle', sheetRecordId: 'old-cycle', date: '2026-02-02' })
+    const current = sheet()
+    const record = decision('CARD_REVIEW_REJECTED_CANDIDATES', [cardTransactionIdentity(stmt, stmt.transactions[0])], [cardReviewCandidateIdentity(rejected)])
+    expect(auditPersistedDecision(record, { banks: [], sheets: [rejected, current], statements: [{ statement: stmt }] }).status).toBe('STALE')
+  })
+
+  it('revalida a rejeição quando a mesma linha muda de dados mantendo o ID', () => {
+    const stmt = cardStatement()
+    const reviewed = sheet({ id: 'same-row', sheetRecordId: 'same-row', date: '2026-02-02' })
+    const edited = sheet({ id: 'same-row', sheetRecordId: 'same-row', date: '2026-03-12' })
+    const record = decision('CARD_REVIEW_REJECTED_CANDIDATES', [cardTransactionIdentity(stmt, stmt.transactions[0])], [cardReviewCandidateIdentity(reviewed)])
+    expect(auditPersistedDecision(record, { banks: [], sheets: [edited], statements: [{ statement: stmt }] }).status).toBe('STALE')
   })
 })

@@ -361,10 +361,16 @@ export function findExistingCostYearCandidates(statement: CardStatement, transac
   const nonInstallmentCandidate = (item: LedgerTransaction) => {
     if (isInstallment || item.amount !== transaction.amount) return false
     if (invoiceDueDate && item.date === invoiceDueDate) return true
-    const similarity = descriptionSimilarity(transaction.originalDescription, item.originalDescription)
-    return similarity >= 0.35 && (dayDistance(item.date, purchaseDate) <= 7 || similarity >= 0.72)
+    // Historical sheets may use the purchase date. Keep nearby rows reviewable,
+    // but never let a recurring merchant name pull in arbitrary older cycles.
+    return dayDistance(item.date, purchaseDate) <= 7
   }
-  return eligible.filter(isInstallment ? installmentCandidate : nonInstallmentCandidate).sort((a, b) => isInstallment
+  const candidates = eligible.filter(isInstallment ? installmentCandidate : nonInstallmentCandidate)
+  if (!isInstallment && invoiceDueDate) {
+    const invoiceCycleCandidates = candidates.filter((item) => item.date === invoiceDueDate)
+    if (invoiceCycleCandidates.length) return invoiceCycleCandidates
+  }
+  return candidates.sort((a, b) => isInstallment
     ? installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(b)?.description ?? b.originalDescription) - installmentDescriptionSimilarity(transaction.originalDescription, installmentInfo(a)?.description ?? a.originalDescription)
       || Number(hasInstallmentSequence(b, eligible)) - Number(hasInstallmentSequence(a, eligible))
     : Number(b.date === invoiceDueDate) - Number(a.date === invoiceDueDate)
@@ -372,7 +378,35 @@ export function findExistingCostYearCandidates(statement: CardStatement, transac
       || descriptionSimilarity(transaction.originalDescription, b.originalDescription) - descriptionSimilarity(transaction.originalDescription, a.originalDescription))
 }
 
-export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTransaction[], confirmedMatches: Map<string, string> = new Map()): CardStatementReconciliation {
+/** Explains the exact shared candidate-search gate for the consistency auditor. */
+export function explainCostYearCandidateRejection(statement: CardStatement, transaction: CardStatementTransaction, row: LedgerTransaction, rows: LedgerTransaction[]): string | null {
+  if (transaction.type !== 'PURCHASE') return 'a movimentação do PDF não está classificada como compra'
+  if (transaction.financialStatus === 'REFUNDED') return 'compra integralmente estornada; excluída da conciliação de ausentes'
+  if (row.direction !== 'DEBIT') return `direção ${row.direction}; compra de cartão exige saída (DEBIT)`
+  if (normalizeDescription(row.paymentMethod) !== 'credito bradesco') return `Forma de pagamento “${row.paymentMethod || 'não informada'}”; exige Crédito_Bradesco`
+  if (['INVESTMENT', 'INVESTMENT_INCOME', 'INCOME', 'TRANSFER', 'CARD_PAYMENT'].includes(row.type)) return `natureza ${row.type}; excluída do conjunto de compras`
+  if (row.amount !== transaction.amount) return `valor diferente: planilha ${row.amount} centavos, PDF ${transaction.amount} centavos`
+
+  const isInstallment = transaction.installment != null && transaction.totalInstallments != null
+  const invoiceDueDate = transaction.invoiceDueDate ?? transaction.statementDueDate ?? statement.dueDate
+  const purchaseDate = transaction.purchaseDate || transaction.date
+  if (isInstallment) {
+    const info = installmentInfo(row)
+    if (!info) return 'linha da planilha não contém parcela N/TOTAL reconhecível'
+    if (info.installment !== transaction.installment || info.total !== transaction.totalInstallments) return `parcela incompatível: planilha ${info.installment}/${info.total}, PDF ${transaction.installment}/${transaction.totalInstallments}`
+    if (invoiceDueDate && row.date === invoiceDueDate) return null
+    const similarity = installmentDescriptionSimilarity(transaction.originalDescription, info.description)
+    if (similarity >= 0.35) return null
+    if (hasInstallmentSequence(row, rows)) return null
+    return `parcela corresponde, mas não há vencimento igual (${invoiceDueDate ?? 'não informado'}), descrição-base suficiente (similaridade ${similarity.toFixed(2)}; mínimo 0,35) nem sequência mensal coerente`
+  }
+  if (invoiceDueDate && row.date === invoiceDueDate) return null
+  const days = dayDistance(row.date, purchaseDate)
+  if (days <= 7) return null
+  return `data fora da tolerância: planilha ${row.date}, vencimento ${invoiceDueDate ?? 'não informado'}, compra ${purchaseDate}; distância de ${days} dias (máximo 7 dias da compra histórica)`
+}
+
+export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTransaction[], confirmedMatches: Map<string, string> = new Map(), rejectedCandidates: Map<string, ReadonlySet<string>> = new Map()): CardStatementReconciliation {
   const purchases = statement.transactions.filter((transaction) => transaction.type === 'PURCHASE' && transaction.financialStatus !== 'REFUNDED')
   // Google Sheets descriptions are user-authored and may not have been classified
   // as EXPENSE by the bank-oriented classifier. Keep the payment method as the
@@ -381,7 +415,10 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
   const isInstallment = (transaction: CardStatementTransaction) => transaction.installment != null && transaction.totalInstallments != null
   const invoiceDueDate = (transaction: CardStatementTransaction) => transaction.invoiceDueDate ?? transaction.statementDueDate ?? statement.dueDate
   const purchaseDate = (transaction: CardStatementTransaction) => transaction.purchaseDate || transaction.date
-  const candidateSearch = (transaction: CardStatementTransaction, rows: LedgerTransaction[]) => findExistingCostYearCandidates(statement, transaction, rows)
+  const candidateSearch = (transaction: CardStatementTransaction, rows: LedgerTransaction[]) => {
+    const rejected = rejectedCandidates.get(transaction.id)
+    return findExistingCostYearCandidates(statement, transaction, rows).filter((row) => !rejected?.has(row.id))
+  }
   const confirmedSheetIds = new Set<string>()
   const validConfirmed = new Map<string, LedgerTransaction>()
   for (const transaction of purchases) {
@@ -444,13 +481,24 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
       : { transaction, status: 'CARD_REVIEW', sheet: null, candidates: sorted, evidence }
     const dueDateMatch = Boolean(invoiceDueDate(transaction) && sorted[0].date === invoiceDueDate(transaction))
     if (unique && dueDateMatch) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
-    if (unique && dayDistance(sorted[0].date, purchaseDate(transaction)) <= 3 && descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
+    const dueDate = invoiceDueDate(transaction)
+    const dateMatchesPurchase = sorted[0].date === purchaseDate(transaction)
+      || dayDistance(sorted[0].date, purchaseDate(transaction)) <= 3
+        && !(dueDate && isPreviousInvoiceCycleDate(sorted[0].date, dueDate))
+    if (unique && dateMatchesPurchase && descriptionSimilarity(transaction.originalDescription, sorted[0].originalDescription) >= 0.35) return { transaction, status: 'CARD_MATCHED', sheet: sorted[0], candidates: sorted, evidence }
     return { transaction, status: 'CARD_REVIEW', sheet: null, candidates: sorted }
   })
   const matchedSheetIds = new Set(matches.flatMap((match) => match.status === 'CARD_MATCHED' && match.sheet ? [match.sheet.id] : match.status === 'CARD_GROUP_MATCHED' ? match.candidates.map((item) => item.id) : []))
   const matchedSheetTotal = eligible.filter((item) => matchedSheetIds.has(item.id)).reduce((sum, item) => sum + item.amount, 0)
   const statementTotal = purchases.reduce((sum, transaction) => sum + transaction.amount, 0)
   return { matches, eligibleSheetTotal: matchedSheetTotal, statementTotal, difference: statementTotal - matchedSheetTotal }
+}
+
+function isPreviousInvoiceCycleDate(sheetDate: string, invoiceDueDate: string): boolean {
+  const sheetMonth = Number(sheetDate.slice(0, 4)) * 12 + Number(sheetDate.slice(5, 7))
+  const dueMonth = Number(invoiceDueDate.slice(0, 4)) * 12 + Number(invoiceDueDate.slice(5, 7))
+  const dayDifference = Math.abs(Number(sheetDate.slice(8, 10)) - Number(invoiceDueDate.slice(8, 10)))
+  return dueMonth - sheetMonth === 1 && dayDifference <= 3
 }
 
 /** Apply persisted ignore/global-consumption state after candidate assignment. */

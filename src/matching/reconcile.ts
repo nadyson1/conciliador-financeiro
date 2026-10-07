@@ -1,5 +1,6 @@
 import type { BankTransaction, CardCompositionOption, DuplicateGroup, LedgerTransaction, MatchCandidate, ReconciliationItem, ReconciliationResult } from '../domain/types'
 import { descriptionSimilarity, normalizeDescription } from '../importers/normalize'
+import { auditBankBalance } from '../domain/bankBalanceAudit'
 
 export const MATCHING_CONFIG = {
   points: { amount: 50, date: [25, 20, 15, 8], description: [25, 20, 12, 5], paymentMethod: 5 },
@@ -270,18 +271,12 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
   const reviewSheetIds = new Set(items.filter((item) => item.status === 'REVIEW' && item.sheet).map((item) => item.sheet!.id))
   const duplicateSheetIds = new Set(duplicateGroups.filter((group) => group.source === 'SHEET').flatMap((group) => group.transactionIds))
   const unmatchedSheet = sheets.filter((sheet) => sheet.type === 'EXPENSE' && !matchedSheetIds.has(sheet.id) && !reviewSheetIds.has(sheet.id) && !duplicateSheetIds.has(sheet.id))
-  const balanceTransactions = banks.filter((bank) => bank.balanceAfter != null).sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id))
-  let initialBalance: number | null = null, finalBalance: number | null = null, calculatedFinalBalance: number | null = null
-  if (balanceTransactions.length) {
-    const first = balanceTransactions[0], last = balanceTransactions[balanceTransactions.length - 1]
-    initialBalance = first.balanceAfter! - (first.direction === 'CREDIT' ? first.amount : -first.amount); finalBalance = last.balanceAfter
-    const net = banks.reduce((total, bank) => total + (bank.direction === 'CREDIT' ? bank.amount : -bank.amount), 0)
-    calculatedFinalBalance = initialBalance + net
-  }
+  const balanceAudit = auditBankBalance(banks)
   return { items, unmatchedSheet, duplicateGroups, totals: {
     bankDebit: banks.filter((bank) => bank.direction === 'DEBIT').reduce((sum, bank) => sum + bank.amount, 0),
     bankCredit: banks.filter((bank) => bank.direction === 'CREDIT').reduce((sum, bank) => sum + bank.amount, 0), sheetTotal: sheets.reduce((sum, sheet) => sum + sheet.amount, 0),
-    initialBalance, finalBalance, calculatedFinalBalance, balanceDifference: finalBalance != null && calculatedFinalBalance != null ? finalBalance - calculatedFinalBalance : null,
+    initialBalance: balanceAudit.initialBalance, finalBalance: balanceAudit.reportedBalance,
+    calculatedFinalBalance: balanceAudit.calculatedBalance, balanceDifference: balanceAudit.difference,
   } }
 }
 
