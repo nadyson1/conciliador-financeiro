@@ -3,7 +3,7 @@ import type { ChangeEvent, ReactNode } from 'react'
 import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, ColumnMap, CsvDocument, ExcludedBankRow, LedgerTransaction, ReconciliationItem, Transaction } from './domain/types'
 import { readCsvFile, initialColumnMap } from './importers/csv'
 import { parseBankRows, parseLedgerRows } from './importers/transactions'
-import { deriveCardPurchaseStatus, findExistingCostYearCandidates, identifyStatementPayments, readCardStatementPdf, reconcileCardStatement } from './importers/cardStatement'
+import { cardStatementFinancialIdentity, deriveCardPurchaseStatus, findExistingCostYearCandidates, identifyStatementPayments, readCardStatementPdf, reconcileCardStatement } from './importers/cardStatement'
 import { normalizeDate } from './importers/normalize'
 import { canonicalCompositionKey, findPlausibleLedgerCandidates, pairKey, reconcile } from './matching/reconcile'
 import { exportCardPayments, exportDuplicates, exportMissing, exportOutOfScope, exportReviews, exportSummary } from './features/export'
@@ -16,6 +16,8 @@ import { clearPersistedDecisions, decisionKey, deletePersistedDecision, listPers
 import type { DecisionKind, PersistedDecision } from './domain/localDecisions'
 import { GoogleSheetsPanel } from './components/GoogleSheetsPanel'
 import type { GoogleSheetsConnectionInfo } from './components/GoogleSheetsPanel'
+import { GoogleDrivePanel } from './components/GoogleDrivePanel'
+import type { DriveSyncSummary } from './components/GoogleDrivePanel'
 import { PwaUpdateNotice } from './components/PwaUpdateNotice'
 import { AddCostYearDialog } from './components/AddCostYearDialog'
 import { BankCsvUploadCard, bankCsvRequiresManualMapping } from './components/BankCsvUploadCard'
@@ -27,12 +29,16 @@ import { GoogleSheetsError, appendCostYearRecord, readGoogleSheetLedger, request
 import { addDecisionTombstone, listDecisionTombstones, readGoogleSheetDecisionsReadOnly, removeDecisionTombstone, syncGoogleSheetDecisions, syncOneGoogleSheetDecision, syncOneGoogleSheetDeletion } from './integrations/googleSheetDecisions'
 import { forgetGoogleSheetLink, GOOGLE_SHEET_TAB_NAME, loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import type { SavedGoogleSheetLink } from './integrations/googleSheetLinkStorage'
+import { downloadGoogleDriveFile, isSupportedDriveFile, listGoogleDriveFolder, selectGoogleDriveFolder, GoogleDriveError } from './integrations/googleDrive'
+import { mergeDriveBankSources } from './integrations/googleDriveMerge'
+import { isDriveFileUnchanged, loadDriveFileIndex, loadDriveFolders, loadDriveLastSync, saveDriveFileIndex, saveDriveFolders, saveDriveLastSync } from './integrations/googleDriveStorage'
+import type { DriveFileIndexEntry, DriveFolderKind, SavedDriveFolders } from './integrations/googleDriveStorage'
 
 type Mode = 'sheet' | 'bank'
 type SourceStatus = 'EMPTY' | 'LOADED' | 'VALIDATED' | 'ACCEPTED'
 type Dataset = { sheet: LedgerTransaction[]; bank: BankTransaction[] }
 type UploadState = { fileName: string; csv: CsvDocument; map: ColumnMap; valid: Transaction[]; issues: { row: number; message: string }[]; rowCount: number; ignoredRows: number; excludedRows: ExcludedBankRow[]; auxiliaryTransactionCount: number } | null
-type CardPdfEntry = { key: string; fingerprint: string; fileName: string; status: 'PROCESSING' | 'PROCESSED' | 'DIVERGENCE' | 'ERROR'; statement: CardStatement | null; legacyStatementIdentity?: string; error?: string }
+type CardPdfEntry = { key: string; fingerprint: string; fileName: string; status: 'PROCESSING' | 'PROCESSED' | 'DIVERGENCE' | 'ERROR'; statement: CardStatement | null; legacyStatementIdentity?: string; error?: string; source?: 'MANUAL' | 'DRIVE'; driveFileId?: string }
 type MissingWriteTarget = { kind: 'BANK'; bank: BankTransaction } | { kind: 'STATEMENT'; statement: CardStatement; transaction: CardStatementTransaction }
 const emptyData: Dataset = { sheet: [], bank: [] }
 const currency = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' })
@@ -92,8 +98,26 @@ export default function App() {
   const [googleError, setGoogleError] = useState('')
   const [googleDecisionStatus, setGoogleDecisionStatus] = useState('')
   const googleAccessToken = useRef('')
+  const googleAccessHasDrive = useRef(false)
   const googleAutoReadAttempted = useRef(false)
   const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID ?? ''
+  const googleDriveApiKey = import.meta.env.VITE_GOOGLE_API_KEY ?? ''
+  const googleDriveProjectNumber = import.meta.env.VITE_GOOGLE_PROJECT_NUMBER ?? ''
+  const [driveFolders, setDriveFolders] = useState<SavedDriveFolders>(loadDriveFolders)
+  const driveFoldersRef = useRef(driveFolders)
+  const driveFileIndexRef = useRef<Record<string, DriveFileIndexEntry>>(loadDriveFileIndex())
+  const [driveLastSync, setDriveLastSync] = useState<string | null>(loadDriveLastSync)
+  const [driveSyncSummary, setDriveSyncSummary] = useState<DriveSyncSummary | null>(null)
+  const [driveSyncProgress, setDriveSyncProgress] = useState('')
+  const [driveSyncError, setDriveSyncError] = useState('')
+  const [driveSyncBusy, setDriveSyncBusy] = useState(false)
+  const [driveConnected, setDriveConnected] = useState(false)
+  const [driveStatementFiles, setDriveStatementFiles] = useState<{ id: string; name: string }[]>([])
+  const suppressedDriveFileIds = useRef(new Set<string>())
+  const driveProcessedInSession = useRef(new Map<string, string>())
+  const drivePdfSemanticIdentities = useRef(new Map<string, string>())
+  const manualBankTransactions = useRef<BankTransaction[]>([])
+  const driveBankFiles = useRef<Record<string, BankTransaction[]>>({})
   const [cardPdfs, setCardPdfs] = useState<CardPdfEntry[]>([])
   const [cardReviewOverrides, setCardReviewOverrides] = useState<Record<string, LedgerTransaction[]>>({})
   const [statementOnlyIssues, setStatementOnlyIssues] = useState(false)
@@ -110,6 +134,8 @@ export default function App() {
   const [auditFocusStatementIdentity, setAuditFocusStatementIdentity] = useState('')
   const staleMissingDecisionCleanup = useRef(new Set<string>())
   const seenPdfFingerprints = useRef(new Set<string>())
+  const seenSemanticPdfFingerprints = useRef(new Map<string, 'MOBILE_APP' | 'INTERNET_BANKING'>())
+  const seenSemanticPdfOrigins = useRef(new Map<string, Set<'MANUAL' | 'DRIVE'>>())
   const pdfSessionGeneration = useRef(0)
   const [cardPdfNotice, setCardPdfNotice] = useState('')
   const [savedDecisions, setSavedDecisions] = useState<PersistedDecision[]>([])
@@ -292,6 +318,178 @@ export default function App() {
     if (googleAccessToken.current && googleSheetLink?.spreadsheetId) await synchronizeSavedDecisions(googleSheetLink.spreadsheetId, googleAccessToken.current)
   }
 
+  function updateDriveIndex(next: Record<string, DriveFileIndexEntry>) {
+    driveFileIndexRef.current = next
+    try { saveDriveFileIndex(next) } catch { setDriveSyncError('Arquivos processados nesta sessão, mas não foi possível salvar o índice local.') }
+  }
+
+  function updateDriveFolders(next: SavedDriveFolders) {
+    driveFoldersRef.current = next
+    setDriveFolders(next)
+    try { saveDriveFolders(next) } catch { setDriveSyncError('A pasta foi selecionada, mas não foi possível salvar a configuração neste dispositivo.') }
+  }
+
+  function markGoogleDriveDisconnected() {
+    googleAccessToken.current = ''
+    googleAccessHasDrive.current = false
+    setDriveConnected(false)
+    setGoogleSheetInfo((current) => current ? { ...current, connected: false } : current)
+  }
+
+  async function syncDriveFiles(accessToken = googleAccessToken.current) {
+    const folders = driveFoldersRef.current
+    if (!folders.invoices && !folders.statements) return
+    if (!accessToken) { setDriveSyncError('Reconecte o Google para acessar as pastas do Drive.'); return }
+    setDriveSyncBusy(true); setDriveSyncError(''); setDriveSyncProgress('Consultando as pastas…')
+    let invoices: Awaited<ReturnType<typeof listGoogleDriveFolder>> = []
+    let statements: Awaited<ReturnType<typeof listGoogleDriveFolder>> = []
+    let errors = 0, alreadyKnown = 0, newProcessed = 0
+    const listed = new Map<DriveFolderKind, Set<string>>()
+    const nextIndex = { ...driveFileIndexRef.current }
+    const folderErrors: string[] = []
+    try {
+      for (const [kind, folder] of [['invoices', folders.invoices], ['statements', folders.statements]] as const) {
+        if (!folder) continue
+        try {
+          const files = await listGoogleDriveFolder(folder.id, accessToken)
+          const supported = files.filter((file) => isSupportedDriveFile(file, kind))
+          listed.set(kind, new Set(supported.map((file) => file.id)))
+          if (kind === 'invoices') invoices = supported
+          else statements = supported
+        } catch (error) {
+          if (error instanceof GoogleDriveError && error.code === 'AUTH') markGoogleDriveDisconnected()
+          folderErrors.push(`${kind === 'invoices' ? 'Faturas' : 'Extratos'}: ${error instanceof Error ? error.message : 'falha ao listar a pasta.'}`); errors += 1
+        }
+      }
+      const tasks = [
+        ...invoices.map((file) => ({ file, kind: 'invoices' as const, folderId: folders.invoices!.id })),
+        ...statements.map((file) => ({ file, kind: 'statements' as const, folderId: folders.statements!.id })),
+      ]
+      let invoiceProgress = 0, statementProgress = 0
+      for (const { file, kind, folderId } of tasks) {
+        const currentKind = kind === 'invoices' ? `Processando faturas ${++invoiceProgress} de ${invoices.length}` : `Processando extratos ${++statementProgress} de ${statements.length}`
+        setDriveSyncProgress(`${currentKind}: ${file.name}`)
+        if (suppressedDriveFileIds.current.has(file.id)) { alreadyKnown += 1; continue }
+        const previous = nextIndex[file.id]
+        const modifiedTime = file.modifiedTime ?? ''
+        if (isDriveFileUnchanged(file, previous, driveProcessedInSession.current.get(file.id), kind, folderId)) {
+          alreadyKnown += 1
+          continue
+        }
+        try {
+          if (file.capabilities?.canDownload === false) throw new GoogleDriveError(`O arquivo “${file.name}” não permite download pela conta Google atual.`, 'DOWNLOAD')
+          if (kind === 'invoices') {
+            const old = cardPdfs.find((entry) => entry.driveFileId === file.id)
+            if (old) removeCardPdf(old.key, false)
+          }
+          const blob = await downloadGoogleDriveFile(file.id, accessToken)
+          const localFile = new File([blob], file.name, { type: file.mimeType || (kind === 'invoices' ? 'application/pdf' : 'text/csv'), lastModified: file.modifiedTime ? Date.parse(file.modifiedTime) : Date.now() })
+          let fileHadError = false
+          if (kind === 'invoices') {
+            const outcome = await processCardPdfFiles([{ file: localFile, driveFileId: file.id }], 'DRIVE')
+            const financialIdentity = outcome?.semanticIdentities[0]
+            if (financialIdentity) drivePdfSemanticIdentities.current.set(file.id, financialIdentity)
+            fileHadError = !outcome || outcome.errors > 0 || (outcome.processed === 0 && outcome.duplicates === 0)
+          } else {
+            const csv = await readCsvFile(localFile)
+            const map = initialColumnMap(csv.headers, 'bank') as ColumnMap
+            const period = csv.statementPeriodStart && csv.statementPeriodEnd ? { start: csv.statementPeriodStart, end: csv.statementPeriodEnd } : undefined
+            const parsed = parseBankRows(csv.rows, map, csv.metadataRowsIgnored, period)
+            const auxiliaryTransactions = parseBankRows(csv.auxiliaryRows, map).transactions
+            if (bankCsvRequiresManualMapping({ fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, auxiliaryTransactionCount: auxiliaryTransactions.length })) {
+              throw new Error('O formato precisa de configuração manual de colunas. Importe este CSV pelo seletor local para revisar o mapeamento.')
+            }
+            if (!parsed.transactions.length) throw new Error('Nenhuma movimentação válida foi encontrada no CSV.')
+            driveBankFiles.current = { ...driveBankFiles.current, [file.id]: parsed.transactions }
+            setDriveStatementFiles((currentFiles) => [...currentFiles.filter((item) => item.id !== file.id), { id: file.id, name: file.name }])
+            const merged = mergeDriveBankSources(manualBankTransactions.current, driveBankFiles.current)
+            setData((currentData) => ({ ...currentData, bank: merged }))
+            setSourceStatus((currentStatus) => ({ ...currentStatus, bank: 'ACCEPTED' }))
+            fileHadError = csv.parseErrors.length > 0 || parsed.issues.length > 0
+          }
+          if (fileHadError) errors += 1
+          else { newProcessed += 1; driveProcessedInSession.current.set(file.id, modifiedTime) }
+          nextIndex[file.id] = { driveFileId: file.id, modifiedTime, size: file.size ?? null, mimeType: file.mimeType, kind, folderId, processingStatus: fileHadError ? 'ERROR' : 'PROCESSED' }
+          updateDriveIndex({ ...nextIndex })
+        } catch (error) {
+          if (error instanceof GoogleDriveError && error.code === 'AUTH') markGoogleDriveDisconnected()
+          errors += 1
+          nextIndex[file.id] = { driveFileId: file.id, modifiedTime, size: file.size ?? null, mimeType: file.mimeType, kind, folderId, processingStatus: 'ERROR' }
+          updateDriveIndex({ ...nextIndex })
+          setDriveSyncError((currentError) => [currentError, `${file.name}: ${error instanceof Error ? error.message : 'não foi possível processar o arquivo.'}`].filter(Boolean).join(' '))
+        }
+      }
+      const removedFromFolders = Object.values(nextIndex).filter((entry) => {
+        const folder = folders[entry.kind]
+        const currentlyListed = listed.get(entry.kind)
+        return folder != null && entry.folderId === folder.id && currentlyListed != null && !currentlyListed.has(entry.driveFileId)
+      }).length
+      const timestamp = new Date().toISOString()
+      setDriveLastSync(timestamp)
+      try { saveDriveLastSync(timestamp) } catch { /* Timestamp is an optional local convenience. */ }
+      setDriveSyncSummary({ invoicesFound: invoices.length, statementsFound: statements.length, alreadyKnown, newProcessed, errors, removedFromFolders })
+      setDriveSyncProgress('')
+      if (folderErrors.length) setDriveSyncError((currentError) => [currentError, ...folderErrors].filter(Boolean).join(' '))
+    } finally { setDriveSyncBusy(false); setDriveSyncProgress('') }
+  }
+
+  async function selectDriveFolder(kind: DriveFolderKind) {
+    setDriveSyncError('')
+    try {
+      if (!googleDriveApiKey || !googleDriveProjectNumber) throw new GoogleDriveError('Configure VITE_GOOGLE_API_KEY e VITE_GOOGLE_PROJECT_NUMBER no ambiente de build para usar o seletor oficial de pastas.', 'CONFIG')
+      let token = googleAccessToken.current
+      if (!token || !googleAccessHasDrive.current) {
+        token = await requestGoogleSheetsAccessToken(googleClientId, undefined, true)
+        googleAccessToken.current = token
+        googleAccessHasDrive.current = true
+        setDriveConnected(true)
+        if (googleSheetLink?.spreadsheetId) await refreshGoogleSheet(googleSheetLink.spreadsheetId, false)
+      }
+      const folder = await selectGoogleDriveFolder(token, googleDriveApiKey, googleDriveProjectNumber)
+      if (!folder) return
+      const next = { ...driveFoldersRef.current, [kind]: folder }
+      updateDriveFolders(next)
+      if (next.invoices || next.statements) await syncDriveFiles(token)
+    } catch (error) { setDriveSyncError(error instanceof Error ? error.message : 'Não foi possível configurar a pasta do Google Drive.') }
+  }
+
+  async function syncDriveManually() {
+    if (!driveFoldersRef.current.invoices && !driveFoldersRef.current.statements) return
+    let token = googleAccessToken.current
+    try {
+      if (!token || !googleAccessHasDrive.current) {
+        token = await requestGoogleSheetsAccessToken(googleClientId, undefined, true)
+        googleAccessToken.current = token
+        googleAccessHasDrive.current = true
+        setDriveConnected(true)
+        setGoogleSheetInfo((current) => current ? { ...current, connected: true } : current)
+        if (googleSheetLink?.spreadsheetId) {
+          const sheet = await readGoogleSheetLedger(googleSheetLink.spreadsheetId, token)
+          const nextLink = { ...googleSheetLink, spreadsheetTitle: sheet.spreadsheetTitle, lastUpdated: new Date().toISOString(), autoConnect: true }
+          setGoogleSheetLink(nextLink); saveGoogleSheetLink(nextLink); setGoogleSheetRows(sheet.transactions); setGoogleSheetInfo({ ...nextLink, rowCount: sheet.rowCount, connected: true })
+          await synchronizeSavedDecisions(sheet.spreadsheetId, token)
+        }
+      }
+      await syncDriveFiles(token)
+    } catch (error) {
+      if (error instanceof GoogleDriveError && error.code === 'AUTH' || error instanceof GoogleSheetsError && error.code === 'AUTH') markGoogleDriveDisconnected()
+      setDriveSyncError(error instanceof Error ? error.message : 'Não foi possível sincronizar as pastas do Google Drive.')
+    }
+  }
+
+  function removeDriveStatementFromSession(fileId: string) {
+    const file = driveStatementFiles.find((item) => item.id === fileId)
+    if (!file) return
+    suppressedDriveFileIds.current.add(fileId)
+    const next = { ...driveBankFiles.current }
+    delete next[fileId]
+    driveBankFiles.current = next
+    setDriveStatementFiles((current) => current.filter((item) => item.id !== fileId))
+    const merged = mergeDriveBankSources(manualBankTransactions.current, next)
+    setData((current) => ({ ...current, bank: merged }))
+    setSourceStatus((current) => ({ ...current, bank: merged.length ? 'ACCEPTED' : 'EMPTY' }))
+  }
+
   const decisionSyncSummary = googleDecisionStatus.startsWith('Decisões mantidas')
     ? googleDecisionStatus
     : googleSheetLink
@@ -301,7 +499,8 @@ export default function App() {
       : 'Decisões salvas neste dispositivo'
 
   function clearSession() {
-    pdfSessionGeneration.current += 1; seenPdfFingerprints.current.clear(); pdfEntryTokens.current.clear()
+    pdfSessionGeneration.current += 1; seenPdfFingerprints.current.clear(); seenSemanticPdfFingerprints.current.clear(); seenSemanticPdfOrigins.current.clear(); pdfEntryTokens.current.clear()
+    suppressedDriveFileIds.current.clear(); driveProcessedInSession.current.clear(); drivePdfSemanticIdentities.current.clear(); manualBankTransactions.current = []; driveBankFiles.current = {}; setDriveStatementFiles([])
     const retainedGoogleSheet = sheetSource === 'google' ? googleSheetRows : null
     setData({ sheet: retainedGoogleSheet ?? [], bank: [] }); setCardPdfs([]); setCardPdfNotice(''); setScreen('home'); setUploads({ sheet: null, bank: null }); setSourceStatus({ sheet: retainedGoogleSheet?.length ? 'ACCEPTED' : 'EMPTY', bank: 'EMPTY' }); setCsvSheetAccepted(false); setGoogleSheetRows(retainedGoogleSheet); setGoogleError(''); setFilterYear('all'); setFilterMonth('all'); setFromDate(''); setToDate('')
   }
@@ -309,9 +508,12 @@ export default function App() {
   async function loadGoogleSheet(input: string) {
     setGoogleLoading(true); setGoogleError('')
     try {
-      const token = await requestGoogleSheetsAccessToken(googleClientId)
+      const includeDrive = Boolean(driveFoldersRef.current.invoices || driveFoldersRef.current.statements)
+      const token = await requestGoogleSheetsAccessToken(googleClientId, undefined, includeDrive)
       const sheet = await readGoogleSheetLedger(input, token)
       googleAccessToken.current = token
+      googleAccessHasDrive.current = includeDrive
+      setDriveConnected(includeDrive)
       const lastUpdated = new Date().toISOString()
       const nextLink: SavedGoogleSheetLink = { spreadsheetId: sheet.spreadsheetId, sheetName: GOOGLE_SHEET_TAB_NAME, spreadsheetTitle: sheet.spreadsheetTitle, lastUpdated, autoConnect: true }
       setGoogleSheetLink(nextLink)
@@ -329,6 +531,7 @@ export default function App() {
       }
       setGoogleError(persistenceWarning)
       await synchronizeSavedDecisions(sheet.spreadsheetId, token)
+      if (includeDrive) await syncDriveFiles(token)
     } catch (error) {
       setGoogleError(error instanceof GoogleSheetsError ? error.message : 'Não foi possível ler a aba CUSTOS ANO. A conciliação atual foi mantida.')
     } finally { setGoogleLoading(false) }
@@ -340,16 +543,20 @@ export default function App() {
     if (!spreadsheetId) return
     setGoogleLoading(true); setGoogleError('')
     try {
+      const includeDrive = Boolean(driveFoldersRef.current.invoices || driveFoldersRef.current.statements)
       let token = googleAccessToken.current
-      if (!token) token = await requestGoogleSheetsAccessToken(googleClientId, '')
+      if (!token || (includeDrive && !googleAccessHasDrive.current)) token = await requestGoogleSheetsAccessToken(googleClientId, automatic ? '' : undefined, includeDrive)
       googleAccessToken.current = token
+      googleAccessHasDrive.current = includeDrive || googleAccessHasDrive.current
+      setDriveConnected(googleAccessHasDrive.current)
       setGoogleSheetInfo((current) => current ? { ...current, connected: true } : current)
       let sheet
       try { sheet = await readGoogleSheetLedger(spreadsheetId, token) }
       catch (error) {
         if (!(error instanceof GoogleSheetsError) || error.code !== 'AUTH') throw error
-        token = await requestGoogleSheetsAccessToken(googleClientId, '')
+        token = await requestGoogleSheetsAccessToken(googleClientId, '', includeDrive)
         googleAccessToken.current = token
+        googleAccessHasDrive.current = includeDrive
         sheet = await readGoogleSheetLedger(spreadsheetId, token)
       }
       googleAccessToken.current = token
@@ -370,9 +577,12 @@ export default function App() {
       }
       setGoogleError(persistenceWarning)
       await synchronizeSavedDecisions(sheet.spreadsheetId, token)
+      if (includeDrive) await syncDriveFiles(token)
     } catch (error) {
       if (error instanceof GoogleSheetsError && error.code === 'AUTH') {
         googleAccessToken.current = ''
+        googleAccessHasDrive.current = false
+        setDriveConnected(false)
         if (googleSheetLink) {
           const nextLink = { ...googleSheetLink, autoConnect: false }
           setGoogleSheetLink(nextLink)
@@ -398,6 +608,8 @@ export default function App() {
   function disconnectGoogleSheet() {
     if (googleAccessToken.current) revokeGoogleSheetsAccessToken(googleAccessToken.current)
     googleAccessToken.current = ''
+    googleAccessHasDrive.current = false
+    setDriveConnected(false)
     if (googleSheetLink) {
       const nextLink = { ...googleSheetLink, autoConnect: false }
       setGoogleSheetLink(nextLink)
@@ -409,6 +621,8 @@ export default function App() {
   function forgetGoogleSheet() {
     if (googleAccessToken.current) revokeGoogleSheetsAccessToken(googleAccessToken.current)
     googleAccessToken.current = ''
+    googleAccessHasDrive.current = false
+    setDriveConnected(false)
     try { forgetGoogleSheetLink() } catch { setGoogleError('Não foi possível remover o vínculo salvo neste dispositivo.'); return }
     setGoogleSheetLink(null); setGoogleSheetInfo(null); setGoogleSheetRows(null); setGoogleLinkEditing(false); setGoogleError('')
     if (sheetSource === 'google') {
@@ -576,11 +790,19 @@ export default function App() {
     const files = Array.from(event.target.files ?? [])
     event.target.value = ''
     if (!files.length) return
+    await processCardPdfFiles(files.map((file) => ({ file })), 'MANUAL')
+  }
+
+  async function processCardPdfFiles(files: { file: File; driveFileId?: string }[], source: 'MANUAL' | 'DRIVE') {
     setCardPdfNotice('')
     const generation = pdfSessionGeneration.current
     let duplicates = 0
+    let semanticDuplicates = 0
     let unreadable = 0
-    for (const file of files) {
+    let processed = 0
+    const semanticIdentities: string[] = []
+    for (const item of files) {
+      const { file, driveFileId } = item
       try {
         const fingerprint = await fingerprintFile(file)
         if (generation !== pdfSessionGeneration.current) return
@@ -589,13 +811,41 @@ export default function App() {
         const key = `pdf-${fingerprint}`
         const entryToken = {}
         pdfEntryTokens.current.set(key, entryToken)
-        setCardPdfs((current) => [...current, { key, fingerprint, fileName: file.name, status: 'PROCESSING', statement: null }])
+        setCardPdfs((current) => [...current, { key, fingerprint, fileName: file.name, status: 'PROCESSING', statement: null, source, driveFileId }])
         try {
           const parsedStatement = await readCardStatementPdf(file)
           if (generation !== pdfSessionGeneration.current) return
           if (pdfEntryTokens.current.get(key) !== entryToken) continue
+          const hasCard = parsedStatement.cardSubtotals.length > 0 || parsedStatement.transactions.some((transaction) => transaction.cardIdentifier)
+          const hasFinancialLine = parsedStatement.transactions.some((transaction) => transaction.type === 'PURCHASE' || transaction.type === 'REFUND')
+          const structurallyIncomplete = parsedStatement.sourceLayout === 'UNKNOWN'
+            || parsedStatement.sourceLayout === 'INTERNET_BANKING' && (!parsedStatement.dueDate || parsedStatement.reportedTotal == null || parsedStatement.reportedTotal <= 0 || !hasCard || !hasFinancialLine)
+          if (structurallyIncomplete) {
+            unreadable += 1
+            setCardPdfs((current) => current.map((entry) => entry.key === key ? { ...entry, status: 'ERROR', statement: null, error: parsedStatement.errors[0] ?? 'A estrutura da fatura está incompleta e não pode ser conciliada.' } : entry))
+            pdfEntryTokens.current.delete(key)
+            continue
+          }
+          const semanticFingerprint = cardStatementFinancialIdentity(parsedStatement)
+          if (semanticFingerprint) semanticIdentities.push(semanticFingerprint)
+          const layout = parsedStatement.sourceLayout
+          const previousLayout = semanticFingerprint ? seenSemanticPdfFingerprints.current.get(semanticFingerprint) : undefined
+          const previousOrigins = semanticFingerprint ? seenSemanticPdfOrigins.current.get(semanticFingerprint) : undefined
+          if (semanticFingerprint && layout && previousLayout && (previousLayout !== layout || source === 'DRIVE' || previousOrigins?.has('DRIVE'))) {
+            semanticDuplicates += 1
+            seenPdfFingerprints.current.delete(fingerprint)
+            setCardPdfs((current) => current.filter((entry) => entry.key !== key))
+            pdfEntryTokens.current.delete(key)
+            continue
+          }
+          if (semanticFingerprint && (layout === 'MOBILE_APP' || layout === 'INTERNET_BANKING') && !previousLayout) seenSemanticPdfFingerprints.current.set(semanticFingerprint, layout)
+          if (semanticFingerprint) {
+            const origins = seenSemanticPdfOrigins.current.get(semanticFingerprint) ?? new Set<'MANUAL' | 'DRIVE'>()
+            origins.add(source); seenSemanticPdfOrigins.current.set(semanticFingerprint, origins)
+          }
           const statement: CardStatement = { ...parsedStatement, statementIdentity: `${parsedStatement.statementIdentity}-${fingerprint}`, transactions: parsedStatement.transactions.map((transaction) => ({ ...transaction, id: `${transaction.id}-${fingerprint}` })) }
           setCardPdfs((current) => current.map((entry) => entry.key === key ? { ...entry, statement, legacyStatementIdentity: parsedStatement.statementIdentity, status: statement.errors.length ? 'DIVERGENCE' : 'PROCESSED' } : entry))
+          processed += 1
           pdfEntryTokens.current.delete(key)
         } catch {
           if (generation !== pdfSessionGeneration.current) return
@@ -608,21 +858,39 @@ export default function App() {
         unreadable += 1
       }
     }
-    if (duplicates || unreadable) {
+    if (duplicates || semanticDuplicates || unreadable) {
       const parts = [
         duplicates ? `${duplicates} PDF${duplicates === 1 ? '' : 's'} duplicado${duplicates === 1 ? '' : 's'} ${duplicates === 1 ? 'foi ignorado' : 'foram ignorados'}` : '',
+        semanticDuplicates ? `${semanticDuplicates} fatura${semanticDuplicates === 1 ? '' : 's'} com conteúdo financeiro já carregado ${semanticDuplicates === 1 ? 'foi ignorada' : 'foram ignoradas'}` : '',
         unreadable ? `${unreadable} PDF${unreadable === 1 ? '' : 's'} ${unreadable === 1 ? 'não pôde ser lido' : 'não puderam ser lidos'}` : '',
       ].filter(Boolean)
       setCardPdfNotice(`${parts.join(' e ')}.`)
     }
+    return { processed, errors: unreadable, duplicates: duplicates + semanticDuplicates, semanticIdentities }
   }
 
-  function removeCardPdf(key: string) {
+  function removeCardPdf(key: string, suppressDrive = true) {
     const fingerprint = key.startsWith('pdf-') ? key.slice(4) : ''
     if (fingerprint) seenPdfFingerprints.current.delete(fingerprint)
     pdfEntryTokens.current.delete(key)
     const removed = cardPdfs.find((entry) => entry.key === key)
+    if (suppressDrive && removed?.source === 'DRIVE' && removed.driveFileId) suppressedDriveFileIds.current.add(removed.driveFileId)
     if (removed?.statement) {
+      if (suppressDrive) {
+        const removedFinancialIdentity = cardStatementFinancialIdentity(removed.statement)
+        if (removedFinancialIdentity) for (const [driveFileId, financialIdentity] of drivePdfSemanticIdentities.current) {
+          if (financialIdentity === removedFinancialIdentity) suppressedDriveFileIds.current.add(driveFileId)
+        }
+      }
+      seenSemanticPdfFingerprints.current.clear()
+      seenSemanticPdfOrigins.current.clear()
+      for (const entry of cardPdfs) {
+        if (entry.key === key || !entry.statement) continue
+        const semanticFingerprint = cardStatementFinancialIdentity(entry.statement)
+        const layout = entry.statement.sourceLayout
+        if (semanticFingerprint && (layout === 'MOBILE_APP' || layout === 'INTERNET_BANKING') && !seenSemanticPdfFingerprints.current.has(semanticFingerprint)) seenSemanticPdfFingerprints.current.set(semanticFingerprint, layout)
+        if (semanticFingerprint) { const origins = seenSemanticPdfOrigins.current.get(semanticFingerprint) ?? new Set<'MANUAL' | 'DRIVE'>(); origins.add(entry.source ?? 'MANUAL'); seenSemanticPdfOrigins.current.set(semanticFingerprint, origins) }
+      }
       const transactionIdentities = new Set(removed.statement.transactions.map((transaction) => cardTransactionIdentity(removed.statement!, transaction)))
       setCardReviewOverrides((current) => Object.fromEntries(Object.entries(current).filter(([identity]) => !transactionIdentities.has(identity))))
       if (auditFocusStatementIdentity === removed.statement.statementIdentity) {
@@ -648,7 +916,10 @@ export default function App() {
   function acceptUpload(mode: Mode) {
     const entry = uploads[mode]
     if (!entry || !entry.valid.length) return
-    const next = mode === 'sheet' ? { ...data, sheet: entry.valid as LedgerTransaction[] } : { ...data, bank: entry.valid as BankTransaction[] }
+    if (mode === 'bank') manualBankTransactions.current = entry.valid as BankTransaction[]
+    const next = mode === 'sheet'
+      ? { ...data, sheet: entry.valid as LedgerTransaction[] }
+      : { ...data, bank: mergeDriveBankSources(manualBankTransactions.current, driveBankFiles.current) }
     setData(next)
     setSourceStatus((current) => ({ ...current, [mode]: 'ACCEPTED' }))
     if (mode === 'sheet') { setCsvSheetAccepted(true); setSheetSource('csv') }
@@ -660,7 +931,12 @@ export default function App() {
     if (mode === 'sheet') {
       setCsvSheetAccepted(false)
       if (sheetSource === 'csv') { setSourceStatus((current) => ({ ...current, sheet: 'EMPTY' })); setData((current) => ({ ...current, sheet: [] })) }
-    } else { setSourceStatus((current) => ({ ...current, bank: 'EMPTY' })); setData((current) => ({ ...current, bank: [] })) }
+    } else {
+      manualBankTransactions.current = []
+      const remaining = mergeDriveBankSources([], driveBankFiles.current)
+      setSourceStatus((current) => ({ ...current, bank: remaining.length ? 'ACCEPTED' : 'EMPTY' }))
+      setData((current) => ({ ...current, bank: remaining }))
+    }
   }
 
   function runReconciliation() {
@@ -706,9 +982,12 @@ export default function App() {
     if (!googleSheetLink) { setMissingWriteError('Vincule uma planilha Google antes de adicionar lançamentos. Cancele e conecte a planilha na tela inicial.'); return }
     setReconnectingForWrite(true); setMissingWriteError('')
     try {
-      const token = await requestGoogleSheetsAccessToken(googleClientId)
+      const includeDrive = Boolean(driveFoldersRef.current.invoices || driveFoldersRef.current.statements)
+      const token = await requestGoogleSheetsAccessToken(googleClientId, undefined, includeDrive)
       const refreshed = await readGoogleSheetLedger(googleSheetLink.spreadsheetId, token)
       googleAccessToken.current = token
+      googleAccessHasDrive.current = includeDrive
+      setDriveConnected(includeDrive)
       const nextLink: SavedGoogleSheetLink = { ...googleSheetLink, spreadsheetTitle: refreshed.spreadsheetTitle, sheetName: GOOGLE_SHEET_TAB_NAME, lastUpdated: new Date().toISOString(), autoConnect: true }
       setGoogleSheetLink(nextLink); saveGoogleSheetLink(nextLink)
       setGoogleSheetInfo({ ...nextLink, rowCount: refreshed.rowCount, connected: true })
@@ -1122,6 +1401,7 @@ export default function App() {
           {error && <div className="alert alert-error" role="alert">{error}</div>}
           <section className="import-section"><div className="section-heading"><div><span className="step-label">01 / DADOS DE LANÇAMENTOS</span><h2>Dados para conciliação</h2></div><span className="local-tag">◉&nbsp; Seus dados não saem daqui</span></div>
             <GoogleSheetsPanel configured={Boolean(googleClientId)} info={googleSheetInfo} loading={googleLoading} error={googleError} decisionStatus={decisionSyncSummary} editing={googleLinkEditing} onConnect={(input) => { void connectGoogleSheet(input) }} onRefresh={() => { void refreshGoogleSheet() }} onSyncDecisions={() => { void syncDecisionsManually() }} onDisconnect={disconnectGoogleSheet} onChangeSheet={toggleGoogleLinkEditing} onForgetLink={forgetGoogleSheet}/>
+            <GoogleDrivePanel folders={driveFolders} connected={driveConnected} configured={Boolean(googleDriveApiKey && googleDriveProjectNumber)} loading={driveSyncBusy} progress={driveSyncProgress} lastSync={driveLastSync} summary={driveSyncSummary} error={driveSyncError} loadedStatements={driveStatementFiles} onSelectFolder={(kind) => { void selectDriveFolder(kind) }} onSync={() => { void syncDriveManually() }} onRemoveStatement={removeDriveStatementFromSession}/>
             <fieldset className="ledger-source-choice"><legend>FONTE DOS LANÇAMENTOS</legend><label><input type="radio" name="ledger-source" checked={sheetSource === 'google'} disabled={!googleSheetRows?.length} onChange={() => selectSheetSource('google')}/>Google Sheets{googleSheetInfo?.connected ? ' · conectado' : googleSheetRows?.length ? ' · disponível neste dispositivo' : ' · conecte e carregue os dados'}</label><label><input type="radio" name="ledger-source" checked={sheetSource === 'csv'} onChange={() => selectSheetSource('csv')}/>Importar CSV</label></fieldset>
             {sheetSource === 'google' && googleSheetRows?.length ? <div className="ledger-source-summary" role="status"><span aria-hidden="true">✓</span><div><strong>Lançamentos carregados do Google Sheets</strong><small>{googleSheetInfo?.spreadsheetTitle ?? 'Planilha vinculada'} · CUSTOS ANO · {googleSheetRows.length} linhas</small></div><button className="text-button" onClick={() => selectSheetSource('csv')}>Trocar para CSV</button></div> : null}
             <div className={`import-grid ${sheetSource === 'google' ? 'import-grid-google' : ''}`}>
@@ -1275,7 +1555,7 @@ function CardStatementUpload({ entries, notice, onSelect, onRemove, onRemoveAll 
       const expanded = expandedKeys.has(entry.key)
       const total = statement?.reportedTotal ?? statement?.transactions.reduce((net, item) => net + (item.direction === 'CREDIT' ? -item.amount : item.amount), 0) ?? 0
       return <article className={`card-pdf-entry ${status.tone === 'red' || status.tone === 'amber' && status.text.startsWith('⚠') ? 'card-pdf-entry-issue' : ''}`} data-testid="card-pdf-entry" key={entry.key}>
-        <header className="card-pdf-summary"><div className="card-pdf-summary-main"><strong>{statement ? titleFor(statement) : entry.status === 'ERROR' ? 'Fatura com erro de leitura' : 'Fatura sendo lida'}</strong>{statement && !statement.dueDate && <small>Vencimento não identificado</small>}{!statement && <small>{status.text}</small>}{statement && <><strong>{formatShortMoney(total)} · {purchasesInStatement.length} compras{refundsInStatement.length ? ` · ${refundsInStatement.length} ${refundsInStatement.length === 1 ? 'estorno/crédito' : 'estornos/créditos'}` : ''}</strong><span className={`statement-status ${status.tone}`}>{status.text}</span></>}</div><div className="card-pdf-entry-actions"><button className="button button-outline button-small" aria-expanded={expanded} onClick={() => toggleExpanded(entry.key)}>{expanded ? 'Recolher detalhes' : 'Ver detalhes'}</button><button className="button button-quiet button-small" aria-label={`Remover ${entry.fileName}`} onClick={() => onRemove(entry.key)}>Remover</button></div></header>
+        <header className="card-pdf-summary"><div className="card-pdf-summary-main"><strong>{statement ? titleFor(statement) : entry.status === 'ERROR' ? 'Fatura com erro de leitura' : 'Fatura sendo lida'}</strong><small>Origem: {entry.source === 'DRIVE' ? 'Google Drive' : 'arquivo local'}</small>{statement && !statement.dueDate && <small>Vencimento não identificado</small>}{!statement && <small>{status.text}</small>}{statement && <><strong>{formatShortMoney(total)} · {purchasesInStatement.length} compras{refundsInStatement.length ? ` · ${refundsInStatement.length} ${refundsInStatement.length === 1 ? 'estorno/crédito' : 'estornos/créditos'}` : ''}</strong><span className={`statement-status ${status.tone}`}>{status.text}</span></>}</div><div className="card-pdf-entry-actions"><button className="button button-outline button-small" aria-expanded={expanded} onClick={() => toggleExpanded(entry.key)}>{expanded ? 'Recolher detalhes' : 'Ver detalhes'}</button><button className="button button-quiet button-small" aria-label={`Remover ${entry.fileName}`} onClick={() => onRemove(entry.key)}>Remover da sessão</button></div></header>
         {expanded && <div className="card-pdf-details"><small>Arquivo: {entry.fileName}</small>{statement && <><small>{statement.pageCount} páginas · {cards.length} cartões encontrados{cards.length ? ` · ${cards.map((card) => `final ${card.slice(-4)}`).join(', ')}` : ''}</small><div className="statement-totals"><AmountRow label="Compras/Débitos extraídos" amount={purchasesInStatement.reduce((sum, item) => sum + item.amount, 0)}/><AmountRow label="Créditos/estornos extraídos" amount={-refundsInStatement.reduce((sum, item) => sum + item.amount, 0)}/>{statement.cardSubtotals.map((subtotal) => <AmountRow key={subtotal.cardIdentifier} label={`Subtotal cartão final ${subtotal.cardIdentifier.slice(-4)}`} amount={subtotal.amount}/ >)}<AmountRow label="Total extraído / líquido" amount={statement.purchasesDebitsTotal != null ? statement.purchasesDebitsTotal - refundsInStatement.reduce((sum, item) => sum + item.amount, 0) : total}/>{statement.reportedTotal != null && <AmountRow label="Total informado pela fatura" amount={statement.reportedTotal}/ >}{statement.previousBalance != null && <AmountRow label="Saldo anterior" amount={statement.previousBalance}/ >}{statement.creditsPaymentsTotal != null && <AmountRow label="Créditos/Pagamentos" amount={statement.creditsPaymentsTotal}/ >}<strong className={status.tone === 'green' ? 'good-text' : 'warning-text'}>{status.text}</strong></div><div className="card-pdf-metadata"><small>Vencimento: {statement.dueDate ? dateLabel(statement.dueDate) : 'não identificado'}</small><small>Fechamento: {statement.nextClosingDate ? dateLabel(statement.nextClosingDate) : 'não informado'}</small>{statement.previousPayment != null && <small>Pagamento anterior: {formatShortMoney(statement.previousPayment)}</small>}{statement.accountingDifference != null && <small>Diferença matemática: {formatShortMoney(statement.accountingDifference)}</small>}</div><div className="card-pdf-transactions"><strong>Compras e créditos extraídos</strong>{statement.transactions.map((transaction) => <div className="card-pdf-transaction" key={transaction.id}><span>{dateLabel(transaction.purchaseDate || transaction.date)} · {transaction.originalDescription}<small>{transaction.type === 'REFUND' ? 'Crédito/estorno' : 'Compra'} · cartão final {transaction.cardIdentifier.slice(-4)}{transaction.installment != null ? ` · parcela ${transaction.installment}/${transaction.totalInstallments}` : ''}{transaction.city ? ` · ${transaction.city}` : ''}{transaction.currency !== 'BRL' ? ` · ${transaction.currency}` : ''}{transaction.exchangeRate != null ? ` · câmbio ${transaction.exchangeRate}` : ''}</small></span><strong>{formatShortMoney(transaction.direction === 'CREDIT' ? -transaction.amount : transaction.amount)}</strong></div>)}</div>{statement.errors.map((message) => <p className="statement-warning" key={message}>{message}</p>)}</>}{entry.error && <p className="statement-warning">{entry.error}</p>}</div>}
       </article>
     })}

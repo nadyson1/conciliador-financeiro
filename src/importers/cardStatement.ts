@@ -60,13 +60,151 @@ function cardId(line: string): string | null {
 }
 
 function parseInstallment(value: string): { installment: number | null; totalInstallments: number | null; description: string } {
-  const match = value.match(/(?:^|\s)(\d{1,2})\/(\d{1,2})(?=\s|$)/)
+  const match = value.match(/(?:^|\s)\(?\s*(\d{1,2})\s*\/\s*(\d{1,2})\s*\)?(?=\s|$)/)
   if (!match) return { installment: null, totalInstallments: null, description: value.trim() }
   return {
     installment: Number(match[1]),
     totalInstallments: Number(match[2]),
     description: value.replace(match[0], ' ').replace(/\s+/g, ' ').trim(),
   }
+}
+
+export type BradescoInvoiceLayout = 'MOBILE_APP' | 'INTERNET_BANKING' | 'UNKNOWN'
+
+/** Detects the statement format from document text, never from its filename. */
+export function detectBradescoInvoiceLayout(pages: string[][]): BradescoInvoiceLayout {
+  const text = normalized(pages.flat().join('\n'))
+  const internetBankingMarkers = [
+    /fatura\s+data\s+\d{2}\/\d{2}\/\d{4}/,
+    /cartao selecionado/,
+    /data de vencimento:/,
+    /gastos referentes ao cartao:\s*final\s+\d{4}/,
+  ]
+  if (internetBankingMarkers.filter((marker) => marker.test(text)).length >= 3) return 'INTERNET_BANKING'
+  const mobileMarkers = [
+    /total da fatura\s+vencimento/,
+    /numero do cartao\s+\d{4}\s+x{4}\s+x{4}\s+\d{4}/,
+    /historico de lancamentos/,
+    /total da fatura em real/,
+  ]
+  if (mobileMarkers.filter((marker) => marker.test(text)).length >= 2) return 'MOBILE_APP'
+  return 'UNKNOWN'
+}
+
+/** Stable financial key shared by equivalent PDFs from mobile and Internet Banking. */
+export function cardStatementFinancialIdentity(statement: CardStatement): string | null {
+  if (!statement.dueDate || statement.reportedTotal == null || !statement.transactions.length) return null
+  const cards = [...new Set(statement.transactions.map((item) => item.cardIdentifier.slice(-4)))].sort()
+  if (!cards.length) return null
+  const transactions = statement.transactions.map((item) => [
+    item.cardIdentifier.slice(-4), item.purchaseDate || item.date, normalizeDescription(item.originalDescription),
+    item.amount, item.direction, item.type, item.installment ?? '', item.totalInstallments ?? '',
+  ].join(':')).sort()
+  const subtotals = statement.cardSubtotals.map((item) => `${item.cardIdentifier.slice(-4)}:${item.amount}`).sort()
+  return `invoice-${stableFingerprint([statement.dueDate, statement.reportedTotal, cards.join(','), subtotals.join(','), ...transactions])}`
+}
+
+function statementMonthDate(day: string, monthName: string, dueDate: string | null): string | null {
+  const months: Record<string, number> = { jan: 1, fev: 2, mar: 3, abr: 4, mai: 5, jun: 6, jul: 7, ago: 8, set: 9, out: 10, nov: 11, dez: 12 }
+  const month = months[normalized(monthName).slice(0, 3)]
+  if (!month || !dueDate) return null
+  const dueYear = Number(dueDate.slice(0, 4)), dueMonth = Number(dueDate.slice(5, 7))
+  const year = month > dueMonth ? dueYear - 1 : dueYear
+  return normalizeDate(`${String(day).padStart(2, '0')}/${String(month).padStart(2, '0')}/${year}`)
+}
+
+function parseInternetBankingPages(pages: string[][], fileName: string): CardStatement {
+  const allLines = pages.flat().map((line) => line.trim())
+  const header = allLines.join('\n')
+  const dueMatch = header.match(/data de vencimento:[^\d\n]*(\d{2}\/\d{2}\/\d{4})/i)
+  const dueDate = dueMatch ? normalizeDate(dueMatch[1]) : null
+  const totalMatch = header.match(/total da fatura:[^\d\n]*R\$\s*([\d.]+,\d{2})/i)
+    ?? header.match(/total da fatura\s*\(final[^\n]*\):\s*R\$\s*([\d.]+,\d{2})/i)
+  const reportedTotal = totalMatch ? parseBrazilianMoney(totalMatch[1]) : null
+  const paymentMethodLine = allLines.find((line) => /^forma de pagamento:/i.test(line))
+  const invoicePaymentMethod = paymentMethodLine?.split(':').slice(1).join(':').replace(/[|]/g, ' ').trim() || null
+  const bestPurchaseLine = allLines.find((line) => /^melhor data de compra:/i.test(line))
+  const bestPurchaseDayMatch = bestPurchaseLine?.match(/(\d{1,2})\s*$/)
+  const bestPurchaseDay = bestPurchaseDayMatch ? Number(bestPurchaseDayMatch[1]) : null
+  const previousBalance = amountAfterLabel(allLines, /saldo anterior/)
+  const creditsPaymentsTotal = amountAfterLabel(allLines, /pagamentos?\s*\/\s*creditos/)
+    ?? amountAfterLabel(allLines, /\(-\)\s*pagamentos?\s*\/\s*creditos/)
+  const purchasesDebitsTotal = amountAfterLabel(allLines, /\(\+\)\s*despesas locais/)
+  const transactions: CardStatementTransaction[] = []
+  const cardSubtotals: CardStatement['cardSubtotals'] = []
+  let activeCard = ''
+  let pendingDay: string | null = null
+  let pendingDescription: string | null = null
+  let previousPayment: number | null = null
+  let purchaseId = 0
+  const errors: string[] = []
+
+  for (const rawLine of allLines) {
+    const line = rawLine.trim()
+    const cardHeader = line.match(/gastos referentes ao cart[aã]o:\s*final\s+(\d{4})/i)
+    if (cardHeader) {
+      activeCard = `XXXX XXXX XXXX ${cardHeader[1]}`
+      const subtotal = amountFromCardHeader(line)
+      if (subtotal != null) cardSubtotals.push({ cardIdentifier: activeCard, amount: subtotal })
+      pendingDay = null
+      pendingDescription = null
+      continue
+    }
+    if (/total da fatura\s*\(final/i.test(normalized(line))) { activeCard = ''; continue }
+    if (/^\d{1,2}$/.test(line)) { pendingDay = line; pendingDescription = null; continue }
+    if (/^(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)$/i.test(normalized(line))) {
+      if (activeCard && pendingDay && pendingDescription) {
+        const date = statementMonthDate(pendingDay, line, dueDate)
+        const amountMatch = [...pendingDescription.matchAll(moneyPattern)].at(-1)
+        const description = amountMatch ? pendingDescription.slice(0, amountMatch.index).replace(/[|]/g, ' ').trim() : ''
+        const statementLine = date && amountMatch
+          ? [`${date.slice(8, 10)}/${date.slice(5, 7)}/${date.slice(0, 4)}`, description, '', '', '', amountMatch[0]].join(' | ')
+          : ''
+        if (/\b(?:pagto\.?|pagamento da fatura|pagto por deb)\b/i.test(normalized(pendingDescription))) {
+          previousPayment = Math.abs(moneyFromLine(pendingDescription) ?? 0) || previousPayment
+        } else {
+          const transaction = date ? parsePurchaseRow(statementLine, activeCard, dueDate, ++purchaseId) : null
+          if (transaction) transactions.push(transaction)
+        }
+      }
+      pendingDay = null
+      pendingDescription = null
+      continue
+    }
+    if (/^resumo das despesas\b/i.test(normalized(line))) { activeCard = ''; pendingDay = null; pendingDescription = null; continue }
+    if (!activeCard) continue
+    if (/\b(?:pagto\.?|pagamento da fatura|pagto por deb)\b/i.test(normalized(line))) {
+      previousPayment = Math.abs(moneyFromLine(line) ?? 0) || previousPayment
+      pendingDescription = null
+      continue
+    }
+    if (/^saldo anterior\b/i.test(normalized(line))) { pendingDescription = null; continue }
+    if (pendingDay && !pendingDescription && moneyFromLine(line) != null) pendingDescription = line
+  }
+
+  const distinctCards = [...new Set([...transactions.map((item) => item.cardIdentifier), ...cardSubtotals.map((item) => item.cardIdentifier)])].sort()
+  const statementIdentity = `statement-${stableFingerprint([dueDate ?? '', reportedTotal == null ? '' : String(reportedTotal), ...distinctCards.map((id) => id.slice(-4))])}`
+  transactions.forEach((transaction) => {
+    transaction.statementTotal = reportedTotal
+    transaction.id = `card-${statementIdentity}-${stableFingerprint([transaction.cardIdentifier, transaction.date, transaction.originalDescription, transaction.amount, transaction.direction, transaction.installment, transaction.totalInstallments])}`
+  })
+  const purchaseTotal = transactions.filter((item) => item.type === 'PURCHASE').reduce((sum, item) => sum + item.amount, 0)
+  if (!dueDate) errors.push('Vencimento da fatura não encontrado; confira o PDF antes de conciliar.')
+  if (reportedTotal == null || reportedTotal <= 0) errors.push('Total informado da fatura não encontrado ou inválido; confira o PDF antes de conciliar.')
+  if (!distinctCards.length) errors.push('Nenhum cartão foi identificado na fatura.')
+  if (!transactions.length) errors.push('Não foi possível localizar compras ou créditos válidos na fatura.')
+  if (reportedTotal != null && cardSubtotals.length && cardSubtotals.reduce((sum, card) => sum + card.amount, 0) !== reportedTotal) errors.push('A soma dos subtotais dos cartões não confere com o total informado da fatura.')
+  if (cardSubtotals.some((subtotal) => transactions.filter((item) => item.cardIdentifier === subtotal.cardIdentifier).reduce((sum, item) => sum + (item.direction === 'DEBIT' ? item.amount : -item.amount), 0) !== subtotal.amount)) errors.push('Divergência entre lançamentos extraídos e subtotal informado para um dos cartões.')
+  if (purchasesDebitsTotal != null && purchaseTotal !== purchasesDebitsTotal) errors.push('Divergência entre compras extraídas e total de Despesas locais informado pela fatura.')
+  const accountingDifference = previousBalance != null && creditsPaymentsTotal != null && purchasesDebitsTotal != null && reportedTotal != null
+    ? previousBalance - creditsPaymentsTotal + purchasesDebitsTotal - reportedTotal : null
+  if (accountingDifference != null && accountingDifference !== 0) errors.push('A relação entre saldo anterior, créditos/pagamentos, compras/débitos e total da fatura não fecha.')
+  return { fileName, sourceLayout: 'INTERNET_BANKING', pageCount: pages.length, statementIdentity, transactions, cardSubtotals, reportedTotal, invoicePaymentMethod, bestPurchaseDay, purchasesDebitsTotal, creditsPaymentsTotal, previousBalance, previousPayment, accountingDifference, dueDate, nextClosingDate: null, errors: [...new Set(errors)] }
+}
+
+function amountFromCardHeader(line: string): number | null {
+  const match = line.match(/valor da fatura:[^\d\n]*R\$\s*([\d.]+,\d{2})/i)
+  return match ? parseBrazilianMoney(match[1]) : null
 }
 
 function rowCells(line: string): string[] {
@@ -117,6 +255,20 @@ function parsePurchaseRow(line: string, cardIdentifier: string, dueDate: string 
 
 /** Parses layout-aware lines emitted from PDF.js. Pipe/tab separators preserve the statement's table columns. */
 export function parseCardStatementPages(pages: string[][], fileName = 'Fatura PDF'): CardStatement {
+  const layout = detectBradescoInvoiceLayout(pages)
+  if (layout === 'INTERNET_BANKING') return parseInternetBankingPages(pages, fileName)
+  if (layout === 'UNKNOWN') return {
+    fileName, sourceLayout: 'UNKNOWN', pageCount: pages.length,
+    statementIdentity: `statement-unsupported-${stableFingerprint([pages.flat().join('\n')])}`,
+    transactions: [], cardSubtotals: [], reportedTotal: null, purchasesDebitsTotal: null,
+    creditsPaymentsTotal: null, previousBalance: null, previousPayment: null,
+    accountingDifference: null, dueDate: null, nextClosingDate: null,
+    errors: ['Este layout de fatura Bradesco ainda não foi reconhecido.'],
+  }
+  return parseMobileAppPages(pages, fileName)
+}
+
+function parseMobileAppPages(pages: string[][], fileName: string): CardStatement {
   const pageOne = pages[0]?.join('\n') ?? ''
   let dueDate: string | null = null
   const dueLines = pageOne.split(/\r?\n/)
@@ -206,7 +358,7 @@ export function parseCardStatementPages(pages: string[][], fileName = 'Fatura PD
   if (accountingDifference != null && accountingDifference !== 0) errors.push('A relação entre saldo anterior, créditos/pagamentos, compras/débitos e total da fatura não fecha.')
   if (!purchaseTransactions.length) errors.push('Não foi possível localizar compras na seção Lançamentos da fatura.')
   if (reportedTotal == null) errors.push('Total informado da fatura não encontrado; confira o PDF antes de conciliar.')
-  return { fileName, pageCount: pages.length, statementIdentity, transactions, cardSubtotals, reportedTotal, purchasesDebitsTotal, creditsPaymentsTotal, previousBalance, previousPayment, accountingDifference, dueDate, nextClosingDate, errors: [...new Set(errors)] }
+  return { fileName, sourceLayout: 'MOBILE_APP', pageCount: pages.length, statementIdentity, transactions, cardSubtotals, reportedTotal, purchasesDebitsTotal, creditsPaymentsTotal, previousBalance, previousPayment, accountingDifference, dueDate, nextClosingDate, errors: [...new Set(errors)] }
 }
 
 function groupPageText(items: PdfTextItem[], pageWidth: number): string[] {

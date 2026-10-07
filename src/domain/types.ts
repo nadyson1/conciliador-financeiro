@@ -165,11 +165,16 @@ export interface CardStatementTransaction {
 
 export interface CardStatement {
   fileName: string
+  sourceLayout?: 'MOBILE_APP' | 'INTERNET_BANKING' | 'UNKNOWN'
   pageCount: number
   statementIdentity: string
   transactions: CardStatementTransaction[]
   cardSubtotals: { cardIdentifier: string; amount: number }[]
   reportedTotal: number | null
+  /** How the invoice itself is paid (for example, debit from account). */
+  invoicePaymentMethod?: string | null
+  /** Day-of-month shown as the best purchase date; not an invoice close date. */
+  bestPurchaseDay?: number | null
   purchasesDebitsTotal: number | null
   creditsPaymentsTotal: number | null
   previousBalance: number | null

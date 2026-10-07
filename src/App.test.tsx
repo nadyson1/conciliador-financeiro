@@ -5,6 +5,7 @@ import type { CardStatement } from './domain/types'
 import { readCardStatementPdf } from './importers/cardStatement'
 import { appendCostYearRecord, GoogleSheetsError, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
+import { saveDriveFolders } from './integrations/googleDriveStorage'
 import { listDecisionTombstones } from './integrations/googleSheetDecisions'
 import { cardReviewCandidateIdentity, cardTransactionIdentity, sheetIdentity, stableFingerprint } from './domain/identity'
 import App from './App'
@@ -23,6 +24,7 @@ const syntheticStatement: CardStatement = {
 
 const savedDecisionStore = vi.hoisted(() => new Map<string, { key: string; schemaVersion: 1; kind: string; identities: string[]; selected: string[]; updatedAt: string }>())
 const googleSheetsMocks = vi.hoisted(() => ({ read: vi.fn(), append: vi.fn(), requestToken: vi.fn(), revoke: vi.fn() }))
+const googleDriveMocks = vi.hoisted(() => ({ list: vi.fn(), download: vi.fn(), pick: vi.fn() }))
 const decisionSyncMocks = vi.hoisted(() => ({ sync: vi.fn(), save: vi.fn(), deletion: vi.fn(), deleteDecision: vi.fn(), tombstones: new Map<string, { updatedAt: string; decision: { key: string } }>(), tombstone: vi.fn((decision: { key: string }) => { decisionSyncMocks.tombstones.set(decision.key, { updatedAt: new Date().toISOString(), decision }) }), readRemote: vi.fn() }))
 
 vi.mock('./domain/localDecisions', () => ({
@@ -51,6 +53,11 @@ vi.mock('./integrations/googleSheets', async (importOriginal) => {
   return { ...actual, appendCostYearRecord: googleSheetsMocks.append, readGoogleSheetLedger: googleSheetsMocks.read, requestGoogleSheetsAccessToken: googleSheetsMocks.requestToken, revokeGoogleSheetsAccessToken: googleSheetsMocks.revoke }
 })
 
+vi.mock('./integrations/googleDrive', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./integrations/googleDrive')>()
+  return { ...actual, listGoogleDriveFolder: googleDriveMocks.list, downloadGoogleDriveFile: googleDriveMocks.download, selectGoogleDriveFolder: googleDriveMocks.pick }
+})
+
 beforeEach(() => {
   // clearMocks clears call history, but it does not discard queued
   // mockResolvedValueOnce/mockRejectedValueOnce implementations.
@@ -72,6 +79,9 @@ beforeEach(() => {
   vi.mocked(readCardStatementPdf).mockImplementation(async () => syntheticStatement)
   vi.mocked(requestGoogleSheetsAccessToken).mockResolvedValue('test-access-token')
   vi.mocked(readGoogleSheetLedger).mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'CONTROLE ORÇAMENTÁRIO PESSOAL 2026', transactions: [], rowCount: 1 })
+  googleDriveMocks.list.mockReset().mockResolvedValue([])
+  googleDriveMocks.download.mockReset()
+  googleDriveMocks.pick.mockReset().mockResolvedValue(null)
   vi.spyOn(window, 'scrollTo').mockImplementation(() => undefined)
 })
 afterEach(() => {
@@ -336,7 +346,7 @@ describe('fluxo completo no navegador', () => {
     render(<App />)
     await waitFor(() => expect(readGoogleSheetLedger).toHaveBeenCalledOnce())
     expect(requestGoogleSheetsAccessToken).toHaveBeenCalledOnce()
-    expect(requestGoogleSheetsAccessToken).toHaveBeenCalledWith(expect.any(String), '')
+    expect(requestGoogleSheetsAccessToken).toHaveBeenCalledWith(expect.any(String), '', false)
     expect(screen.getByText('CONTROLE ORÇAMENTÁRIO PESSOAL 2026')).toBeInTheDocument()
     expect(screen.getByText('Aba: CUSTOS ANO')).toBeInTheDocument()
     expect(screen.queryByLabelText('URL ou ID da planilha')).not.toBeInTheDocument()
@@ -783,6 +793,22 @@ describe('fluxo completo no navegador', () => {
     expect(await screen.findByText(/1 PDF duplicado foi ignorado/)).toBeInTheDocument()
   })
 
+  it('não cria duas conciliações para PDFs mobile e Internet Banking com o mesmo conteúdo financeiro', async () => {
+    const user = userEvent.setup()
+    const internetLayout = { ...structuredClone(syntheticStatement), sourceLayout: 'INTERNET_BANKING' as const, statementIdentity: 'statement-internet-banking' }
+    const mobileLayout = { ...structuredClone(syntheticStatement), sourceLayout: 'MOBILE_APP' as const }
+    vi.mocked(readCardStatementPdf).mockResolvedValueOnce(mobileLayout).mockResolvedValueOnce(internetLayout)
+    render(<App />)
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), [
+      new File(['mobile pdf bytes'], 'mobile.pdf', { type: 'application/pdf' }),
+      new File(['internet banking pdf bytes'], 'internet-banking.pdf', { type: 'application/pdf' }),
+    ])
+    expect(await screen.findByText(/1 fatura com conteúdo financeiro já carregado foi ignorada/)).toBeInTheDocument()
+    expect(screen.getAllByTestId('card-pdf-entry')).toHaveLength(1)
+    expect(screen.getByRole('button', { name: 'Remover mobile.pdf' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Remover internet-banking.pdf' })).not.toBeInTheDocument()
+  })
+
   it('mantém vários PDFs válidos compactos, resume o lote e expande/recolhe os detalhes sob demanda', async () => {
     const user = userEvent.setup()
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
@@ -1148,5 +1174,98 @@ describe('fluxo completo no navegador', () => {
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], first)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     expect(screen.getByText('custos-1.csv')).toBeInTheDocument()
+  })
+
+  it('reconecta uma vez e sincroniza PDF/CSV do Drive pelos parsers existentes, sem repetir arquivos iguais na sessão', async () => {
+    const user = userEvent.setup()
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha conectada', lastUpdated: null, autoConnect: true })
+    saveDriveFolders({ invoices: { id: 'invoice-folder', name: 'Faturas' }, statements: { id: 'statement-folder', name: 'Extratos' } })
+    googleDriveMocks.list.mockImplementation(async (folderId: string) => folderId === 'invoice-folder'
+      ? [
+        { id: 'drive-pdf', name: 'fatura-drive.pdf', mimeType: 'application/pdf', modifiedTime: '2026-10-06T10:00:00Z', size: '20' },
+        { id: 'ignored-pdf-folder', name: 'not-a-pdf.txt', mimeType: 'text/plain', modifiedTime: '2026-10-06T10:00:00Z' },
+      ]
+      : [
+        { id: 'drive-csv', name: 'extrato-drive.csv', mimeType: 'text/csv', modifiedTime: '2026-10-06T10:00:00Z', size: '80' },
+        { id: 'ignored-csv-folder', name: 'not-a-csv.pdf', mimeType: 'application/pdf', modifiedTime: '2026-10-06T10:00:00Z' },
+      ])
+    googleDriveMocks.download.mockImplementation(async (id: string) => new Blob([id === 'drive-csv'
+      ? 'Data;Histórico;Débito R$;Crédito R$;Saldo\n05/10/2026;PIX ENVIADO;25,00;;-100,00'
+      : 'synthetic pdf'], { type: id === 'drive-csv' ? 'text/csv' : 'application/pdf' }))
+    render(<App />)
+    expect(await screen.findByText('2 arquivo(s) novo(s) processado(s)')).toBeInTheDocument()
+    expect(googleDriveMocks.list).toHaveBeenCalledWith('invoice-folder', 'test-access-token')
+    expect(googleDriveMocks.list).toHaveBeenCalledWith('statement-folder', 'test-access-token')
+    expect(googleDriveMocks.download).toHaveBeenCalledTimes(2)
+    expect(googleDriveMocks.download).not.toHaveBeenCalledWith('ignored-pdf-folder', expect.anything())
+    expect(googleDriveMocks.download).not.toHaveBeenCalledWith('ignored-csv-folder', expect.anything())
+    expect(vi.mocked(readCardStatementPdf)).toHaveBeenCalledWith(expect.objectContaining({ name: 'fatura-drive.pdf' }))
+    expect(vi.mocked(requestGoogleSheetsAccessToken)).toHaveBeenCalledWith('vitest-mock-client.apps.googleusercontent.com', '', true)
+    expect(screen.getByRole('region', { name: 'Fontes do Google Drive' })).toHaveTextContent('Extratos: 1')
+
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic pdf'], 'manual-copia.pdf', { type: 'application/pdf' }))
+    expect(await screen.findByText(/PDF duplicado foi ignorado/)).toBeInTheDocument()
+    expect(vi.mocked(readCardStatementPdf)).toHaveBeenCalledTimes(1)
+
+    await user.click(screen.getByRole('button', { name: 'Sincronizar arquivos' }))
+    await waitFor(() => expect(googleDriveMocks.list).toHaveBeenCalledTimes(4))
+    expect(googleDriveMocks.download).toHaveBeenCalledTimes(2)
+    await user.click(screen.getByRole('button', { name: 'Remover fatura-drive.pdf' }))
+    await user.click(screen.getByRole('button', { name: 'Sincronizar arquivos' }))
+    await waitFor(() => expect(googleDriveMocks.list).toHaveBeenCalledTimes(6))
+    expect(googleDriveMocks.download).toHaveBeenCalledTimes(2)
+    const drivePanel = screen.getByRole('region', { name: 'Fontes do Google Drive' })
+    await user.click(within(drivePanel).getByRole('button', { name: 'Remover da sessão' }))
+    expect(within(drivePanel).queryByText('extrato-drive.csv')).not.toBeInTheDocument()
+    await user.click(within(drivePanel).getByRole('button', { name: 'Sincronizar arquivos' }))
+    await waitFor(() => expect(googleDriveMocks.list).toHaveBeenCalledTimes(8))
+    expect(googleDriveMocks.download).toHaveBeenCalledTimes(2)
+  })
+
+  it('continua processando os demais arquivos se um PDF do Drive falhar', async () => {
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha conectada', lastUpdated: null, autoConnect: true })
+    saveDriveFolders({ invoices: { id: 'invoice-folder', name: 'Faturas' }, statements: null })
+    googleDriveMocks.list.mockResolvedValue([
+      { id: 'good-pdf', name: 'boa.pdf', mimeType: 'application/pdf', modifiedTime: 'v1' },
+      { id: 'bad-pdf', name: 'ruim.pdf', mimeType: 'application/pdf', modifiedTime: 'v1' },
+    ])
+    googleDriveMocks.download.mockImplementation(async (id: string) => new Blob([id]))
+    vi.mocked(readCardStatementPdf).mockImplementation(async (file) => {
+      if (file.name === 'ruim.pdf') throw new Error('PDF inválido')
+      return syntheticStatement
+    })
+    render(<App />)
+    await waitFor(() => expect(googleDriveMocks.list).toHaveBeenCalledWith('invoice-folder', 'test-access-token'))
+    await waitFor(() => expect(googleDriveMocks.download).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('region', { name: 'Fontes do Google Drive' }).textContent).toContain('processado')
+    expect(screen.getByRole('region', { name: 'Fontes do Google Drive' })).toHaveTextContent('arquivo(s) precisam de atenção')
+    expect(googleDriveMocks.download).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(readCardStatementPdf)).toHaveBeenCalledTimes(2)
+  })
+
+  it('não baixa arquivos do Drive sem autorização', async () => {
+    saveDriveFolders({ invoices: { id: 'invoice-folder', name: 'Faturas' }, statements: null })
+    render(<App />)
+    expect(screen.getByRole('button', { name: 'Sincronizar arquivos' })).toBeDisabled()
+    expect(googleDriveMocks.download).not.toHaveBeenCalled()
+  })
+
+  it('reprocessa um CSV do Drive quando modifiedTime muda', async () => {
+    const user = userEvent.setup()
+    let modifiedTime = 'v1'
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha conectada', lastUpdated: null, autoConnect: true })
+    saveDriveFolders({ invoices: null, statements: { id: 'statement-folder', name: 'Extratos' } })
+    googleDriveMocks.list.mockImplementation(async () => [{ id: 'drive-csv', name: 'extrato.csv', mimeType: 'text/csv', modifiedTime, size: '40' }])
+    googleDriveMocks.download.mockImplementation(async () => new Blob([`Data;Histórico;Débito R$;Crédito R$;Saldo\n05/10/2026;PIX ENVIADO;25,00;;-${modifiedTime === 'v1' ? '100,00' : '125,00'}`]))
+    render(<App />)
+    await waitFor(() => expect(googleDriveMocks.download).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText('1 arquivo(s) novo(s) processado(s)')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Sincronizar arquivos' }))
+    await waitFor(() => expect(googleDriveMocks.list).toHaveBeenCalledTimes(2))
+    expect(googleDriveMocks.download).toHaveBeenCalledTimes(1)
+    modifiedTime = 'v2'
+    await user.click(screen.getByRole('button', { name: 'Sincronizar arquivos' }))
+    await waitFor(() => expect(googleDriveMocks.download).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('region', { name: 'Fontes do Google Drive' })).toHaveTextContent('Extratos: 1')
   })
 })

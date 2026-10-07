@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  appendCostYearRecord, extractSpreadsheetId, generateCostYearId, GOOGLE_SHEETS_SCOPE, GoogleSheetsError, mapGoogleSheetValues,
+  appendCostYearRecord, extractSpreadsheetId, generateCostYearId, GOOGLE_DRIVE_SCOPE, GOOGLE_SHEETS_SCOPE, GoogleSheetsError, mapGoogleSheetValues,
   readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken,
 } from './googleSheets'
 
@@ -39,6 +39,20 @@ describe('leitura da aba financeira via Google Sheets', () => {
     ;(window as Window & { google?: unknown }).google = { accounts: { oauth2: { initTokenClient, revoke: vi.fn() } } }
     await expect(requestGoogleSheetsAccessToken('client-id.apps.googleusercontent.com', '')).resolves.toBe('renewed-memory-token')
     expect(requestAccessToken).toHaveBeenCalledWith({ prompt: '' })
+  })
+
+  it('solicita acesso Drive somente leitura junto com Sheets quando a integração Drive é usada', async () => {
+    const requestAccessToken = vi.fn((_options?: { prompt?: string }) => tokenCallback({ access_token: 'drive-memory-token' }))
+    let tokenCallback: (response: { access_token: string }) => void = () => undefined
+    const initTokenClient = vi.fn((options: { callback: (result: { access_token: string }) => void }) => {
+      tokenCallback = options.callback
+      return { requestAccessToken }
+    })
+    ;(window as Window & { google?: unknown }).google = { accounts: { oauth2: { initTokenClient, revoke: vi.fn() } } }
+    await expect(requestGoogleSheetsAccessToken('client-id.apps.googleusercontent.com', undefined, true)).resolves.toBe('drive-memory-token')
+    expect(initTokenClient).toHaveBeenCalledWith(expect.objectContaining({ scope: `${GOOGLE_SHEETS_SCOPE} ${GOOGLE_DRIVE_SCOPE}`, include_granted_scopes: true }))
+    expect(requestAccessToken).toHaveBeenCalledWith()
+    expect(GOOGLE_DRIVE_SCOPE).toBe('https://www.googleapis.com/auth/drive.readonly')
   })
 
   it('revoga autorização somente quando solicitado explicitamente', () => {

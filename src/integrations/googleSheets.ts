@@ -5,6 +5,7 @@ import { normalizeAmount, normalizeDate, parseBoolean } from '../importers/norma
 import { COST_YEAR_PAYMENT_METHODS } from '../features/costYearRecord'
 
 export const GOOGLE_SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets'
+export const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.readonly'
 const SHEET_NAME = 'CUSTOS ANO'
 const REQUIRED_SHEET_COLUMNS = ['description', 'date', 'month', 'year', 'category', 'amount', 'paymentMethod', 'isFixed', 'isEssential', 'id'] as const
 const COLUMN_NAMES: Record<(typeof REQUIRED_SHEET_COLUMNS)[number], string> = {
@@ -75,13 +76,13 @@ function loadGoogleIdentityServices(): Promise<GoogleIdentity> {
   return identityScriptPromise
 }
 
-export async function requestGoogleSheetsAccessToken(clientId: string, prompt?: string): Promise<string> {
+export async function requestGoogleSheetsAccessToken(clientId: string, prompt?: string, includeDrive = false): Promise<string> {
   if (!clientId.trim()) throw new GoogleSheetsError('Configure VITE_GOOGLE_CLIENT_ID para ativar a conexão com Google Sheets.', 'CONFIG')
   const google = await loadGoogleIdentityServices()
   return new Promise((resolve, reject) => {
     let settled = false
     const client = google.accounts.oauth2.initTokenClient({
-      client_id: clientId.trim(), scope: GOOGLE_SHEETS_SCOPE, include_granted_scopes: true,
+      client_id: clientId.trim(), scope: includeDrive ? `${GOOGLE_SHEETS_SCOPE} ${GOOGLE_DRIVE_SCOPE}` : GOOGLE_SHEETS_SCOPE, include_granted_scopes: true,
       callback: (response) => {
         if (settled) return
         settled = true

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { BankTransaction, CardStatement, LedgerTransaction } from '../domain/types'
-import { deriveCardPurchaseStatus, findExistingCostYearCandidates, identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
+import { cardStatementFinancialIdentity, deriveCardPurchaseStatus, detectBradescoInvoiceLayout, findExistingCostYearCandidates, identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
 import { findDuplicateGroups, reconcile } from '../matching/reconcile'
 import { parseLedgerRows } from './transactions'
 
@@ -55,6 +55,29 @@ const refundStatementPages = [
   ],
 ]
 
+const internetBankingInvoicePages = [
+  [
+    'Fatura | Data 06/10/2026 - 10:26:53', 'Cartao selecionado', 'Data de vencimento: | 12/07/2026',
+    '**** **** **** 1271', 'Total da fatura: | R$ 1.245,87', 'Forma de pagamento: | Débito em conta',
+    'Melhor data de compra: | 30', 'Valor da fatura anterior: | R$ 827,67',
+    'Data | Lançamentos | Moeda de Origem | Valor (US$) | Cotação (US$) | Valor (R$)',
+    'Gastos referentes ao cartão: Final 1271 | TITULAR | Valor da fatura: | R$ 905,96',
+    '26', 'SEGURO SUPERPROTEGIDO | 9,99', 'JUN',
+    '12', 'SALDO ANTERIOR | 827,67', 'JUN', 'PAGTO. POR DEB EM C/C | -827,67',
+    '06', 'ALCHYMIST BEACH CLUB | 260,00', 'JUN',
+    '27', 'EDZIA PIRES COBDE ( 02/04 ) | 255,97', 'MAI',
+    '23', 'AGROLESTE RACOES ( 02/02 ) | 380,00', 'MAI',
+  ],
+  [
+    'Data | Lançamentos | Moeda de Origem | Valor (US$) | Cotação (US$) | Valor (R$)',
+    'Gastos referentes ao cartão: Final 9833 | TITULAR | Valor da fatura: | R$ 339,91',
+    '01', 'CONTA VIVO | 104,91', 'JUN', '28', 'FORMULA FARMACIA DE MA | 235,00', 'MAI',
+    'Total da fatura (final 1271 + 9833): | R$ 1.245,87',
+    'Resumo das Despesas | Real', 'Saldo anterior | 827,67', '(-)Pagamentos/Créditos: | 827,67',
+    '(+)Despesas locais: | 1.245,87', '(=)Total da fatura: | 1.245,87',
+  ],
+]
+
 function ledger(id: string, date: string, description: string, amount: number, paymentMethod = 'Crédito_Bradesco'): LedgerTransaction {
   return { id, source: 'SHEET', sheetRecordId: id, bankTransactionId: null, date, description, originalDescription: description, amount, direction: 'DEBIT', type: 'EXPENSE', paymentMethod, category: '', month: '', year: date.slice(0, 4), isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
 }
@@ -71,6 +94,51 @@ function cardBank(id: string, date: string, amount: number): BankTransaction {
 }
 
 describe('PDF de fatura do cartão', () => {
+  it('detecta e normaliza o layout Internet Banking sem misturar os cartões da mesma fatura', () => {
+    expect(detectBradescoInvoiceLayout(internetBankingInvoicePages)).toBe('INTERNET_BANKING')
+    const statement = parseCardStatementPages(internetBankingInvoicePages, 'nome-aleatorio.pdf')
+    expect(statement).toMatchObject({ sourceLayout: 'INTERNET_BANKING', dueDate: '2026-07-12', reportedTotal: 124587, invoicePaymentMethod: 'Débito em conta', bestPurchaseDay: 30, previousBalance: 82767, previousPayment: 82767, creditsPaymentsTotal: 82767, purchasesDebitsTotal: 124587, accountingDifference: 0, errors: [] })
+    expect(statement.cardSubtotals).toEqual([
+      { cardIdentifier: 'XXXX XXXX XXXX 1271', amount: 90596 },
+      { cardIdentifier: 'XXXX XXXX XXXX 9833', amount: 33991 },
+    ])
+    expect(statement.transactions).toHaveLength(6)
+    expect(statement.transactions.map(({ cardIdentifier, date, originalDescription, amount, installment, totalInstallments }) => ({ card: cardIdentifier.slice(-4), date, description: originalDescription, amount, installment, totalInstallments }))).toEqual([
+      { card: '1271', date: '2026-06-26', description: 'SEGURO SUPERPROTEGIDO', amount: 999, installment: null, totalInstallments: null },
+      { card: '1271', date: '2026-06-06', description: 'ALCHYMIST BEACH CLUB', amount: 26000, installment: null, totalInstallments: null },
+      { card: '1271', date: '2026-05-27', description: 'EDZIA PIRES COBDE', amount: 25597, installment: 2, totalInstallments: 4 },
+      { card: '1271', date: '2026-05-23', description: 'AGROLESTE RACOES', amount: 38000, installment: 2, totalInstallments: 2 },
+      { card: '9833', date: '2026-06-01', description: 'CONTA VIVO', amount: 10491, installment: null, totalInstallments: null },
+      { card: '9833', date: '2026-05-28', description: 'FORMULA FARMACIA DE MA', amount: 23500, installment: null, totalInstallments: null },
+    ])
+    expect(statement.transactions.some((item) => /saldo anterior|pagto/i.test(item.originalDescription))).toBe(false)
+    expect(cardStatementFinancialIdentity(statement)).toBeTruthy()
+  })
+
+  it('reconhece mobile por conteúdo, não por nome, e mantém o parser legado', () => {
+    expect(detectBradescoInvoiceLayout(syntheticPages)).toBe('MOBILE_APP')
+    expect(parseCardStatementPages(syntheticPages, 'arquivo-sem-nome-conhecido.pdf').sourceLayout).toBe('MOBILE_APP')
+  })
+
+  it('não trata um layout desconhecido como uma fatura vazia válida', () => {
+    const unknown = parseCardStatementPages([['Documento financeiro', 'Conteúdo não reconhecido']], 'fatura.pdf')
+    expect(detectBradescoInvoiceLayout([['Documento financeiro', 'Conteúdo não reconhecido']])).toBe('UNKNOWN')
+    expect(unknown).toMatchObject({ sourceLayout: 'UNKNOWN', dueDate: null, reportedTotal: null, transactions: [], cardSubtotals: [] })
+    expect(unknown.errors).toContain('Este layout de fatura Bradesco ainda não foi reconhecido.')
+  })
+
+  it('gera a mesma identidade financeira para uma fatura equivalente nos dois layouts', () => {
+    const internet = parseCardStatementPages(internetBankingInvoicePages)
+    const mobile = {
+      ...internet,
+      sourceLayout: 'MOBILE_APP' as const,
+      statementIdentity: 'identity-do-mobile',
+      cardSubtotals: internet.cardSubtotals.map((card) => ({ ...card, cardIdentifier: `6550 XXXX XXXX ${card.cardIdentifier.slice(-4)}` })),
+      transactions: internet.transactions.map((transaction) => ({ ...transaction, cardIdentifier: `6550 XXXX XXXX ${transaction.cardIdentifier.slice(-4)}` })),
+    }
+    expect(cardStatementFinancialIdentity(internet)).toBe(cardStatementFinancialIdentity(mobile))
+  })
+
   it('extrai tabela, dois cartões, parcelas, pagamentos excluídos e valida os totais sintéticos', () => {
     const statement = parseCardStatementPages(syntheticPages, 'fatura-sintetica.pdf')
     const reimported = parseCardStatementPages(structuredClone(syntheticPages), 'outro-nome.pdf')
