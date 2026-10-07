@@ -552,6 +552,65 @@ describe('fluxo completo no navegador', () => {
     expect(screen.getByLabelText('Forma de pagamento')).toHaveValue('Crédito_Bradesco')
   })
 
+  it('exibe IOF separado das compras conciliáveis no detalhamento da fatura', async () => {
+    const user = userEvent.setup()
+    vi.mocked(readCardStatementPdf).mockResolvedValueOnce({
+      ...structuredClone(syntheticStatement),
+      transactions: [{ ...syntheticStatement.transactions[0], amount: 10000, cardIdentifier: '4321 XXXX XXXX 1111' }],
+      cardSubtotals: [{ cardIdentifier: '4321 XXXX XXXX 1111', amount: 10140 }],
+      reportedTotal: 10140,
+      purchasesDebitsTotal: 10140,
+      financialAdjustments: [{
+        id: 'synthetic-tax', date: '2025-06-02', description: 'IOF S/ TRANSACAO DEMO', amount: 140,
+        direction: 'DEBIT', kind: 'TAX', cardIdentifier: '4321 XXXX XXXX 1111',
+      }],
+    })
+    render(<App />)
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic'], 'fatura-taxas.pdf', { type: 'application/pdf' }))
+    const entry = await screen.findByTestId('card-pdf-entry')
+    await user.click(within(entry).getByRole('button', { name: 'Ver detalhes' }))
+
+    expect(within(entry).getByText('Encargos/taxas extraídos')).toBeInTheDocument()
+    expect(within(entry).getByText(/IOF S\/ TRANSACAO DEMO/)).toBeInTheDocument()
+    expect(within(entry).getByText('Imposto/tributo · cartão final 1111')).toBeInTheDocument()
+    expect(within(entry).getAllByText('✓ Valores conferem')).toHaveLength(2)
+  })
+
+  it('exibe o grupo de parcelas estornado de forma compacta e não oferece adicionar as parcelas à planilha', async () => {
+    const user = userEvent.setup()
+    const purchases = Array.from({ length: 10 }, (_, index) => ({
+      ...syntheticStatement.transactions[0], id: `refund-purchase-${index + 1}`, purchaseDate: '2026-09-19', date: '2026-09-19',
+      invoiceDueDate: '2026-10-12', statementDueDate: '2026-10-12', originalDescription: 'LOJA MODELO', description: 'LOJA MODELO',
+      amount: 10001, cardIdentifier: 'XXXX XXXX XXXX 5514', installment: index + 1, totalInstallments: 10,
+      financialStatus: 'REFUNDED' as const, refundGroupId: 'refund-group-synthetic',
+    }))
+    const credit = { ...syntheticStatement.transactions[2], id: 'refund-credit-synthetic', purchaseDate: '2026-09-19', date: '2026-09-19', invoiceDueDate: '2026-10-12', statementDueDate: '2026-10-12', originalDescription: 'LOJA MODELO', description: 'LOJA MODELO', amount: 100010, direction: 'CREDIT' as const, type: 'REFUND' as const, cardIdentifier: 'XXXX XXXX XXXX 5514' }
+    const transactionIds = purchases.map((purchase) => purchase.id)
+    vi.mocked(readCardStatementPdf).mockResolvedValueOnce({
+      ...structuredClone(syntheticStatement), fileName: 'fatura-estorno.pdf', statementIdentity: 'statement-aggregate-refund',
+      dueDate: '2026-10-12', reportedTotal: 10001, purchasesDebitsTotal: 100010, creditsPaymentsTotal: 100010,
+      previousBalance: 0, accountingDifference: 0, cardSubtotals: [{ cardIdentifier: 'XXXX XXXX XXXX 5514', amount: 10001 }],
+      transactions: [...purchases, credit], refundGroups: [{ id: 'refund-group-synthetic', cardIdentifier: 'XXXX XXXX XXXX 5514', date: '2026-09-19', merchant: 'LOJA MODELO', transactionIds, refundTransactionId: credit.id, purchaseGroupAmount: 100010, refundAmount: 100010, netAmount: 0, installmentCount: 10 }],
+    })
+    render(<App />)
+    const csv = new File(['Descrição,Data,Custo,Forma de pagamento\nALUGUEL,12/10/2026,"500,00",Pix'], 'custos.csv', { type: 'text/csv' })
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], csv)
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic'], 'fatura-estorno.pdf', { type: 'application/pdf' }))
+    await screen.findByText(/^Fatura /)
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+
+    expect(await screen.findByText(/Compra cancelada · 10 parcelas · R\$ 1\.000,10 estornados/)).toBeInTheDocument()
+    expect(screen.getByText(/0 compras conciliáveis · 0 conciliadas · 0 revisão · 0 ausentes · 10 parcelas estornadas/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Ver detalhes do estorno' }))
+    expect(screen.getByText(/Débitos do grupo/)).toBeInTheDocument()
+    expect(screen.getByText(/Crédito associado/)).toBeInTheDocument()
+    expect(screen.getByText(/Líquido/)).toBeInTheDocument()
+    expect(screen.getByText(/parcela 10\/10/)).toBeInTheDocument()
+  })
+
   it('adiciona compra ausente de PDF como Crédito_Bradesco e persiste vínculo com a transação da fatura', async () => {
     const user = userEvent.setup()
     const category = { id: 'category-row', source: 'SHEET' as const, sheetRecordId: 'category-row', bankTransactionId: null, date: '2026-01-01', description: 'Escola', originalDescription: 'Escola', amount: 9000, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }

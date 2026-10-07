@@ -1,4 +1,4 @@
-import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementReconciliation, CardStatementTransaction, LedgerTransaction } from '../domain/types'
+import type { BankTransaction, CardStatement, CardStatementFinancialAdjustment, CardStatementMatch, CardStatementReconciliation, CardStatementRefundGroup, CardStatementTransaction, LedgerTransaction } from '../domain/types'
 import { descriptionSimilarity, normalizeDate, normalizeDescription } from './normalize'
 import { stableFingerprint } from '../domain/identity'
 
@@ -129,15 +129,92 @@ function parseInternetBankingPages(pages: string[][], fileName: string): CardSta
   const previousBalance = amountAfterLabel(allLines, /saldo anterior/)
   const creditsPaymentsTotal = amountAfterLabel(allLines, /pagamentos?\s*\/\s*creditos/)
     ?? amountAfterLabel(allLines, /\(-\)\s*pagamentos?\s*\/\s*creditos/)
-  const purchasesDebitsTotal = amountAfterLabel(allLines, /\(\+\)\s*despesas locais/)
+  const localExpensesTotal = amountAfterLabel(allLines, /\(\+\)\s*despesas locais/)
+  const foreignExpensesTotal = amountAfterLabel(allLines, /despesas no exterior/)
+  const purchasesDebitsTotal = localExpensesTotal == null && foreignExpensesTotal == null
+    ? null : (localExpensesTotal ?? 0) + (foreignExpensesTotal ?? 0)
   const transactions: CardStatementTransaction[] = []
+  const financialAdjustments: CardStatementFinancialAdjustment[] = []
   const cardSubtotals: CardStatement['cardSubtotals'] = []
   let activeCard = ''
   let pendingDay: string | null = null
-  let pendingDescription: string | null = null
+  let pendingRows: string[] = []
+  let pendingExplicitDate: string | null = null
+  let lastTransactionDate: string | null = null
   let previousPayment: number | null = null
+  let extractedPaymentTotal = 0
   let purchaseId = 0
   const errors: string[] = []
+
+  const resetCardContext = () => {
+    pendingDay = null
+    pendingRows = []
+    pendingExplicitDate = null
+    lastTransactionDate = null
+  }
+
+  const readFinancialRow = (row: string, date: string | null) => {
+    const clean = row.trim()
+    const description = internetBankingDescription(clean)
+    const descriptionKey = normalized(description)
+    if (/\b(?:pagto\.?|pagamento da fatura|pagto por deb)\b/i.test(descriptionKey)) {
+      const payment = moneyFromLine(clean)
+      if (payment != null) {
+        const amount = Math.abs(payment)
+        extractedPaymentTotal += amount
+        previousPayment = amount || previousPayment
+      }
+      return
+    }
+    if (/^saldo anterior\b/i.test(descriptionKey) || !date) return
+    const signedAmount = moneyFromLine(clean)
+    if (signedAmount == null || signedAmount === 0) return
+    if (!description) return
+    const adjustmentKind = internetBankingAdjustmentKind(description)
+    if (adjustmentKind) {
+      financialAdjustments.push({
+        id: `card-adjustment-${purchaseId + financialAdjustments.length + 1}`,
+        date,
+        description,
+        amount: Math.abs(signedAmount),
+        direction: signedAmount < 0 ? 'CREDIT' : 'DEBIT',
+        kind: adjustmentKind,
+        cardIdentifier: activeCard,
+      })
+      lastTransactionDate = date
+      return
+    }
+    if (isInternetBankingNonTransactionRow(description)) return
+    const installment = parseInstallment(description)
+    const amount = Math.abs(signedAmount)
+    const transaction: CardStatementTransaction = {
+      id: `card-${++purchaseId}`,
+      purchaseDate: date,
+      invoiceDueDate: dueDate,
+      date,
+      description: installment.description,
+      originalDescription: installment.description,
+      amount,
+      direction: signedAmount < 0 ? 'CREDIT' : 'DEBIT',
+      type: signedAmount < 0 ? 'REFUND' : 'PURCHASE',
+      ...(signedAmount > 0 ? { financialStatus: 'ACTIVE' as const } : {}),
+      cardIdentifier: activeCard,
+      installment: installment.installment,
+      totalInstallments: installment.totalInstallments,
+      city: '', currency: 'BRL', exchangeRate: null, statementDueDate: dueDate, statementTotal: null,
+    }
+    transactions.push(transaction)
+    lastTransactionDate = date
+  }
+
+  const finishPendingDay = (monthName: string) => {
+    if (pendingDay && pendingRows.length) {
+      const date = statementMonthDate(pendingDay, monthName, dueDate)
+      pendingRows.forEach((row) => readFinancialRow(row, date))
+    }
+    pendingDay = null
+    pendingRows = []
+  }
 
   for (const rawLine of allLines) {
     const line = rawLine.trim()
@@ -146,65 +223,152 @@ function parseInternetBankingPages(pages: string[][], fileName: string): CardSta
       activeCard = `XXXX XXXX XXXX ${cardHeader[1]}`
       const subtotal = amountFromCardHeader(line)
       if (subtotal != null) cardSubtotals.push({ cardIdentifier: activeCard, amount: subtotal })
-      pendingDay = null
-      pendingDescription = null
+      resetCardContext()
       continue
     }
-    if (/total da fatura\s*\(final/i.test(normalized(line))) { activeCard = ''; continue }
-    if (/^\d{1,2}$/.test(line)) { pendingDay = line; pendingDescription = null; continue }
-    if (/^(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)$/i.test(normalized(line))) {
-      if (activeCard && pendingDay && pendingDescription) {
-        const date = statementMonthDate(pendingDay, line, dueDate)
-        const amountMatch = [...pendingDescription.matchAll(moneyPattern)].at(-1)
-        const description = amountMatch ? pendingDescription.slice(0, amountMatch.index).replace(/[|]/g, ' ').trim() : ''
-        const statementLine = date && amountMatch
-          ? [`${date.slice(8, 10)}/${date.slice(5, 7)}/${date.slice(0, 4)}`, description, '', '', '', amountMatch[0]].join(' | ')
-          : ''
-        if (/\b(?:pagto\.?|pagamento da fatura|pagto por deb)\b/i.test(normalized(pendingDescription))) {
-          previousPayment = Math.abs(moneyFromLine(pendingDescription) ?? 0) || previousPayment
-        } else {
-          const transaction = date ? parsePurchaseRow(statementLine, activeCard, dueDate, ++purchaseId) : null
-          if (transaction) transactions.push(transaction)
-        }
-      }
-      pendingDay = null
-      pendingDescription = null
-      continue
-    }
-    if (/^resumo das despesas\b/i.test(normalized(line))) { activeCard = ''; pendingDay = null; pendingDescription = null; continue }
+    if (/total da fatura\s*\(final/i.test(normalized(line))) { activeCard = ''; resetCardContext(); continue }
+    if (/^resumo das despesas\b/i.test(normalized(line))) { activeCard = ''; resetCardContext(); continue }
     if (!activeCard) continue
-    if (/\b(?:pagto\.?|pagamento da fatura|pagto por deb)\b/i.test(normalized(line))) {
-      previousPayment = Math.abs(moneyFromLine(line) ?? 0) || previousPayment
-      pendingDescription = null
+
+    const explicitDateOnly = line.match(/^\s*(\d{2}\/\d{2}(?:\/\d{4})?)\s*$/)
+    if (explicitDateOnly) {
+      pendingExplicitDate = statementDate(explicitDateOnly[1], dueDate)
       continue
     }
-    if (/^saldo anterior\b/i.test(normalized(line))) { pendingDescription = null; continue }
-    if (pendingDay && !pendingDescription && moneyFromLine(line) != null) pendingDescription = line
+    if (/^\d{1,2}$/.test(line)) { pendingDay = line; pendingRows = []; pendingExplicitDate = null; continue }
+    if (/^(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)$/i.test(normalized(line))) {
+      finishPendingDay(line)
+      continue
+    }
+
+    const explicitDate = line.match(/^\s*(\d{2}\/\d{2}(?:\/\d{4})?)\b/)
+    if (explicitDate) {
+      const date = statementDate(explicitDate[1], dueDate)
+      readFinancialRow(line, date)
+      pendingDay = null
+      pendingRows = []
+      pendingExplicitDate = null
+      continue
+    }
+
+    if (!moneyFromLine(line)) continue
+    if (pendingDay) {
+      pendingRows.push(line)
+      continue
+    }
+    const date = pendingExplicitDate ?? lastTransactionDate
+    readFinancialRow(line, date)
+    pendingExplicitDate = null
   }
 
-  const distinctCards = [...new Set([...transactions.map((item) => item.cardIdentifier), ...cardSubtotals.map((item) => item.cardIdentifier)])].sort()
+  const distinctCards = [...new Set([...transactions.map((item) => item.cardIdentifier), ...financialAdjustments.map((item) => item.cardIdentifier), ...cardSubtotals.map((item) => item.cardIdentifier)])].sort()
   const statementIdentity = `statement-${stableFingerprint([dueDate ?? '', reportedTotal == null ? '' : String(reportedTotal), ...distinctCards.map((id) => id.slice(-4))])}`
   transactions.forEach((transaction) => {
     transaction.statementTotal = reportedTotal
     transaction.id = `card-${statementIdentity}-${stableFingerprint([transaction.cardIdentifier, transaction.date, transaction.originalDescription, transaction.amount, transaction.direction, transaction.installment, transaction.totalInstallments])}`
   })
+  const refundGroups = identifyAggregatedRefundGroups(transactions)
   const purchaseTotal = transactions.filter((item) => item.type === 'PURCHASE').reduce((sum, item) => sum + item.amount, 0)
+  const refundTotal = transactions.filter((item) => item.type === 'REFUND').reduce((sum, item) => sum + item.amount, 0)
+  const adjustmentDebitTotal = financialAdjustments.filter((item) => item.direction === 'DEBIT').reduce((sum, item) => sum + item.amount, 0)
+  const adjustmentCreditTotal = financialAdjustments.filter((item) => item.direction === 'CREDIT').reduce((sum, item) => sum + item.amount, 0)
+  const localFinancialDebits = purchaseTotal + adjustmentDebitTotal
+  const extractedCreditsTotal = extractedPaymentTotal + refundTotal + adjustmentCreditTotal
   if (!dueDate) errors.push('Vencimento da fatura não encontrado; confira o PDF antes de conciliar.')
   if (reportedTotal == null || reportedTotal <= 0) errors.push('Total informado da fatura não encontrado ou inválido; confira o PDF antes de conciliar.')
   if (!distinctCards.length) errors.push('Nenhum cartão foi identificado na fatura.')
-  if (!transactions.length) errors.push('Não foi possível localizar compras ou créditos válidos na fatura.')
+  if (!transactions.length && !financialAdjustments.length) errors.push('Não foi possível localizar compras, créditos ou encargos válidos na fatura.')
   if (reportedTotal != null && cardSubtotals.length && cardSubtotals.reduce((sum, card) => sum + card.amount, 0) !== reportedTotal) errors.push('A soma dos subtotais dos cartões não confere com o total informado da fatura.')
-  if (cardSubtotals.some((subtotal) => transactions.filter((item) => item.cardIdentifier === subtotal.cardIdentifier).reduce((sum, item) => sum + (item.direction === 'DEBIT' ? item.amount : -item.amount), 0) !== subtotal.amount)) errors.push('Divergência entre lançamentos extraídos e subtotal informado para um dos cartões.')
-  if (purchasesDebitsTotal != null && purchaseTotal !== purchasesDebitsTotal) errors.push('Divergência entre compras extraídas e total de Despesas locais informado pela fatura.')
+  if (cardSubtotals.some((subtotal) => {
+    const transactionNet = transactions.filter((item) => item.cardIdentifier === subtotal.cardIdentifier).reduce((sum, item) => sum + (item.direction === 'DEBIT' ? item.amount : -item.amount), 0)
+    const adjustmentNet = financialAdjustments.filter((item) => item.cardIdentifier === subtotal.cardIdentifier).reduce((sum, item) => sum + (item.direction === 'DEBIT' ? item.amount : -item.amount), 0)
+    return transactionNet + adjustmentNet !== subtotal.amount
+  })) errors.push('Divergência entre lançamentos e encargos extraídos e subtotal informado para um dos cartões.')
+  if (purchasesDebitsTotal != null && localFinancialDebits !== purchasesDebitsTotal) errors.push('Divergência entre débitos financeiros extraídos e total de Despesas locais e no exterior informado pela fatura.')
+  if (creditsPaymentsTotal != null && extractedCreditsTotal !== creditsPaymentsTotal) errors.push('Divergência entre pagamentos/créditos extraídos e total de Pagamentos/Créditos informado pela fatura.')
   const accountingDifference = previousBalance != null && creditsPaymentsTotal != null && purchasesDebitsTotal != null && reportedTotal != null
     ? previousBalance - creditsPaymentsTotal + purchasesDebitsTotal - reportedTotal : null
   if (accountingDifference != null && accountingDifference !== 0) errors.push('A relação entre saldo anterior, créditos/pagamentos, compras/débitos e total da fatura não fecha.')
-  return { fileName, sourceLayout: 'INTERNET_BANKING', pageCount: pages.length, statementIdentity, transactions, cardSubtotals, reportedTotal, invoicePaymentMethod, bestPurchaseDay, purchasesDebitsTotal, creditsPaymentsTotal, previousBalance, previousPayment, accountingDifference, dueDate, nextClosingDate: null, errors: [...new Set(errors)] }
+  return { fileName, sourceLayout: 'INTERNET_BANKING', pageCount: pages.length, statementIdentity, transactions, financialAdjustments, refundGroups, cardSubtotals, reportedTotal, invoicePaymentMethod, bestPurchaseDay, purchasesDebitsTotal, creditsPaymentsTotal, previousBalance, previousPayment, accountingDifference, dueDate, nextClosingDate: null, errors: [...new Set(errors)] }
+}
+
+/** Recognize only uniquely attributable, exact-value installment refund groups before sheet matching. */
+export function identifyAggregatedRefundGroups(transactions: CardStatementTransaction[]): CardStatementRefundGroup[] {
+  const installments = new Map<string, CardStatementTransaction[]>()
+  for (const purchase of transactions.filter((item) => item.type === 'PURCHASE' && item.installment != null && (item.totalInstallments ?? 0) > 1)) {
+    const key = JSON.stringify([purchase.cardIdentifier, purchase.date, normalizeDescription(purchase.originalDescription), purchase.totalInstallments])
+    installments.set(key, [...(installments.get(key) ?? []), purchase])
+  }
+  const candidateGroups = [...installments.entries()].flatMap(([key, rows]) => {
+    const total = rows[0].totalInstallments!
+    const numbers = rows.map((row) => row.installment!).sort((a, b) => a - b)
+    if (rows.length !== total || numbers.some((number, index) => number !== index + 1)) return []
+    const amount = rows.reduce((sum, row) => sum + row.amount, 0)
+    const [cardIdentifier, date, merchant] = JSON.parse(key) as [string, string, string, number]
+    return [{ key, rows, amount, cardIdentifier, date, merchant, total }]
+  })
+  const credits = transactions.filter((item) => item.type === 'REFUND' && item.direction === 'CREDIT')
+  const candidates = candidateGroups.flatMap((group) => credits
+    .filter((credit) => credit.cardIdentifier === group.cardIdentifier && credit.date === group.date
+      && normalizeDescription(credit.originalDescription) === group.merchant && credit.amount === group.amount)
+    .map((credit) => ({ group, credit })))
+  const groupCounts = new Map<string, number>(), creditCounts = new Map<string, number>()
+  candidates.forEach(({ group, credit }) => {
+    groupCounts.set(group.key, (groupCounts.get(group.key) ?? 0) + 1)
+    creditCounts.set(credit.id, (creditCounts.get(credit.id) ?? 0) + 1)
+  })
+  return candidates.filter(({ group, credit }) => groupCounts.get(group.key) === 1 && creditCounts.get(credit.id) === 1).map(({ group, credit }) => {
+    const orderedRows = [...group.rows].sort((a, b) => a.installment! - b.installment!)
+    const transactionIds = orderedRows.map((row) => row.id)
+    const id = `refund-group-${stableFingerprint([group.cardIdentifier, group.date, group.merchant, ...transactionIds, credit.id, group.amount])}`
+    orderedRows.forEach((row) => { row.financialStatus = 'REFUNDED'; row.refundGroupId = id })
+    return { id, cardIdentifier: group.cardIdentifier, date: group.date, merchant: orderedRows[0].originalDescription, transactionIds, refundTransactionId: credit.id, purchaseGroupAmount: group.amount, refundAmount: credit.amount, netAmount: group.amount - credit.amount, installmentCount: group.total }
+  })
+}
+
+function markOneToOneRefunds(transactions: CardStatementTransaction[], groupedRefundIds: Set<string>): void {
+  const pairedRefunds = new Set(groupedRefundIds)
+  for (const purchase of transactions.filter((item) => item.type === 'PURCHASE' && item.financialStatus !== 'REFUNDED')) {
+    const refund = transactions.find((item) => item.type === 'REFUND' && !pairedRefunds.has(item.id)
+      && item.cardIdentifier === purchase.cardIdentifier && item.date === purchase.date && item.amount === purchase.amount
+      && normalizeDescription(item.originalDescription) === normalizeDescription(purchase.originalDescription))
+    if (refund) { purchase.financialStatus = 'REFUNDED'; pairedRefunds.add(refund.id) }
+  }
 }
 
 function amountFromCardHeader(line: string): number | null {
   const match = line.match(/valor da fatura:[^\d\n]*R\$\s*([\d.]+,\d{2})/i)
   return match ? parseBrazilianMoney(match[1]) : null
+}
+
+function isInternetBankingNonTransactionRow(line: string): boolean {
+  return /^(?:data\b|lan[cç]amentos\b|moeda\b|valor da fatura\b|forma de pagamento\b|melhor data de compra\b|total\b|resumo\b|saldo anterior\b|despesas locais\b|despesas no exterior\b|\(-\)\s*pagamentos?\s*\/\s*cr[eé]ditos\b|\(\+\)\s*despesas\b|\(=\)\s*total\b|gastos referentes\b|cet\b|informa[cç][oõ]es legais\b)/i.test(line.trim())
+}
+
+function internetBankingAdjustmentKind(description: string): CardStatementFinancialAdjustment['kind'] | null {
+  const key = normalized(description)
+  if (/\b(?:iof|imposto|tributo|taxa tributaria)\b/.test(key)) return 'TAX'
+  if (/\b(?:tarifa|taxa|juros|encargos?)\b/.test(key)) return 'FEE'
+  return null
+}
+
+function internetBankingDescription(line: string): string {
+  const cells = rowCells(line)
+  if (cells.length > 1) {
+    const hasDateCell = /^\d{2}\/\d{2}(?:\/\d{4})?(?:\s|$)/.test(cells[0])
+    const relevant = cells.slice(hasDateCell ? 1 : 0)
+    const amountIndex = relevant.findIndex((cell) => [...cell.matchAll(new RegExp(moneyPattern.source, moneyPattern.flags))].length > 0)
+    const descriptionCell = (amountIndex >= 0 ? relevant.slice(0, amountIndex) : relevant).find((cell) => cell.trim())
+    if (descriptionCell) return descriptionCell
+      .replace(/^\s*\d{2}\/\d{2}(?:\/\d{4})?\s*/, '')
+      .replace(/[|]/g, ' ').replace(/\s+/g, ' ').trim()
+  }
+  return line
+    .replace(/^\s*\d{2}\/\d{2}(?:\/\d{4})?\s*/, '')
+    .replace(new RegExp(moneyPattern.source, moneyPattern.flags), ' ')
+    .replace(/[|\t]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function rowCells(line: string): string[] {
@@ -332,17 +496,8 @@ function parseMobileAppPages(pages: string[][], fileName: string): CardStatement
     transaction.statementTotal = reportedTotal
     transaction.id = `card-${statementIdentity}-${stableFingerprint([transaction.cardIdentifier, transaction.date, transaction.originalDescription, transaction.amount, transaction.direction, transaction.installment, transaction.totalInstallments])}`
   })
-  // Pair only strong, one-to-one refund evidence: same card, date, amount, and normalized merchant.
-  const pairedRefunds = new Set<string>()
-  for (const purchase of transactions.filter((item) => item.type === 'PURCHASE')) {
-    const refund = transactions.find((item) => item.type === 'REFUND' && !pairedRefunds.has(item.id)
-      && item.cardIdentifier === purchase.cardIdentifier && item.date === purchase.date && item.amount === purchase.amount
-      && normalizeDescription(item.originalDescription) === normalizeDescription(purchase.originalDescription))
-    if (refund) {
-      purchase.financialStatus = 'REFUNDED'
-      pairedRefunds.add(refund.id)
-    }
-  }
+  const refundGroups = identifyAggregatedRefundGroups(transactions)
+  markOneToOneRefunds(transactions, new Set(refundGroups.map((group) => group.refundTransactionId)))
   for (const subtotal of cardSubtotals) {
     const actual = transactions.filter((transaction) => transaction.cardIdentifier === subtotal.cardIdentifier).reduce((sum, transaction) => sum + (transaction.direction === 'DEBIT' ? transaction.amount : -transaction.amount), 0)
     if (actual !== subtotal.amount) errors.push(`Divergência entre lançamentos extraídos e subtotal informado para o cartão final ${subtotal.cardIdentifier.slice(-4)}.`)
@@ -358,7 +513,7 @@ function parseMobileAppPages(pages: string[][], fileName: string): CardStatement
   if (accountingDifference != null && accountingDifference !== 0) errors.push('A relação entre saldo anterior, créditos/pagamentos, compras/débitos e total da fatura não fecha.')
   if (!purchaseTransactions.length) errors.push('Não foi possível localizar compras na seção Lançamentos da fatura.')
   if (reportedTotal == null) errors.push('Total informado da fatura não encontrado; confira o PDF antes de conciliar.')
-  return { fileName, sourceLayout: 'MOBILE_APP', pageCount: pages.length, statementIdentity, transactions, cardSubtotals, reportedTotal, purchasesDebitsTotal, creditsPaymentsTotal, previousBalance, previousPayment, accountingDifference, dueDate, nextClosingDate, errors: [...new Set(errors)] }
+  return { fileName, sourceLayout: 'MOBILE_APP', pageCount: pages.length, statementIdentity, transactions, refundGroups, cardSubtotals, reportedTotal, purchasesDebitsTotal, creditsPaymentsTotal, previousBalance, previousPayment, accountingDifference, dueDate, nextClosingDate, errors: [...new Set(errors)] }
 }
 
 function groupPageText(items: PdfTextItem[], pageWidth: number): string[] {

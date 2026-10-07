@@ -16,6 +16,16 @@ const missingMatch = (): CardStatementMatch => ({ transaction: statement.transac
 const oldMissing: PersistedDecision = { key: 'CARD_MISSING_CONFIRMED:["old-identity"]', schemaVersion: 1, kind: 'CARD_MISSING_CONFIRMED', identities: ['old-identity'], selected: [], updatedAt: '2026-02-03T00:00:00.000Z' }
 
 describe('consistency audit', () => {
+  it('exclui compra neutralizada por estorno agregado da auditoria de ausências e candidatos', () => {
+    const canceled = { ...statement.transactions[0], financialStatus: 'REFUNDED' as const, refundGroupId: 'refund-group-synthetic' }
+    const invoice = { ...statement, transactions: [canceled], refundGroups: [{ id: 'refund-group-synthetic', cardIdentifier: '0000', date: canceled.date, merchant: 'LOJA MODELO', transactionIds: [canceled.id], refundTransactionId: 'refund-credit', purchaseGroupAmount: 299, refundAmount: 299, netAmount: 0, installmentCount: 1 }] }
+    const result = auditConsistency({ banks: [], sheets: [], statements: [{ statement: invoice }], currentCardMatches: [{ statementIdentity: invoice.statementIdentity, transactionId: canceled.id, match: { transaction: canceled, status: 'CARD_REFUNDED', sheet: null, candidates: [] } }], localDecisions: [] })
+    expect(result.items).toEqual([])
+    expect(result.findings.map((finding) => finding.code)).not.toContain('CARD_MISSING_NO_CANDIDATE')
+    expect(result.findings.map((finding) => finding.code)).not.toContain('UNUSED_STRONG_CANDIDATE')
+    expect(result.findings.map((finding) => finding.code)).not.toContain('DOUBLE_CLAIM')
+  })
+
   const selfitDecisionScenario = () => {
     const makePurchase = (id: string, purchaseDate: string, dueDate: string): CardStatementTransaction => ({ ...statement.transactions[0], id, purchaseDate, date: purchaseDate, invoiceDueDate: dueDate, statementDueDate: dueDate, originalDescription: 'SELFITHOMEROCASTELOBRA', description: 'SELFITHOMEROCASTELOBRA', amount: 12990 })
     const mayPurchase = makePurchase('selfit-may-purchase', '2026-05-08', '2026-06-12')

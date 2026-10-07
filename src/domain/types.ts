@@ -153,6 +153,7 @@ export interface CardStatementTransaction {
   direction: 'DEBIT' | 'CREDIT'
   type: 'PURCHASE' | 'REFUND'
   financialStatus?: 'ACTIVE' | 'REFUNDED'
+  refundGroupId?: string
   cardIdentifier: string
   installment: number | null
   totalInstallments: number | null
@@ -163,12 +164,39 @@ export interface CardStatementTransaction {
   statementTotal: number | null
 }
 
+/** Financial charges/taxes that affect an invoice but are not individual purchases to reconcile. */
+export interface CardStatementFinancialAdjustment {
+  id: string
+  date: string
+  description: string
+  amount: number
+  direction: 'DEBIT' | 'CREDIT'
+  kind: 'FEE' | 'TAX' | 'OTHER'
+  cardIdentifier: string
+}
+
+/** Auditable relationship between a complete installment purchase group and one aggregate refund. */
+export interface CardStatementRefundGroup {
+  id: string
+  cardIdentifier: string
+  date: string
+  merchant: string
+  transactionIds: string[]
+  refundTransactionId: string
+  purchaseGroupAmount: number
+  refundAmount: number
+  netAmount: number
+  installmentCount: number
+}
+
 export interface CardStatement {
   fileName: string
   sourceLayout?: 'MOBILE_APP' | 'INTERNET_BANKING' | 'UNKNOWN'
   pageCount: number
   statementIdentity: string
   transactions: CardStatementTransaction[]
+  financialAdjustments?: CardStatementFinancialAdjustment[]
+  refundGroups?: CardStatementRefundGroup[]
   cardSubtotals: { cardIdentifier: string; amount: number }[]
   reportedTotal: number | null
   /** How the invoice itself is paid (for example, debit from account). */

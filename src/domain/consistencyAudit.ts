@@ -187,7 +187,7 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
   const findings: AuditFinding[] = []
   const pureStates: Record<string, string> = {}, currentStates: Record<string, string> = {}
   const onlySubjectFingerprints = input.onlySubjectFingerprints ? new Set(input.onlySubjectFingerprints) : null
-  for (const entry of input.statements) for (const transaction of entry.statement.transactions.filter((tx) => tx.type === 'PURCHASE')) {
+  for (const entry of input.statements) for (const transaction of entry.statement.transactions.filter((tx) => tx.type === 'PURCHASE' && tx.financialStatus !== 'REFUNDED')) {
     const key = `${entry.statement.statementIdentity}\u001f${transaction.id}`
     const identity = cardTransactionIdentity(entry.statement, transaction)
     if (onlySubjectFingerprints && !onlySubjectFingerprints.has(identity)) continue
