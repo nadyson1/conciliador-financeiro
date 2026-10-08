@@ -62,8 +62,8 @@ describe('resumo de despesas ausentes', () => {
       { status: 'MATCHED', bank: bank({ amount: 10000, direction: 'DEBIT', type: 'EXPENSE' }) },
     ]
     const visible = selectMissingExpenses(items)
-    expect(visible).toHaveLength(2)
-    expect(summarizeMissingExpenses(visible)).toEqual({ count: 2, total: 3500 })
+    expect(visible).toHaveLength(1)
+    expect(summarizeMissingExpenses(visible)).toEqual({ count: 1, total: 1000 })
   })
 
   it('acompanha o subconjunto visível após aplicar o filtro de período', () => {

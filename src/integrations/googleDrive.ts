@@ -52,7 +52,7 @@ export async function downloadGoogleDriveFile(fileId: string, accessToken: strin
 export function isSupportedDriveFile(file: GoogleDriveFile, kind: DriveFolderKind): boolean {
   const name = file.name.toLocaleLowerCase('pt-BR')
   if (kind === 'invoices') return file.mimeType === 'application/pdf' || name.endsWith('.pdf')
-  return name.endsWith('.csv') || ['text/csv', 'application/vnd.ms-excel', 'application/csv'].includes(file.mimeType)
+  return name.endsWith('.csv') || name.endsWith('.ofx') || ['text/csv', 'application/vnd.ms-excel', 'application/csv', 'application/x-ofx', 'application/ofx'].includes(file.mimeType)
 }
 
 type PickerDocument = { id: string; name: string; mimeType: string }

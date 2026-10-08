@@ -1,6 +1,8 @@
 import type { BankTransaction, ColumnMap, CsvDocument, ExcludedBankRow, LedgerTransaction, ParsedTransactions, RowIssue } from '../domain/types'
 import { classifySheetRecord, investmentAction, normalizeAmount, normalizeDate, parseBoolean, transactionType } from './normalize'
 import { stableFingerprint } from '../domain/identity'
+import { counterpartyEvidence, counterpartyFromDescription } from './counterparty'
+import type { CounterpartySource } from '../domain/types'
 
 const cell = (row: Record<string, string>, key?: string) => key ? String(row[key] ?? '').trim() : ''
 const installmentFrom = (description: string) => {
@@ -83,6 +85,7 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap, ph
     if (date && statementPeriod && (date < statementPeriod.start || date > statementPeriod.end)) { exclude(row, index, 'OUTSIDE_STATEMENT_PERIOD'); return }
     if (splitColumns && !debitPresent && !creditPresent && !genericAmountText) { exclude(row, index, date && originalDescription ? 'NO_MOVEMENT' : 'FOOTER_OR_METADATA'); return }
     if (!date && !debitPresent && !creditPresent && !genericAmountText) { exclude(row, index, 'EMPTY'); return }
+    if (!date && /^total(?:\s|$)/i.test(originalDescription)) { exclude(row, index, 'FOOTER_OR_METADATA'); return }
     // Totais e outras linhas de rodapé podem preencher débito e crédito ao mesmo tempo,
     // mas sem data e histórico não representam uma transação individual.
     if (!date && !originalDescription) { exclude(row, index, 'FOOTER_OR_METADATA'); return }
@@ -108,7 +111,7 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap, ph
     const describedType = transactionType(originalDescription)
     const action = investmentAction(originalDescription)
     const explicitTextDirection = /credit|credito|entrada|receb|debit|debito|saida|pag/.test(directionValue)
-    const directionKnown = Boolean(splitColumns && (debitPresent || creditPresent)) || explicitTextDirection || describedType === 'INCOME' || describedType === 'REFUND' || describedType === 'INVESTMENT_INCOME' || (describedType === 'EXPENSE' && /pix enviado|pix qr code|compra|seguro cart deb bradesco|conta de telefone|mercado|supermercado|farmacia|drogaria|posto de combustivel/.test(originalDescription.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase())) || (describedType === 'INVESTMENT' && action != null) || describedType === 'CARD_PAYMENT'
+    const directionKnown = Boolean(splitColumns && (debitPresent || creditPresent)) || explicitTextDirection || describedType === 'INCOME' || describedType === 'REFUND' || describedType === 'INVESTMENT_INCOME' || describedType === 'EXPENSE' || (describedType === 'INVESTMENT' && action != null) || describedType === 'CARD_PAYMENT'
     let direction: 'DEBIT' | 'CREDIT'
     if (splitColumns && (debitPresent || creditPresent)) direction = debitPresent ? 'DEBIT' : 'CREDIT'
     else if (/credit|credito|entrada|receb/.test(directionValue)) direction = 'CREDIT'
@@ -121,14 +124,24 @@ export function parseBankRows(rows: Record<string, string>[], map: ColumnMap, ph
     const type = classifiedType
     const outOfScopeSubtype = /^rentab invest facilcred(?: |$)/.test(originalDescription.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()) ? 'INVEST_FACIL_YIELD' as const : undefined
     const installment = installmentFrom(originalDescription)
+    const sourceDescription = cell(row, '__sourceDescription') || originalDescription
+    const counterpartyName = cell(row, '__counterpartyName') || counterpartyFromDescription(originalDescription)
+    const counterpartySource = (cell(row, '__counterpartySource') || 'CSV_MOBILE') as CounterpartySource
+    const counterparty = counterpartyEvidence(counterpartyName, counterpartySource)
+    const original = { ...row }
+    delete original.__counterpartyName
+    delete original.__counterpartySource
+    delete original.__sourceDescription
     transactions.push({
       id: `bank-${index + 1}`, sourceRow: rowNumber, source: 'BANK', sheetRecordId: null,
       bankTransactionId: cell(row, map.id) || '',
       date, description: originalDescription, originalDescription, amount, direction, directionKnown,
+      sourceDescriptions: [...new Set([originalDescription, sourceDescription])],
+      ...(counterparty[0] ? { counterpartyName: counterparty[0].name, counterpartyEvidence: counterparty } : {}),
       type, investmentAction: investmentAction(originalDescription),
       ...(outOfScopeSubtype ? { outOfScopeSubtype } : {}),
       paymentMethod, category: '', month: '', year: date.slice(0, 4), isFixed: null, isEssential: null,
-      ...installment, balanceAfter: map.balance ? normalizeSignedBalance(cell(row, map.balance)) : null, original: { ...row },
+      ...installment, balanceAfter: map.balance ? normalizeSignedBalance(cell(row, map.balance)) : null, original,
     })
   })
   {

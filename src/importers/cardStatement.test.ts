@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import type { BankTransaction, CardStatement, LedgerTransaction } from '../domain/types'
-import { cardStatementFinancialIdentity, deriveCardPurchaseStatus, detectBradescoInvoiceLayout, findExistingCostYearCandidates, identifyAggregatedRefundGroups, identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
+import { cardStatementFinancialIdentity, deriveCardPurchaseStatus, detectBradescoInvoiceLayout, findExistingCostYearCandidates, identifyAggregatedRefundGroups, identifyOneToOneRefundGroups, identifyStatementPayment, identifyStatementPayments, parseBrazilianMoney, parseCardStatementPages, reconcileCardStatement } from './cardStatement'
 import { findDuplicateGroups, reconcile } from '../matching/reconcile'
 import { parseLedgerRows } from './transactions'
+import { summarizeCardPurchases } from '../features/cardStatementCounts'
 
 const syntheticPages = [
   [
@@ -78,6 +79,32 @@ const internetBankingInvoicePages = [
   ],
 ]
 
+// Sanitized structural reproductions of Internet Banking PDFs without card-specific sections.
+const internetBankingSelectedCardOnlyMayPages = [[
+  'Fatura | Data 07/10/2026 - 03:39:06', 'Cartao selecionado', '**** **** **** 1271',
+  'Data de vencimento: | 12/05/2026', 'Total da fatura: | R$ 191,68',
+  'Data | Lançamentos | Moeda de Origem | Valor (US$) | Cotação (US$) | Valor (R$)',
+  '28', 'SEGURO SUPERPROTEGIDO | 9,99', 'ABR',
+  '15', 'CRIAR CENTRO VETERINAR ( 01/02 ) | 181,69', 'ABR',
+  'Total da fatura (final 1271): | R$ 191,68',
+  'Resumo das Despesas | Real', 'Saldo anterior | 0,00', '(-)Pagamentos/Créditos: | 0,00',
+  '(+)Despesas locais: | 191,68', '(=)Total da fatura: | 191,68',
+]]
+
+const internetBankingSelectedCardOnlyJunePages = [[
+  'Fatura | Data 07/10/2026 - 03:39:14', 'Cartao selecionado', '**** **** **** 1271',
+  'Data de vencimento: | 12/06/2026', 'Total da fatura: | R$ 827,67',
+  'Data | Lançamentos | Moeda de Origem | Valor (US$) | Cotação (US$) | Valor (R$)',
+  '27', 'EDZIA PIRES COBDE ( 01/04 ) | 255,99', 'MAI',
+  'SEGURO SUPERPROTEGIDO | 9,99',
+  '23', 'AGROLESTE RACOES ( 01/02 ) | 380,00', 'MAI',
+  '12', 'SALDO ANTERIOR | 191,68', 'MAI', 'PAGTO. POR DEB EM C/C | -191,68',
+  '15', 'CRIAR CENTRO VETERINAR ( 02/02 ) | 181,69', 'ABR',
+  'Total da fatura (final 1271): | R$ 827,67',
+  'Resumo das Despesas | Real', 'Saldo anterior | 191,68', '(-)Pagamentos/Créditos: | 191,68',
+  '(+)Despesas locais: | 827,67', '(=)Total da fatura: | 827,67',
+]]
+
 // Sanitized table shapes derived from the two Internet Banking examples. No real statement data is stored here.
 const internetBankingInheritedRefundPages = [
   [
@@ -131,6 +158,23 @@ const internetBankingFinancialClosePages = [[
   '(+)Despesas locais: | 864,02', '(=)Total da fatura: | 764,02',
 ]]
 
+// Synthetic structural reproduction of the reference invoice's exact one-to-one refund.
+const internetBankingFullPurchaseRefundPages = [[
+  'Fatura | Data 07/10/2026 - 03:36:20', 'Cartao selecionado', 'Data de vencimento: | 12/06/2026',
+  'Total da fatura: | R$ 312,75', 'Forma de pagamento: | Débito em conta', '**** **** **** 5875',
+  'Valor da fatura anterior: | R$ 691,85',
+  'Data | Lançamentos | Moeda de Origem | Valor (US$) | Cotação (US$) | Valor (R$)',
+  'Gastos referentes ao cartão: Final 5875 | TITULAR | Valor da fatura: | R$ 129,90',
+  '12', 'SALDO ANTERIOR | 691,85', 'PAGTO. POR DEB EM C/C | -691,85', 'MAI',
+  '08', 'SELFITHOMEROCASTELOBRA | 129,90', 'MAI',
+  '04', 'PETZ DIGITAL | 294,82', 'PETZ DIGITAL | -294,82', 'MAI',
+  'Gastos referentes ao cartão: Final 5514 | TITULAR | Valor da fatura: | R$ 182,85',
+  '14', 'IFD*iFood | 7,95', 'MAI', '27', 'EBN *BATTLE NET | 174,90', 'ABR',
+  'Total da fatura (final 5875 + 5514): | R$ 312,75',
+  'Resumo das Despesas | Real', 'Saldo anterior | 691,85', '(-)Pagamentos/Créditos: | 986,67',
+  '(+)Despesas locais: | 607,57', '(=)Total da fatura: | 312,75',
+]]
+
 const internetBankingFinancialAdjustmentsPages = [[
   'Fatura | Data 07/10/2026 - 00:00:00', 'Cartao selecionado', 'Data de vencimento: | 12/10/2026',
   'Total da fatura: | R$ 222,00',
@@ -158,6 +202,50 @@ function cardBank(id: string, date: string, amount: number): BankTransaction {
 }
 
 describe('PDF de fatura do cartão', () => {
+  it('usa o cartão selecionado como fallback quando a tabela Internet Banking não tem blocos por cartão', () => {
+    const statement = parseCardStatementPages(internetBankingSelectedCardOnlyMayPages)
+
+    expect(statement.sourceLayout).toBe('INTERNET_BANKING')
+    expect(statement).toMatchObject({ dueDate: '2026-05-12', reportedTotal: 19168, errors: [] })
+    expect(statement.cardSubtotals).toEqual([{ cardIdentifier: 'XXXX XXXX XXXX 1271', amount: 19168 }])
+    expect(statement.transactions.map((item) => [item.cardIdentifier, item.date, item.originalDescription, item.amount, item.installment, item.totalInstallments])).toEqual([
+      ['XXXX XXXX XXXX 1271', '2026-04-28', 'SEGURO SUPERPROTEGIDO', 999, null, null],
+      ['XXXX XXXX XXXX 1271', '2026-04-15', 'CRIAR CENTRO VETERINAR', 18169, 1, 2],
+    ])
+  })
+
+  it('usa o cartão selecionado sem converter saldo anterior ou pagamento em compra', () => {
+    const statement = parseCardStatementPages(internetBankingSelectedCardOnlyJunePages)
+
+    expect(statement.sourceLayout).toBe('INTERNET_BANKING')
+    expect(statement).toMatchObject({ dueDate: '2026-06-12', reportedTotal: 82767, previousBalance: 19168, previousPayment: 19168, creditsPaymentsTotal: 19168, purchasesDebitsTotal: 82767, accountingDifference: 0, errors: [] })
+    expect(statement.cardSubtotals).toEqual([{ cardIdentifier: 'XXXX XXXX XXXX 1271', amount: 82767 }])
+    expect(statement.transactions.map((item) => [item.originalDescription, item.amount, item.installment, item.totalInstallments])).toEqual([
+      ['EDZIA PIRES COBDE', 25599, 1, 4],
+      ['SEGURO SUPERPROTEGIDO', 999, null, null],
+      ['AGROLESTE RACOES', 38000, 1, 2],
+      ['CRIAR CENTRO VETERINAR', 18169, 2, 2],
+    ])
+    expect(statement.transactions.some((item) => /saldo anterior|pagto/i.test(item.originalDescription))).toBe(false)
+  })
+
+  it('não cria cartão de fallback sem tabela válida, vencimento e total identificados', () => {
+    const missingTable = parseCardStatementPages([[
+      'Fatura | Data 07/10/2026 - 03:39:06', 'Cartao selecionado', '**** **** **** 1271',
+      'Data de vencimento: | 12/05/2026', 'Total da fatura: | R$ 191,68',
+    ]])
+    const missingSelectedCard = parseCardStatementPages([[
+      'Fatura | Data 07/10/2026 - 03:39:06', 'Data de vencimento: | 12/05/2026',
+      'Total da fatura: | R$ 191,68', 'Data | Lançamentos | Moeda de Origem | Valor (R$)',
+      '28', 'LOJA MODELO | 191,68', 'ABR',
+    ]])
+
+    expect(missingTable.errors.length).toBeGreaterThan(0)
+    expect(missingSelectedCard.sourceLayout).toBe('INTERNET_BANKING')
+    expect(missingSelectedCard.errors).toContain('Nenhum cartão foi identificado na fatura.')
+    expect(missingSelectedCard.transactions).toEqual([])
+  })
+
   it('detecta e normaliza o layout Internet Banking sem misturar os cartões da mesma fatura', () => {
     expect(detectBradescoInvoiceLayout(internetBankingInvoicePages)).toBe('INTERNET_BANKING')
     const statement = parseCardStatementPages(internetBankingInvoicePages, 'nome-aleatorio.pdf')
@@ -250,6 +338,50 @@ describe('PDF de fatura do cartão', () => {
     expect(result.matches.find((match) => match.transaction.date === '2026-09-25')).toMatchObject({ status: 'CARD_MISSING', transaction: { financialStatus: 'ACTIVE', installment: 1, amount: 10001 } })
     expect(result.statementTotal).toBe(10001)
     expect(separatePurchase?.financialStatus).toBe('ACTIVE')
+  })
+
+  it('neutraliza purchase + refund integral 1:1 no mesmo cartão antes de classificar compras ausentes', () => {
+    const statement = parseCardStatementPages(internetBankingFullPurchaseRefundPages)
+    const petz = statement.transactions.find((item) => item.type === 'PURCHASE' && item.originalDescription === 'PETZ DIGITAL')!
+    const refund = statement.transactions.find((item) => item.type === 'REFUND' && item.originalDescription === 'PETZ DIGITAL')!
+    const reconciled = reconcileCardStatement(statement, [])
+    const petzMatch = reconciled.matches.find((match) => match.transaction.id === petz.id)
+
+    expect(statement.sourceLayout).toBe('INTERNET_BANKING')
+    expect(statement.errors).toEqual([])
+    expect(petz).toMatchObject({ amount: 29482, direction: 'DEBIT', financialStatus: 'REFUNDED' })
+    expect(refund).toMatchObject({ amount: 29482, direction: 'CREDIT', type: 'REFUND', refundGroupId: petz.refundGroupId })
+    expect(petz.refundGroupId).toBeTruthy()
+    expect(statement.refundGroups).toContainEqual(expect.objectContaining({ transactionIds: [petz.id], refundTransactionId: refund.id, netAmount: 0, installmentCount: 1 }))
+    expect(petzMatch?.status).toBe('CARD_REFUNDED')
+    expect(reconciled.matches.some((match) => match.status === 'CARD_MISSING' && match.transaction.id === petz.id)).toBe(false)
+    expect(summarizeCardPurchases(reconciled.matches)).toMatchObject({ eligible: 3, missing: 3, refunded: 1 })
+
+    expect(statement.cardSubtotals).toEqual([
+      { cardIdentifier: 'XXXX XXXX XXXX 5875', amount: 12990 },
+      { cardIdentifier: 'XXXX XXXX XXXX 5514', amount: 18285 },
+    ])
+    expect(statement.cardSubtotals.reduce((sum, item) => sum + item.amount, 0)).toBe(31275)
+    expect(statement.reportedTotal).toBe(31275)
+    expect(statement.purchasesDebitsTotal).toBe(60757)
+    expect(statement.creditsPaymentsTotal).toBe(98667)
+    expect(statement.previousBalance! - statement.creditsPaymentsTotal! + statement.purchasesDebitsTotal!).toBe(statement.reportedTotal)
+  })
+
+  it('não neutraliza automaticamente crédito parcial nem correspondência ambígua', () => {
+    const base = parseCardStatementPages(internetBankingFullPurchaseRefundPages)
+    const petzPurchase = base.transactions.find((item) => item.originalDescription === 'PETZ DIGITAL' && item.type === 'PURCHASE')!
+    const partialRefund = base.transactions.find((item) => item.originalDescription === 'PETZ DIGITAL' && item.type === 'REFUND')!
+    const activePurchase = { ...petzPurchase, financialStatus: 'ACTIVE' as const, refundGroupId: undefined }
+    const partial = identifyOneToOneRefundGroups([activePurchase, { ...partialRefund, amount: partialRefund.amount - 1, refundGroupId: undefined }])
+    expect(partial).toEqual([])
+    expect(activePurchase.financialStatus).toBe('ACTIVE')
+    expect(identifyOneToOneRefundGroups([activePurchase, { ...partialRefund, date: '2026-05-05', refundGroupId: undefined }])).toEqual([])
+
+    const ambiguousPurchases = [{ ...activePurchase, id: 'petz-one' }, { ...activePurchase, id: 'petz-two' }]
+    const ambiguous = identifyOneToOneRefundGroups([...ambiguousPurchases, { ...partialRefund, refundGroupId: undefined }])
+    expect(ambiguous).toEqual([])
+    expect(ambiguousPurchases.every((item) => item.financialStatus === 'ACTIVE')).toBe(true)
   })
 
   it('não associa estorno parcial, de outro merchant ou de outro cartão ao grupo de parcelas', () => {
@@ -782,6 +914,27 @@ describe('PDF de fatura do cartão', () => {
     const afterGlobalAssignment = deriveCardPurchaseStatus(initiallyMatched, { consumedSheetIds: new Set([row.id]) })
     expect(afterGlobalAssignment).toMatchObject({ status: 'CARD_REVIEW', sheet: null, candidates: [row] })
     expect(afterGlobalAssignment.status).not.toBe('CARD_MISSING')
+  })
+
+  it('reserva globalmente a linha da confirmação manual e recalcula a outra fatura', () => {
+    const ownerStatement = parseCardStatementPages(syntheticPages)
+    ownerStatement.statementIdentity = 'invoice-owner'
+    ownerStatement.dueDate = '2026-06-12'
+    ownerStatement.transactions = [{ ...ownerStatement.transactions[0], id: 'ifood-owner', type: 'PURCHASE', direction: 'DEBIT', financialStatus: 'ACTIVE', date: '2026-06-08', purchaseDate: '2026-06-08', invoiceDueDate: '2026-06-12', statementDueDate: '2026-06-12', amount: 795, installment: null, totalInstallments: null, originalDescription: 'Mensalidade ifood', description: 'Mensalidade ifood' }]
+    const otherStatement = { ...ownerStatement, statementIdentity: 'invoice-other', transactions: [{ ...ownerStatement.transactions[0], id: 'ifood-other' }] }
+    const confirmedRow = ledger('ifood-confirmed-june', '2026-06-12', 'Mensalidade ifood', 795)
+    const alternateRow = ledger('ifood-alternate-june', '2026-06-12', 'Mensalidade ifood', 795)
+    const owner = `${ownerStatement.statementIdentity}\u001f${ownerStatement.transactions[0].id}`
+    const reservation = new Map([[confirmedRow.id, owner]])
+    expect(findExistingCostYearCandidates(ownerStatement, ownerStatement.transactions[0], [confirmedRow])).toEqual([confirmedRow])
+    const ownerResult = reconcileCardStatement(ownerStatement, [confirmedRow, alternateRow], new Map([[ownerStatement.transactions[0].id, confirmedRow.id]]), new Map(), reservation)
+    const loserWithoutAlternative = reconcileCardStatement(otherStatement, [confirmedRow], new Map(), new Map(), reservation)
+    const loserWithAlternative = reconcileCardStatement(otherStatement, [confirmedRow, alternateRow], new Map(), new Map(), reservation)
+
+    expect(ownerResult.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: confirmedRow })
+    expect(loserWithoutAlternative.matches[0]).toMatchObject({ status: 'CARD_MISSING', candidates: [] })
+    expect(loserWithAlternative.matches[0]).toMatchObject({ status: 'CARD_MATCHED', sheet: alternateRow })
+    expect(loserWithAlternative.matches[0].sheet?.id).not.toBe(confirmedRow.id)
   })
 
   it('mantém a mensalidade do ciclo anterior em REVIEW, nunca como match forte', () => {

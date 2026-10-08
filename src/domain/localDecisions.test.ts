@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { clearPersistedDecisions, deletePersistedDecision, decisionKey, listPersistedDecisions, savePersistedDecision } from './localDecisions'
+import { clearPersistedDecisions, deletePersistedDecision, decisionKey, listPersistedDecisions, replacePersistedDecision, savePersistedDecision } from './localDecisions'
 
 type RequestLike<T> = IDBRequest<T>
 
@@ -69,5 +69,17 @@ describe('decisões locais persistidas', () => {
     await savePersistedDecision({ key, kind: 'PAIR_CONFIRMED', identities: ['bank:hash-a'], selected: ['sheet:hash-x'] })
     await clearPersistedDecisions()
     expect(await listPersistedDecisions()).toEqual([])
+  })
+
+  it('substitui owners incompatíveis e grava o novo vínculo na mesma transação local', async () => {
+    Object.defineProperty(globalThis, 'indexedDB', { configurable: true, value: new FakeIndexedDB() as unknown as IDBFactory })
+    const oldKey = decisionKey('STATEMENT_MATCH_CONFIRMED', ['purchase-a'])
+    const newerKey = decisionKey('STATEMENT_MATCH_CONFIRMED', ['purchase-b'])
+    await savePersistedDecision({ key: oldKey, kind: 'STATEMENT_MATCH_CONFIRMED', identities: ['purchase-a'], selected: ['sheet-row-x'] })
+    await replacePersistedDecision({ key: newerKey, kind: 'STATEMENT_MATCH_CONFIRMED', identities: ['purchase-b'], selected: ['sheet-row-x'] }, [oldKey])
+    const active = await listPersistedDecisions()
+    expect(active).toHaveLength(1)
+    expect(active[0]).toMatchObject({ key: newerKey, identities: ['purchase-b'], selected: ['sheet-row-x'] })
+    expect(active.some((decision) => decision.key === oldKey)).toBe(false)
   })
 })

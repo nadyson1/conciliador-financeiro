@@ -56,5 +56,20 @@ export async function savePersistedDecision(decision: Omit<PersistedDecision, 's
   return record
 }
 
+/** Replaces one manual assignment and removes its superseded owners in one IndexedDB transaction. */
+export async function replacePersistedDecision(decision: Omit<PersistedDecision, 'schemaVersion' | 'updatedAt'>, supersededKeys: string[]) {
+  const record: PersistedDecision = { ...decision, schemaVersion: 1, updatedAt: new Date().toISOString() }
+  const database = await openDatabase()
+  return new Promise<PersistedDecision>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(STORE_NAME)
+    supersededKeys.filter((key) => key !== record.key).forEach((key) => store.delete(key))
+    store.put(record)
+    transaction.oncomplete = () => { database.close(); resolve(record) }
+    transaction.onerror = () => { database.close(); reject(transaction.error ?? new Error('Falha ao substituir a confirmação local.')) }
+    transaction.onabort = () => { database.close(); reject(transaction.error ?? new Error('Substituição local cancelada.')) }
+  })
+}
+
 export const deletePersistedDecision = (key: string) => withStore<undefined>('readwrite', (store) => store.delete(key))
 export const clearPersistedDecisions = () => withStore<undefined>('readwrite', (store) => store.clear())

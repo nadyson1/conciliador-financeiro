@@ -6,8 +6,12 @@ describe('classificação determinística da forma de pagamento para nova linha'
     ['PIX ENVIADO', 'Pix'],
     ['PIX QR CODE DINAMICO', 'Pix'],
     ['PIX QR CODE ESTATICO', 'Pix'],
+    ['Pix Qrcode Din', 'Pix'],
+    ['Pix Qrcode Est', 'Pix'],
     ['COMPRA CARTAO VISA', 'Débito'],
-    ['SEGURO CART DEB BRADESCO', 'Débito'],
+    ['Compra Visa', 'Débito'],
+    ['SEGURO CART DEB BRADESCO', 'Débito automático'],
+    ['Seguro Cart Deb', 'Débito automático'],
     ['CONTA DE TELEFONE', 'Débito automático'],
     ['APLICACAO CDB', 'Investimento'],
   ])('%s → %s', (description, paymentMethod) => expect(inferCostPaymentMethod(description)).toBe(paymentMethod))

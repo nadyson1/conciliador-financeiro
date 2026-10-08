@@ -3,7 +3,7 @@ import { descriptionSimilarity, normalizeDescription } from '../importers/normal
 import { auditBankBalance } from '../domain/bankBalanceAudit'
 
 export const MATCHING_CONFIG = {
-  points: { amount: 50, date: [25, 20, 15, 8], description: [25, 20, 12, 5], paymentMethod: 5 },
+  points: { amount: 50, date: [25, 20, 15, 8], description: [25, 20, 12, 5], paymentMethod: 5, counterparty: 6 },
   minimumCandidateScore: 55,
   automaticMatchScore: 85,
   globalAmbiguityMargin: 10,
@@ -22,13 +22,13 @@ export interface ReviewDecisions {
 export const pairKey = (bankId: string, sheetId: string) => `${bankId}::${sheetId}`
 export const canonicalCompositionKey = (items: LedgerTransaction[]) => items.map((item) => item.sheetRecordId || item.id).sort().join('|')
 const sheetIdentity = (sheet: LedgerTransaction) => sheet.sheetRecordId || sheet.id
-const genericBankDescriptions = new Set(['pix enviado', 'pix recebido', 'pix qr code dinamico', 'pix qr code estatico', 'compra cartao visa', 'cod lanc 0', 'conta de telefone'])
+const genericBankDescriptions = new Set(['pix enviado', 'pix recebido', 'pix qr code dinamico', 'pix qr code estatico', 'pix qrcode din', 'pix qrcode est', 'compra cartao visa', 'cod lanc 0', 'conta de telefone'])
 export const isGenericBankDescription = (description: string) => genericBankDescriptions.has(normalizeDescription(description))
 function dayNumber(date: string) { const [year, month, day] = date.split('-').map(Number); return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000) }
 function dateDistance(a: string, b: string) { return Math.abs(dayNumber(a) - dayNumber(b)) }
 const isInvestmentSheet = (sheet: LedgerTransaction) => sheet.type === 'INVESTMENT' || normalizeDescription(sheet.paymentMethod) === 'investimento'
 const cardPaymentMethod = (sheet: LedgerTransaction) => normalizeDescription(sheet.paymentMethod) === 'credito bradesco'
-const isPixPaymentDescription = (description: string) => /^(?:pix enviado|pix qr code dinamico|pix qr code estatico|envio pix)(?: |$)/.test(normalizeDescription(description))
+const isPixPaymentDescription = (description: string) => /^(?:pix enviado|pix (?:qr code|qrcode) (?:din(?:amico)?|est(?:atico)?)|envio pix)(?: |$)/.test(normalizeDescription(description))
 const isLegacyTransferAlias = (bank: BankTransaction, sheet: LedgerTransaction) => isPixPaymentDescription(bank.originalDescription)
   && normalizeDescription(sheet.paymentMethod) === 'transferencia' && sheet.type === 'TRANSFER'
 
@@ -45,6 +45,7 @@ function candidate(bank: BankTransaction, sheet: LedgerTransaction): MatchCandid
   if (!investmentPair && distance > 3) return null
   const genericDescription = isGenericBankDescription(bank.originalDescription)
   const similarity = genericDescription ? 0 : descriptionSimilarity(bank.originalDescription, sheet.originalDescription)
+  const counterpartySimilarity = bank.counterpartyName ? descriptionSimilarity(bank.counterpartyName, sheet.originalDescription) : 0
   const reasons: string[] = ['Valor exato']
   let score = MATCHING_CONFIG.points.amount
   const datePoints = distance === 0 ? MATCHING_CONFIG.points.date[0] : distance === 1 ? MATCHING_CONFIG.points.date[1] : distance === 2 ? MATCHING_CONFIG.points.date[2] : distance === 3 ? MATCHING_CONFIG.points.date[3] : 0
@@ -53,6 +54,7 @@ function candidate(bank: BankTransaction, sheet: LedgerTransaction): MatchCandid
   if (bank.directionKnown === false) reasons.push('Direção não confirmada no arquivo')
   else reasons.push('Direção compatível')
   if (genericDescription) reasons.push('Descrição bancária genérica; não usada para reduzir a compatibilidade')
+  if (counterpartySimilarity >= 0.45) { score += MATCHING_CONFIG.points.counterparty; reasons.push('Contraparte compatível') }
   if (legacyAlias) reasons.push('Alias histórico de forma de pagamento: Pix ↔ Transferência')
   if (similarity >= 0.999) { score += MATCHING_CONFIG.points.description[0]; reasons.push('Descrição exata após normalização') }
   else if (similarity >= 0.72) { score += MATCHING_CONFIG.points.description[1]; reasons.push('Descrição altamente semelhante') }
@@ -65,7 +67,7 @@ function candidate(bank: BankTransaction, sheet: LedgerTransaction): MatchCandid
   if (score < MATCHING_CONFIG.minimumCandidateScore) return null
   const dateConfidence = distance === 0 ? 30 : distance === 1 ? 24 : distance === 2 ? 18 : distance === 3 ? 11 : 0
   const confidence = Math.min(94, 45 + (bank.directionKnown === false ? 0 : 15) + dateConfidence + Math.round(similarity * 8))
-  return { bankId: bank.id, sheetId: sheet.id, score, confidence, reasons, dateDistance: distance, descriptionSimilarity: similarity, matchMethod: 'SCORED' }
+  return { bankId: bank.id, sheetId: sheet.id, score, confidence, reasons, dateDistance: distance, descriptionSimilarity: similarity, counterpartySimilarity, matchMethod: 'SCORED' }
 }
 
 /** Returns only rows that pass the same minimum plausibility rules used by reconciliation. */
@@ -86,6 +88,7 @@ function structuralCandidate(candidateItem: MatchCandidate, bank: BankTransactio
       'Direção compatível',
       locallyUnique ? 'Única candidata plausível' : 'Correspondência 1:1 escolhida globalmente',
       genericDescription ? 'Descrição bancária genérica; não penalizada' : candidateItem.descriptionSimilarity < 0.45 ? 'Descrição com baixa similaridade; evidência estrutural prevaleceu' : 'Descrição compatível',
+      ...(candidateItem.reasons.includes('Contraparte compatível') ? ['Contraparte compatível'] : []),
       ...(candidateItem.reasons.includes('Alias histórico de forma de pagamento: Pix ↔ Transferência') ? ['Alias histórico de forma de pagamento: Pix ↔ Transferência'] : []),
     ],
   }
@@ -308,12 +311,24 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
     if (matched) return { ...emptyItem(bank, 'MATCHED', matched.reasons.includes('Alias histórico de forma de pagamento: Pix ↔ Transferência') ? 'LEGACY_PAYMENT_ALIAS' : undefined), sheet: sheets.find((sheet) => sheet.id === matched.sheetId) ?? null, candidate: matched }
     const assigned = planned.get(bank.id)
     if (assigned) return { ...emptyItem(bank, 'REVIEW'), sheet: sheets.find((sheet) => sheet.id === assigned.sheetId) ?? null, candidate: assigned }
-    const plausible = (byBank.get(bank.id) ?? []).filter((item) => !usedSheets.has(item.sheetId))
+    const allPlausible = byBank.get(bank.id) ?? []
+    const plausible = allPlausible.filter((item) => !usedSheets.has(item.sheetId))
     const available = plausible.filter((item) => !plannedSheetIds.has(item.sheetId)).sort((a, b) => b.score - a.score)
     const best = available[0]
     if (best) return { ...emptyItem(bank, 'REVIEW'), sheet: sheets.find((sheet) => sheet.id === best.sheetId) ?? null, candidate: best }
-    if (plausible.length) return emptyItem(bank, 'REVIEW', undefined, 'ASSIGNMENT_CONFLICT')
+    const conflict = allPlausible
+      .filter((item) => usedSheets.has(item.sheetId) || plannedSheetIds.has(item.sheetId))
+      .sort((a, b) => b.score - a.score)[0]
+    if (conflict) {
+      const owner = [...matches.entries()].find(([, assignment]) => assignment.sheetId === conflict.sheetId)?.[0]
+        ?? [...planned.entries()].find(([, assignment]) => assignment.sheetId === conflict.sheetId)?.[0]
+      const candidate = owner
+        ? { ...conflict, reasons: [...conflict.reasons, `Linha reservada na atribuição global para a movimentação ${owner}`] }
+        : conflict
+      return { ...emptyItem(bank, 'REVIEW', undefined, 'ASSIGNMENT_CONFLICT'), sheet: sheets.find((item) => item.id === conflict.sheetId) ?? null, candidate, ...(owner ? { assignmentConflictOwnerBankId: owner } : {}) }
+    }
     if (bank.directionKnown === false) return emptyItem(bank, 'REVIEW', undefined, 'DIRECTION_UNCERTAIN')
+    if (bank.type === 'OTHER') return emptyItem(bank, 'OUT_OF_SCOPE', 'NOT_EXPENSE')
     return emptyItem(bank, 'MISSING', 'MISSING_NO_CANDIDATE')
   })
   const matchedSheetIds = new Set([...matches.values()].map((item) => item.sheetId))

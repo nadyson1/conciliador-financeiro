@@ -63,7 +63,7 @@ Para habilitar também o Drive, configure `VITE_GOOGLE_API_KEY` e `VITE_GOOGLE_P
 1. No mesmo projeto Google Cloud, habilite **Google Drive API** e **Google Picker API**. O seletor oficial precisa de uma chave de API de navegador e do número do projeto (App ID); não é necessário client secret.
 2. Crie/reutilize uma chave de API em **APIs & Services → Credentials**. Restrinja-a por **Websites** às origens do app (por exemplo `http://localhost:4173/*` e `https://SEU_USUARIO.github.io/*`) e inclua também `https://docs.google.com/*`, usado pelo iframe do Picker. Restrinja o uso às APIs **Google Drive API** e **Google Picker API**.
 3. Em `.env.local`, configure `VITE_GOOGLE_API_KEY` com essa chave e `VITE_GOOGLE_PROJECT_NUMBER` com o número do projeto exibido no Google Cloud. No GitHub Pages, disponibilize os mesmos valores como variables de Actions para o build.
-4. Inclua `https://www.googleapis.com/auth/drive.readonly` na configuração de escopos de dados do app OAuth e reconecte Google para conceder essa leitura. Em modo de teste OAuth, inclua sua conta como test user. O seletor permite escolher explicitamente uma pasta para **Faturas PDF** e outra para **Extratos CSV**. Os IDs e nomes das pastas ficam neste dispositivo.
+4. Inclua `https://www.googleapis.com/auth/drive.readonly` na configuração de escopos de dados do app OAuth e reconecte Google para conceder essa leitura. Em modo de teste OAuth, inclua sua conta como test user. O seletor permite escolher explicitamente uma pasta para **Faturas PDF** e outra para **Extratos bancários** (CSV e OFX). Os IDs e nomes das pastas ficam neste dispositivo.
 5. Com as pastas configuradas, a sincronização ocorre uma vez depois da autenticação Google e também pelo botão **Sincronizar arquivos**. Não há polling. Arquivos novos/alterados são baixados e processados em memória. Após recarregar ou limpar a sessão, os arquivos são baixados de novo quando necessário, pois bytes e dados financeiros não são persistidos.
 
 O escopo `drive.readonly` foi escolhido para permitir listar e baixar automaticamente os arquivos filhos das pastas preexistentes selecionadas. `drive.metadata.readonly` não permite baixar PDFs/CSVs; `drive.file` é mais restrito por arquivo e não concede acesso confiável a todos os filhos de uma pasta só por ela ter sido selecionada. `drive.readonly` é classificado pelo Google como escopo restrito e dá leitura ampla no Drive; o Picker registra a seleção explícita, mas não limita tecnicamente o token às pastas escolhidas. Apps públicos podem precisar de verificação OAuth; como o Conciliador não armazena nem transmite conteúdo Drive a servidores próprios, não há avaliação de segurança de servidor nesta arquitetura. O app não usa métodos de escrita ou exclusão do Drive. A configuração de pastas e o índice local não são sincronizados entre dispositivos.
@@ -115,7 +115,13 @@ Os testes permanentes usam apenas dados sintéticos e mocks, sem acessar planilh
 - A checagem foi feita em navegador local e em viewports responsivos simulados; a instalação e o modo offline ainda devem ser confirmados nos dispositivos Android/Windows de destino.
 - O aplicativo apenas ajuda a comparar um período escolhido; não consegue saber se outra conta, dinheiro em espécie, outro cartão ou uma data fora do período representa o lançamento da planilha ausente.
 
-Fora de escopo nesta versão: OFX, gravação no Google Sheets, backend, contas/login próprias, OCR e qualquer processamento financeiro remoto.
+### Formatos de extrato bancário
+
+Os extratos Bradesco CSV Mobile e CSV Internet Banking, além de OFX, são identificados pelo conteúdo e normalizados para `BankTransaction`. O CSV Mobile mantém o processamento de período e seções auxiliares existente. O CSV Internet Banking reúne linhas de complemento à movimentação principal. O OFX preserva FITID, tipo, memo, período declarado e saldo informado. Ao sincronizar mais de um formato, movimentos equivalentes são unidos com as fontes e descrições preservadas; casos sem evidência suficiente para deduplicação permanecem separados.
+
+Preferência técnica: OFX oferece os campos bancários mais estruturados e FITID; CSV Internet Banking pode oferecer descrição de favorecido e saldos linha a linha mais detalhados; CSV Mobile permanece suportado para compatibilidade. Não é necessário migrar o formato. Todos os arquivos são interpretados localmente.
+
+Fora de escopo nesta versão: gravação no Google Sheets, backend, contas/login próprias, OCR e qualquer processamento financeiro remoto.
 
 ## Matching de fatura do cartão
 

@@ -33,6 +33,7 @@ describe('Google Drive somente como fonte de arquivos', () => {
   it('filtra por conteúdo/tipo, ignorando arquivos que não pertencem à pasta', () => {
     expect(isSupportedDriveFile({ id: 'a', name: 'invoice.PDF', mimeType: 'application/octet-stream', modifiedTime: '' }, 'invoices')).toBe(true)
     expect(isSupportedDriveFile({ id: 'b', name: 'data.csv', mimeType: 'text/plain', modifiedTime: '' }, 'statements')).toBe(true)
+    expect(isSupportedDriveFile({ id: 'e', name: 'statement.OFX', mimeType: 'application/octet-stream', modifiedTime: '' }, 'statements')).toBe(true)
     expect(isSupportedDriveFile({ id: 'c', name: 'notes.txt', mimeType: 'text/plain', modifiedTime: '' }, 'statements')).toBe(false)
     expect(isSupportedDriveFile({ id: 'd', name: 'sheet.csv', mimeType: 'text/csv', modifiedTime: '' }, 'invoices')).toBe(false)
   })

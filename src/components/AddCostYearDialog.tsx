@@ -2,7 +2,7 @@ import { useState, type FormEvent } from 'react'
 import type { BankTransaction } from '../domain/types'
 import type { CostYearRecordInput } from '../integrations/googleSheets'
 import { COST_YEAR_PAYMENT_METHODS, inferCostPaymentMethod } from '../features/costYearRecord'
-import { normalizeDate } from '../importers/normalize'
+import { bankDisplayDescription, normalizeDate } from '../importers/normalize'
 
 function dateLabel(value: string) {
   const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/)
@@ -20,7 +20,7 @@ export function AddCostYearDialog({ transaction, initial, categories, connected,
   onReconnect: () => void
   onSubmit: (record: CostYearRecordInput) => void
 }) {
-  const [description, setDescription] = useState(initial?.description ?? transaction?.originalDescription ?? '')
+  const [description, setDescription] = useState(initial?.description ?? (transaction ? bankDisplayDescription(transaction.originalDescription) : '') )
   const [sheetDate, setSheetDate] = useState(initial?.sheetDate ?? initial?.date ?? transaction?.date ?? '')
   const [category, setCategory] = useState('')
   const [amount, setAmount] = useState(((initial?.amount ?? transaction?.amount ?? 0) / 100).toFixed(2))

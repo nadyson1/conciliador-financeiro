@@ -31,6 +31,7 @@ vi.mock('./domain/localDecisions', () => ({
   decisionKey: (kind: string, identities: string[]) => `${kind}:${JSON.stringify(identities)}`,
   listPersistedDecisions: async () => [...savedDecisionStore.values()],
   savePersistedDecision: async (decision: { key: string; kind: string; identities: string[]; selected: string[] }) => { const record = { ...decision, schemaVersion: 1 as const, updatedAt: new Date().toISOString() }; savedDecisionStore.set(decision.key, record); return record },
+  replacePersistedDecision: async (decision: { key: string; kind: string; identities: string[]; selected: string[] }, supersededKeys: string[]) => { supersededKeys.forEach((key) => savedDecisionStore.delete(key)); const record = { ...decision, schemaVersion: 1 as const, updatedAt: new Date().toISOString() }; savedDecisionStore.set(decision.key, record); return record },
   deletePersistedDecision: decisionSyncMocks.deleteDecision,
   clearPersistedDecisions: async () => savedDecisionStore.clear(),
 }))
@@ -90,7 +91,6 @@ afterEach(() => {
   vi.unstubAllGlobals()
   vi.unstubAllEnvs()
 })
-
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason?: unknown) => void
@@ -119,11 +119,15 @@ describe('fluxo completo no navegador', () => {
     vi.mocked(readCardStatementPdf).mockResolvedValueOnce(kindleStatement)
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<App />)
+    expect(screen.queryByText('Build de teste PWA')).not.toBeInTheDocument()
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo,Forma de pagamento\nAssinatura Kindle unlimited (2 meses),12/03/2026,"2,99",Crédito_Bradesco'], 'custos.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic'], 'fatura.pdf', { type: 'application/pdf' }))
     await screen.findByText(/^Fatura /)
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    const auditExport = screen.getByRole('button', { name: /↓ Auditoria/ })
+    expect(auditExport).toBeDisabled()
+    expect(auditExport.closest('.export-bar')).toBeInTheDocument()
     const savedBefore = [...savedDecisionStore.entries()]
     const readStorage = (storage: Storage) => Array.from({ length: storage.length }, (_, index) => storage.key(index)!).map((key) => [key, storage.getItem(key)])
     const storageBefore = { local: readStorage(localStorage), session: readStorage(sessionStorage) }
@@ -131,8 +135,11 @@ describe('fluxo completo no navegador', () => {
     const localSetItem = vi.spyOn(Storage.prototype, 'setItem')
     const localRemoveItem = vi.spyOn(Storage.prototype, 'removeItem')
     await user.click(screen.getByRole('button', { name: 'Auditar consistência' }))
+    expect(screen.queryByRole('combobox', { name: 'Modo da auditoria' })).not.toBeInTheDocument()
     expect(await screen.findByRole('tab', { name: /Auditoria/ })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: /↓ Auditoria \(\d+\)/ })).toBeEnabled())
     expect(screen.getByText('Auditoria de consistência')).toBeInTheDocument()
+    expect(screen.queryByText(/Modo:\s*(Rápida|Profunda)/i)).not.toBeInTheDocument()
     expect(screen.getByText(/nenhuma alteração foi feita/i)).toBeInTheDocument()
     expect(appendCostYearRecord).not.toHaveBeenCalled()
     expect(googleSheetsMocks.append).not.toHaveBeenCalled()
@@ -154,7 +161,7 @@ describe('fluxo completo no navegador', () => {
     expect(decisionSyncMocks.deletion).not.toHaveBeenCalled()
   })
 
-  it('descarta apenas o vínculo antigo provado em DOUBLE_CLAIM e recalcula as duas compras', async () => {
+  it('prioriza a confirmação manual entre faturas e recalcula a compra concorrente sem reutilizar a linha', async () => {
     const user = userEvent.setup()
     const makePurchase = (id: string, purchaseDate: string, dueDate: string): CardStatement['transactions'][number] => ({ ...syntheticStatement.transactions[0], id, purchaseDate, date: purchaseDate, invoiceDueDate: dueDate, statementDueDate: dueDate, originalDescription: 'SELFITHOMEROCASTELOBRA', description: 'SELFITHOMEROCASTELOBRA', amount: 12990 })
     const mayPurchase = makePurchase('selfit-may-purchase', '2026-05-08', '2026-06-12')
@@ -185,20 +192,60 @@ describe('fluxo completo no navegador', () => {
     await waitFor(() => expect(screen.getAllByText(/^Fatura /)).toHaveLength(2))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('button', { name: 'Auditar consistência' }))
-    expect(await screen.findByRole('heading', { name: 'O mesmo lançamento está ligado a duas compras' })).toBeInTheDocument()
-    decisionSyncMocks.deleteDecision.mockClear()
-    const discard = await screen.findByRole('button', { name: 'Descartar vínculo antigo' })
-    await user.click(discard)
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Nenhuma linha da CUSTOS ANO será alterada.'))
-    expect(confirm.mock.calls.at(-1)?.[0]).toContain('encontrou outro lançamento válido')
-    await waitFor(() => expect(decisionSyncMocks.deletion).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', decision, expect.any(String)))
-    await waitFor(() => expect(savedDecisionStore.has(decision.key)).toBe(false))
-    expect(decisionSyncMocks.deleteDecision.mock.calls.map(([key]) => key)).toEqual([decision.key])
+    await screen.findByText(/Auditoria de consistência/)
+    expect(screen.queryByRole('heading', { name: 'O mesmo lançamento está ligado a duas compras' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Descartar vínculo antigo' })).not.toBeInTheDocument()
+    expect(confirm).not.toHaveBeenCalled()
+    expect(decisionSyncMocks.deletion.mock.calls.filter(([, , record]) => record.key === decision.key)).toHaveLength(0)
+    expect(savedDecisionStore.has(decision.key)).toBe(true)
     expect(googleSheetsMocks.append).not.toHaveBeenCalled()
-    await waitFor(() => expect(screen.queryByRole('heading', { name: 'O mesmo lançamento está ligado a duas compras' })).not.toBeInTheDocument())
     await user.click(screen.getByText(/Compras avaliadas/))
-    await waitFor(() => expect(Array.from(document.querySelectorAll('pre')).filter((pre) => pre.textContent?.includes('"estadoAtual": "CARD_MATCHED"'))).toHaveLength(2))
-    expect(Object.keys(listDecisionTombstones()).filter((key) => key === decision.key)).toHaveLength(1)
+    await waitFor(() => {
+      const details = Array.from(document.querySelectorAll('pre')).map((pre) => pre.textContent ?? '').join('\n')
+      expect(details.match(/"estadoAtual": "CARD_MATCHED"/g)).toHaveLength(1)
+      expect(details.match(/"estadoAtual": "CARD_MISSING"/g)).toHaveLength(1)
+    })
+    expect(Object.keys(listDecisionTombstones()).filter((key) => key === decision.key)).toHaveLength(0)
+  })
+
+  it('rehidrata pelo sheetRecordId uma confirmação válida mesmo quando o matcher puro prefere o ciclo da fatura', async () => {
+    const user = userEvent.setup()
+    const selfit = { ...syntheticStatement.transactions[0], id: 'selfit-june', purchaseDate: '2026-06-08', date: '2026-06-08', invoiceDueDate: '2026-07-12', statementDueDate: '2026-07-12', originalDescription: 'SELFITHOMEROCASTELOBRA', description: 'SELFITHOMEROCASTELOBRA', amount: 12990 }
+    const ifood = { ...syntheticStatement.transactions[0], id: 'ifood-june', purchaseDate: '2026-06-14', date: '2026-06-14', invoiceDueDate: '2026-07-12', statementDueDate: '2026-07-12', originalDescription: 'IFD*iFood', description: 'IFD*iFood', amount: 795, cardIdentifier: '4321 XXXX XXXX 5514' }
+    const statement: CardStatement = { ...structuredClone(syntheticStatement), fileName: 'selfit-ifood-julho.pdf', statementIdentity: 'selfit-ifood-july-invoice', dueDate: '2026-07-12', reportedTotal: 13785, purchasesDebitsTotal: 13785, transactions: [selfit, ifood] }
+    const row = (id: string, sheetRecordId: string, date: string) => ({ id, source: 'SHEET' as const, sheetRecordId, bankTransactionId: null, date, description: 'Mensalidade Selfit', originalDescription: 'Mensalidade Selfit', amount: 12990, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Crédito_Bradesco', category: 'Saúde', month: '', year: date.slice(0, 4), isFixed: false, isEssential: true, installment: null, totalInstallments: null, balanceAfter: null, original: {} })
+    const manualRow = row('internal-ledger-a', '2e4013ed', '2026-06-12')
+    const ifoodRow = { ...row('internal-ledger-ifood', '49e85f00', '2026-06-12'), originalDescription: 'Mensalidade ifood', description: 'Mensalidade ifood', amount: 795 }
+    const purePreferredRow = row('internal-ledger-b', 'fa01626d', '2026-07-12')
+    const pureIfoodRow = { ...row('internal-ledger-ifood-b', 'd892845c', '2026-07-12'), originalDescription: 'Mensalidade ifood', description: 'Mensalidade ifood', amount: 795 }
+    const decisions = [selfit, ifood].map((purchase, index) => {
+      const identity = cardTransactionIdentity(statement, purchase)
+      const selected = index === 0 ? '2e4013ed' : '49e85f00'
+      return { key: `STATEMENT_MATCH_CONFIRMED:${JSON.stringify([identity])}`, schemaVersion: 1 as const, kind: 'STATEMENT_MATCH_CONFIRMED', identities: [identity], selected: [selected], updatedAt: '2026-10-07T20:00:00.000Z' }
+    })
+    decisions.forEach((decision) => savedDecisionStore.set(decision.key, decision))
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha Selfit e iFood', transactions: [manualRow, ifoodRow, purePreferredRow, pureIfoodRow], rowCount: 4 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha Selfit', lastUpdated: null, autoConnect: true })
+    vi.mocked(readCardStatementPdf).mockResolvedValue(statement)
+    decisionSyncMocks.readRemote.mockResolvedValue({ exists: true, active: decisions, tombstones: [] })
+
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic invoice'], 'selfit-julho.pdf', { type: 'application/pdf' }))
+    await screen.findByText(/^Fatura /)
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    const showAllButtons = screen.queryAllByRole('button', { name: 'Mostrar tudo' })
+    for (const button of showAllButtons) await user.click(button)
+    const showMatched = screen.queryByRole('button', { name: 'Mostrar conciliadas' })
+    if (showMatched) await user.click(showMatched)
+
+    await waitFor(() => expect(screen.getByText(/Planilha: 12\/06\/2026 · Mensalidade Selfit/)).toBeInTheDocument())
+    expect(screen.getByText(/Planilha: 12\/06\/2026 · Mensalidade ifood/)).toBeInTheDocument()
+    expect(screen.queryByText(/Planilha: 12\/07\/2026 · Mensalidade Selfit/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Planilha: 12\/07\/2026 · Mensalidade ifood/)).not.toBeInTheDocument()
+    expect(screen.getAllByText(/Confirmação manual válida aplicada/)).toHaveLength(2)
+    expect(googleSheetsMocks.append).not.toHaveBeenCalled()
   })
 
   it('adiciona somente após confirmação, valida campos e associa a nova linha ao ausente', async () => {
@@ -209,14 +256,14 @@ describe('fluxo completo no navegador', () => {
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
     render(<App />)
     await screen.findByText(/Lançamentos carregados do Google Sheets/)
-    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
     await user.click(await screen.findByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
     const dialog = screen.getByRole('dialog', { name: 'Adicionar lançamento à CUSTOS ANO' })
     expect(dialog).toBeInTheDocument()
-    expect(screen.getByLabelText('Descrição')).toHaveValue('PIX ENVIADO MERCADO')
+    expect(screen.getByLabelText('Descrição')).toHaveValue('Pix Enviado')
     expect(screen.getByLabelText('Data')).toHaveValue('2026-01-08')
     expect(screen.getByLabelText('Custo (R$)')).toHaveValue(45)
     expect(screen.getByLabelText('Categoria')).toHaveValue('')
@@ -249,7 +296,7 @@ describe('fluxo completo no navegador', () => {
     const bank = new File(['Data,Histórico,Crédito (R$),Débito (R$)\n02/10/2026,RENTAB.INVEST FACILCRED*,"0,03",\n03/10/2026,RENTAB.INVEST FACILCRED*,"0,02",\n04/10/2026,RENTAB.INVEST FACILCRED*,"0,01",\n05/10/2026,PIX RECEBIDO,"12,00",'], 'extrato.csv', { type: 'text/csv' })
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheet)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bank)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bank)
     await user.click(await screen.findByRole('button', { name: 'Usar 4 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Fora do escopo/ }))
@@ -273,7 +320,7 @@ describe('fluxo completo no navegador', () => {
       '06/03/2026,PIX RECEBIDO,"40,00",Crédito',
       '07/03/2026,GASTOS CARTAO DE CREDITO,"30,00",Débito',
     ].join('\n')
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], new File([bankCsv], 'extrato.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File([bankCsv], 'extrato.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 4 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
@@ -298,7 +345,7 @@ describe('fluxo completo no navegador', () => {
       '08/01/2026,SEGURO CART DEB BRADESCO,"5,05",Débito',
       '08/01/2026,CONTA DE TELEFONE,"5,06",Débito',
     ].join('\n')
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], new File([bankCsv], 'extrato.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File([bankCsv], 'extrato.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 6 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
@@ -310,7 +357,7 @@ describe('fluxo completo no navegador', () => {
     render(<App />)
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo,Forma de pagamento\nTransferencia para CC Nubank,08/01/2026,"60,00",Transferência'], 'custos.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], new File(['Data,Histórico,Valor,Tipo\n08/01/2026,PIX ENVIADO,"60,00",Débito'], 'extrato.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Histórico,Valor,Tipo\n08/01/2026,PIX ENVIADO,"60,00",Débito'], 'extrato.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     expect(screen.getByRole('button', { name: /Conciliadas/ })).toHaveTextContent('1')
@@ -325,7 +372,7 @@ describe('fluxo completo no navegador', () => {
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
     render(<App />)
     await screen.findByText(/Lançamentos carregados do Google Sheets/)
-    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,COMPRA DE SERVICO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,COMPRA DE SERVICO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
@@ -345,7 +392,7 @@ describe('fluxo completo no navegador', () => {
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
     render(<App />)
     await screen.findByText(/Lançamentos carregados do Google Sheets/)
-    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
@@ -354,12 +401,12 @@ describe('fluxo completo no navegador', () => {
     await user.selectOptions(screen.getByLabelText('Categoria'), 'Casa')
     await user.click(within(dialog).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
     expect(await within(dialog).findByRole('alert')).toHaveTextContent('Autorização expirada')
-    expect(screen.getByLabelText('Descrição')).toHaveValue('PIX ENVIADO MERCADO')
+    expect(screen.getByLabelText('Descrição')).toHaveValue('Pix Enviado')
     expect(screen.getByRole('button', { name: /Ausentes/ })).toHaveTextContent('1')
     await user.click(within(dialog).getByRole('button', { name: 'Reconectar Google' }))
     await waitFor(() => expect(readGoogleSheetLedger).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(within(dialog).queryByRole('button', { name: 'Reconectar Google' })).not.toBeInTheDocument())
-    expect(screen.getByLabelText('Descrição')).toHaveValue('PIX ENVIADO MERCADO')
+    expect(screen.getByLabelText('Descrição')).toHaveValue('Pix Enviado')
     expect(screen.getByRole('button', { name: /Ausentes/ })).toHaveTextContent('1')
   })
 
@@ -394,7 +441,7 @@ describe('fluxo completo no navegador', () => {
     const sourceOptions = within(screen.getByRole('group', { name: 'FONTE DOS LANÇAMENTOS' }))
     await user.click(sourceOptions.getByRole('radio', { name: /Google Sheets/ }))
     expect(screen.queryByRole('heading', { name: 'Importar lançamentos' })).not.toBeInTheDocument()
-    expect(screen.getAllByLabelText('Selecionar arquivo CSV')).toHaveLength(1)
+    expect(screen.getAllByLabelText('Selecionar extrato bancário')).toHaveLength(1)
     await user.click(sourceOptions.getByRole('radio', { name: 'Importar CSV' }))
     expect(screen.getByRole('heading', { name: 'Importar lançamentos' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Sincronizar decisões' })).toBeInTheDocument()
@@ -417,7 +464,7 @@ describe('fluxo completo no navegador', () => {
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha pronta', lastUpdated: null, autoConnect: true })
     render(<App />)
     await screen.findByText(/Lançamentos carregados do Google Sheets/)
-    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,Mercado,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,Mercado,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     expect(screen.getByRole('button', { name: 'Sincronizar decisões' })).toBeInTheDocument()
@@ -436,7 +483,7 @@ describe('fluxo completo no navegador', () => {
     ]
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], files[0])
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], files[1])
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), files[1])
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     expect(window.scrollTo).toHaveBeenCalledOnce()
@@ -480,7 +527,7 @@ describe('fluxo completo no navegador', () => {
     expect(sticky).toBeDisabled()
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo\nMercado,08/01/2026,"45,00"'], 'custos.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], new File(['Data,Descrição,Valor,Tipo\n08/01/2026,Mercado,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,Mercado,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     expect(screen.getByRole('button', { name: 'Conciliar agora' })).toBeEnabled()
     await user.click(screen.getByRole('button', { name: 'Conciliar agora' }))
@@ -521,7 +568,7 @@ describe('fluxo completo no navegador', () => {
 
     const bankCsv = new File([''], 'extrato-pendente.csv', { type: 'text/csv' })
     Object.defineProperty(bankCsv, 'text', { configurable: true, value: () => csvRead.promise })
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bankCsv)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bankCsv)
     expect(await screen.findByRole('button', { name: 'Processando arquivos...' })).toBeDisabled()
     expect(document.querySelector('.launch-action small')).toHaveTextContent('Processando arquivos...')
 
@@ -546,7 +593,7 @@ describe('fluxo completo no navegador', () => {
     const csvInputs = screen.getAllByLabelText('Selecionar arquivo CSV')
     await user.upload(csvInputs[0], new File(['Descrição,Data,Custo\nMercado,08/01/2026,"45,00"'], 'custos.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], new File(['Data,Descrição,Valor,Tipo\n08/01/2026,Mercado,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,Mercado,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     expect([...document.querySelectorAll<HTMLButtonElement>('.button-launch')].every((button) => !button.disabled)).toBe(true)
 
@@ -663,7 +710,7 @@ describe('fluxo completo no navegador', () => {
     expect(screen.getByText('CRÉDITO/ESTORNO')).toBeInTheDocument()
     expect(screen.getByText('COMPRA DE CARTÃO NÃO REGISTRADA')).toBeInTheDocument()
     expect(screen.getByText(/Pagamento anterior identificado: R\$\s*50,00 · excluído das compras da fatura/)).toBeInTheDocument()
-    expect(screen.getByText(/Nenhum pagamento bancário com o total da fatura foi identificado perto do vencimento/)).toBeInTheDocument()
+    expect(screen.getByText(/Pagamento da fatura: não identificado/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Adicionar à CUSTOS ANO' })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
     expect(screen.getByLabelText('Forma de pagamento')).toHaveValue('Crédito_Bradesco')
@@ -718,14 +765,17 @@ describe('fluxo completo no navegador', () => {
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
 
-    expect(await screen.findByText(/Compra cancelada · 10 parcelas · R\$ 1\.000,10 estornados/)).toBeInTheDocument()
-    expect(screen.getByText(/0 compras conciliáveis · 0 conciliadas · 0 revisão · 0 ausentes · 10 parcelas estornadas/)).toBeInTheDocument()
+    const refundSummary = document.querySelector('.statement-collapsed-group strong')
+    expect(refundSummary?.textContent).toContain('Compra estornada')
+    expect(refundSummary?.textContent).toContain('10 parcelas')
+    expect(refundSummary?.textContent).toContain('1.000,10')
+    expect(screen.getByText(/Compras: 0 conciliadas · 0 revisão · 0 ausentes/)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Ver detalhes do estorno' }))
     expect(screen.getByText(/Débitos do grupo/)).toBeInTheDocument()
     expect(screen.getByText(/Crédito associado/)).toBeInTheDocument()
     expect(screen.getByText(/Líquido/)).toBeInTheDocument()
-    expect(screen.getByText(/parcela 10\/10/)).toBeInTheDocument()
+    expect([...document.querySelectorAll('.card-refund-group-details small')].some((item) => item.textContent?.includes('parcela 10/10'))).toBe(true)
   })
 
   it('adiciona compra ausente de PDF como Crédito_Bradesco e persiste vínculo com a transação da fatura', async () => {
@@ -783,6 +833,8 @@ describe('fluxo completo no navegador', () => {
     expect(within(refreshedCard).getByRole('button', { name: 'Usar este lançamento' })).toBeInTheDocument()
     await user.click(within(refreshedCard).getByRole('button', { name: 'Usar este lançamento' }))
     await waitFor(() => expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED' && decision.selected[0] === 'kindle-existing')).toBe(true))
+    expect(await screen.findByText(/Compras: 1 conciliadas · 0 revisão · 0 ausentes/)).toBeInTheDocument()
+    expect(screen.queryByText(/Candidato já atribuído a outra compra/)).not.toBeInTheDocument()
   })
 
   it('invalida confirmação persistida de ausência quando a CUSTOS ANO atual contém a compra', async () => {
@@ -878,7 +930,7 @@ describe('fluxo completo no navegador', () => {
     vi.mocked(readCardStatementPdf).mockResolvedValueOnce(clearStatement).mockResolvedValueOnce(issueStatement)
     const { container } = render(<App />)
     await screen.findByText(/Lançamentos carregados do Google Sheets/)
-    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo,Forma de pagamento,ID\n12/07/2025,GASTOS CARTAO DE CREDITO,"60,00",Débito,Débito,pay-july\n12/08/2025,GASTOS CARTAO DE CREDITO,"70,00",Débito,Débito,pay-august'], 'pagamentos.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo,Forma de pagamento,ID\n12/07/2025,GASTOS CARTAO DE CREDITO,"60,00",Débito,Débito,pay-july\n12/08/2025,GASTOS CARTAO DE CREDITO,"70,00",Débito,Débito,pay-august'], 'pagamentos.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
     await user.upload(screen.getByLabelText('Selecionar fatura PDF'), [new File(['july pdf'], 'fatura-julho.pdf', { type: 'application/pdf' }), new File(['august pdf'], 'fatura-agosto.pdf', { type: 'application/pdf' })])
     await waitFor(() => expect(screen.getAllByText(/^Fatura /)).toHaveLength(2))
@@ -910,11 +962,11 @@ describe('fluxo completo no navegador', () => {
     await screen.findByText(/Lançamentos carregados do Google Sheets/)
     await waitFor(() => expect(savedDecisionStore.has(orphan.key)).toBe(false))
     expect(decisionSyncMocks.tombstone).toHaveBeenCalledWith(orphan)
-    await user.upload(screen.getByLabelText('Selecionar arquivo CSV'), new File(['Data,Descrição,Valor,Tipo,ID\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito,orphan-bank'], 'banco.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo,ID\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito,orphan-bank'], 'banco.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
-    expect(screen.getByText('PIX ENVIADO MERCADO')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Pix Enviado' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Adicionar à CUSTOS ANO' })).toBeInTheDocument()
   })
 
@@ -985,6 +1037,53 @@ describe('fluxo completo no navegador', () => {
     expect(screen.queryByRole('button', { name: 'Remover internet-banking.pdf' })).not.toBeInTheDocument()
   })
 
+  it('mostra compra integralmente estornada separada das ausentes no resumo operacional da fatura', async () => {
+    const user = userEvent.setup()
+    const dueDate = '2026-06-12'
+    const card = 'XXXX XXXX XXXX 5875'
+    const petzPurchase = { ...syntheticStatement.transactions[0], id: 'petz-purchase', purchaseDate: '2026-05-04', date: '2026-05-04', invoiceDueDate: dueDate, statementDueDate: dueDate, description: 'PETZ DIGITAL', originalDescription: 'PETZ DIGITAL', amount: 29482, cardIdentifier: card }
+    const petzRefund = { ...syntheticStatement.transactions[2], id: 'petz-refund', purchaseDate: '2026-05-04', date: '2026-05-04', invoiceDueDate: dueDate, statementDueDate: dueDate, description: 'PETZ DIGITAL', originalDescription: 'PETZ DIGITAL', amount: 29482, cardIdentifier: card, direction: 'CREDIT' as const, type: 'REFUND' as const }
+    const activePurchases = [
+      { ...petzPurchase, id: 'selfit', purchaseDate: '2026-05-08', date: '2026-05-08', description: 'SELFIT', originalDescription: 'SELFIT', amount: 12990, financialStatus: 'ACTIVE' as const },
+      { ...petzPurchase, id: 'ifood', purchaseDate: '2026-05-09', date: '2026-05-09', description: 'IFOOD', originalDescription: 'IFOOD', amount: 795, financialStatus: 'ACTIVE' as const },
+      { ...petzPurchase, id: 'battle-net', purchaseDate: '2026-05-10', date: '2026-05-10', description: 'BATTLE NET', originalDescription: 'BATTLE NET', amount: 17490, financialStatus: 'ACTIVE' as const },
+    ]
+    const pairId = 'refund-pair-petz'
+    vi.mocked(readCardStatementPdf).mockResolvedValueOnce({
+      ...structuredClone(syntheticStatement), fileName: 'fatura-internet-banking.pdf', sourceLayout: 'INTERNET_BANKING', statementIdentity: 'statement-petz-refund', dueDate, nextClosingDate: null,
+      transactions: [{ ...petzPurchase, financialStatus: 'REFUNDED' as const, refundGroupId: pairId }, { ...petzRefund, refundGroupId: pairId }, ...activePurchases],
+      refundGroups: [{ id: pairId, cardIdentifier: card, date: '2026-05-04', merchant: 'PETZ DIGITAL', transactionIds: [petzPurchase.id], refundTransactionId: petzRefund.id, purchaseGroupAmount: 29482, refundAmount: 29482, netAmount: 0, installmentCount: 1 }],
+      cardSubtotals: [{ cardIdentifier: card, amount: 31275 }], reportedTotal: 31275, purchasesDebitsTotal: 60757, creditsPaymentsTotal: 98667, previousBalance: 69185, previousPayment: 69185, accountingDifference: 0, errors: [],
+    })
+    render(<App />)
+    const sheetFile = new File(['Descrição,Data,Custo,Forma de pagamento\nSELFIT,12/06/2026,"129,90",Crédito_Bradesco\nIFOOD,12/06/2026,"7,95",Crédito_Bradesco\nBATTLE NET,12/06/2026,"174,90",Crédito_Bradesco'], 'custos.csv', { type: 'text/csv' })
+    const bankFile = new File(['Data,Descrição,Valor,Tipo\n12/06/2026,GASTOS CARTAO DE CREDITO,"312,75",Débito'], 'banco.csv', { type: 'text/csv' })
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheetFile)
+    await user.click(await screen.findByRole('button', { name: 'Usar 3 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bankFile)
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['sanitized pdf'], 'fatura.pdf', { type: 'application/pdf' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /Conciliar agora/ })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+
+    const invoice = await screen.findByText(`Fatura · ${new Intl.DateTimeFormat('pt-BR').format(new Date(`${dueDate}T00:00:00`))}`)
+    const invoiceCard = invoice.closest('.statement-results') as HTMLElement
+    expect(within(invoiceCard).getByText('Compras: 3 conciliadas · 0 revisão · 0 ausentes')).toBeInTheDocument()
+    expect(within(invoiceCard).getByText('1 compra estornada · R$ 294,82')).toBeInTheDocument()
+    expect(within(invoiceCard).getByText('Pagamento da fatura identificado · 12/06/2026 · R$ 312,75')).toBeInTheDocument()
+    expect(within(invoiceCard).getByRole('button', { name: 'Mostrar tudo' })).toHaveAttribute('aria-expanded', 'false')
+    expect(within(invoiceCard).queryByText(/PETZ DIGITAL/)).not.toBeInTheDocument()
+    await user.click(within(invoiceCard).getByRole('button', { name: 'Mostrar tudo' }))
+    expect(within(invoiceCard).getByText('✓ Compra estornada · R$ 294,82')).toBeInTheDocument()
+    await user.click(within(invoiceCard).getByRole('button', { name: 'Mostrar tudo' }))
+    await user.click(within(invoiceCard).getByRole('button', { name: 'Ver detalhes do estorno' }))
+    expect(within(invoiceCard).getAllByText(/PETZ DIGITAL/).length).toBeGreaterThanOrEqual(3)
+    expect(within(invoiceCard).getByText(/Crédito PETZ DIGITAL · -R\$ 294,82/)).toBeInTheDocument()
+    await user.click(within(invoiceCard).getByText('Mostrar detalhes financeiros'))
+    expect(within(invoiceCard).getByText(/Saldo anterior − créditos\/pagamentos \+ compras\/débitos = total da fatura/)).toBeInTheDocument()
+  })
+
   it('mantém vários PDFs válidos compactos, resume o lote e expande/recolhe os detalhes sob demanda', async () => {
     const user = userEvent.setup()
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
@@ -1026,6 +1125,7 @@ describe('fluxo completo no navegador', () => {
     render(<App />)
     await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['problem invoice'], 'fatura-divergente.pdf', { type: 'application/pdf' }))
     const entry = await screen.findByTestId('card-pdf-entry')
+    await waitFor(() => expect(within(entry).getByRole('button', { name: 'Recolher detalhes' })).toHaveAttribute('aria-expanded', 'true'))
     expect(within(entry).getAllByText('⚠ Valores não conferem')).toHaveLength(2)
     expect(within(entry).getByRole('button', { name: 'Recolher detalhes' })).toHaveAttribute('aria-expanded', 'true')
     expect(within(entry).getByText('Arquivo: fatura-divergente.pdf')).toBeInTheDocument()
@@ -1109,6 +1209,60 @@ describe('fluxo completo no navegador', () => {
     expect([...savedDecisionStore.values()][0].identities[0]).toBe(savedIdentity)
   })
 
+  it('exibe contraparte em ausentes, revisão, devoluções e fora do escopo', async () => {
+    const user = userEvent.setup()
+    const counterpartyNote = (text: string) => [...document.querySelectorAll('.counterparty-note')].find((element) => element.textContent === text)
+    render(<App />)
+    const ledgerCsv = [
+      'Descrição,Data,Custo,Forma de pagamento,ID',
+      'Conta Equatorial principal,01/10/2026,"50,00",Pix,sheet-1',
+      'Conta Equatorial mensal,01/10/2026,"50,00",Pix,sheet-2',
+      'Despesa de referência,04/10/2026,"200,00",Pix,sheet-3',
+    ].join('\n')
+    const bankCsv = [
+      'Data;Histórico;Docto.;Crédito (R$);Débito (R$);Saldo (R$);',
+      '01/10/26;Pix Qrcode Est;DOC-1;;50,00;950,00;',
+      ';Des: Equatorial Piaui 01/10;;;;;',
+      '02/10/26;Pix Qrcode Din;DOC-2;;60,00;890,00;',
+      ';Des: Loja Ausente 02/10;;;;;',
+      '03/10/26;Pix Recebido;DOC-3;22,00;;912,00;',
+      ';Rem: Marketplace 03/10;;;;;',
+      '04/10/26;Pix Enviado;DOC-4;;80,00;832,00;',
+      ';Des: Loja Original 04/10;;;;;',
+      '05/10/26;Devolucao Pix;DOC-5;80,00;;912,00;',
+      ';Rem: Marketplace 05/10;;;;;',
+      '07/10/26;Pix Enviado;DOC-6;;70,00;842,00;',
+    ].join('\n')
+    const sheetInput = screen.getAllByLabelText('Selecionar arquivo CSV')[0]
+    await user.upload(sheetInput, new File([ledgerCsv], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 3 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File([bankCsv], 'extrato.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar extrato' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+
+    await user.click(await screen.findByRole('tab', { name: /Revisão/ }))
+    expect(counterpartyNote('Para: Equatorial Piaui')).toBeInTheDocument()
+    expect(screen.getByText('Pix QR Code Estático')).toBeInTheDocument()
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    expect(counterpartyNote('Para: Loja Ausente')).toBeInTheDocument()
+    const dynamicPixCard = screen.getByRole('heading', { name: 'Pix QR Code Dinâmico' }).closest('article')!
+    const dynamicCounterparty = dynamicPixCard.querySelector('.counterparty-note')!
+    expect(dynamicCounterparty.querySelector('strong')).toHaveTextContent('Loja Ausente')
+    expect(dynamicCounterparty).toHaveClass('counterparty-note')
+    await user.click(within(dynamicPixCard).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    expect(screen.getByLabelText('Descrição')).toHaveValue('Pix QR Code Dinâmico')
+    expect(screen.getByLabelText('Forma de pagamento')).toHaveValue('Pix')
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancelar' }))
+    const withoutCounterparty = screen.getByRole('heading', { name: 'Pix Enviado' }).closest('article')
+    expect(within(withoutCounterparty!).queryByText(/Para:|De:|Estabelecimento:|Contraparte:/)).not.toBeInTheDocument()
+    await user.click(screen.getByRole('tab', { name: /Fora do escopo/ }))
+    expect(counterpartyNote('De: Marketplace')).toBeInTheDocument()
+    await user.click(screen.getByRole('tab', { name: /Resumo/ }))
+    await user.click(screen.getByText(/Devoluções bancárias · 1/))
+    expect(counterpartyNote('Para: Loja Original')).toBeInTheDocument()
+    expect(counterpartyNote('De: Marketplace')).toBeInTheDocument()
+  })
+
   it('importa CSVs, valida e concilia localmente; filtra por ano/mês e exporta', async () => {
     const user = userEvent.setup()
     render(<App />)
@@ -1130,7 +1284,7 @@ describe('fluxo completo no navegador', () => {
     expect(screen.getByText('1 linha com problema não importada')).toBeInTheDocument()
     expect(screen.getByText('Falta aceitar as linhas válidas do extrato bancário.')).toBeInTheDocument()
 
-    const bankInput = screen.getAllByLabelText('Selecionar arquivo CSV')[1]
+    const bankInput = screen.getByLabelText('Selecionar extrato bancário')
     await user.upload(bankInput, bankFile)
     expect(await screen.findByText('2 válidas · 0 ignoradas · 0 problemas')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Usar 2 linha(s) válidas' }))
@@ -1174,7 +1328,7 @@ describe('fluxo completo no navegador', () => {
     ], 'banco.csv', { type: 'text/csv' })
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheetFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bankFile)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bankFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     expect(scrollTo).toHaveBeenCalledOnce()
@@ -1192,7 +1346,7 @@ describe('fluxo completo no navegador', () => {
     await user.click(screen.getByRole('button', { name: 'Nova conciliação' }))
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheetFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bankFile)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bankFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     expect(await screen.findByRole('button', { name: /Conciliadas/ })).toHaveTextContent('1')
@@ -1225,10 +1379,10 @@ describe('fluxo completo no navegador', () => {
     ].join('\n')], 'bradesco.csv', { type: 'text/csv' })
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheetFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bankFile)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bankFile)
     expect(await screen.findByText('Extrato reconhecido')).toBeInTheDocument()
     expect(screen.getByText('3 lançamentos válidos')).toBeInTheDocument()
-    expect(screen.getByText('Formato identificado: Bradesco')).toBeInTheDocument()
+    expect(screen.getByText('Formato identificado: CSV Mobile')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Configuração avançada/ })).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByText('Direção da conta')).not.toBeInTheDocument()
     await user.click(screen.getByText(/Ver prévia/))
@@ -1248,7 +1402,7 @@ describe('fluxo completo no navegador', () => {
     const user = userEvent.setup()
     render(<App />)
     const file = new File(['Data,Data transação,Histórico,Crédito (R$),Débito (R$),Saldo (R$)\n02/02/2026,02/02/2026,PIX RECEBIDO,"12,00",,120,00'], 'ambiguo.csv', { type: 'text/csv' })
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], file)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), file)
     expect(await screen.findByText('Precisamos confirmar algumas colunas')).toBeInTheDocument()
     expect(screen.getByText('Confira o mapeamento das colunas')).toBeInTheDocument()
     expect(screen.getByLabelText(/Data/)).toBeInTheDocument()
@@ -1262,7 +1416,7 @@ describe('fluxo completo no navegador', () => {
     const bank = new File(['Data,Descrição,Valor,Tipo\n02/02/2026,Café Exemplo,"12,00",Débito'], 'banco.csv', { type: 'text/csv' })
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheet)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bank)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bank)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
 
@@ -1283,7 +1437,7 @@ describe('fluxo completo no navegador', () => {
     const bankFile = new File(['Data,Descrição,Valor,Tipo\n02/02/2026,GASTOS CARTAO DE CREDITO,"100,00",Débito'], 'banco.csv', { type: 'text/csv' })
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheetFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bankFile)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bankFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     expect(screen.getByRole('button', { name: /Para revisar/ })).toHaveTextContent('0')
@@ -1300,7 +1454,7 @@ describe('fluxo completo no navegador', () => {
     await user.click(screen.getByRole('button', { name: 'Nova conciliação' }))
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheetFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bankFile)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bankFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     const confirmedPayment = document.querySelector('.card-payment-card') as HTMLElement
@@ -1318,7 +1472,7 @@ describe('fluxo completo no navegador', () => {
     const bankFile = new File(['Data,Descrição,Valor,Tipo\n02/02/2026,GASTOS CARTAO DE CREDITO,"1.000,00",Débito'], 'banco.csv', { type: 'text/csv' })
     await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], sheetFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
-    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[1], bankFile)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bankFile)
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     expect(screen.getByRole('button', { name: /Para revisar/ })).toHaveTextContent('0')
@@ -1397,6 +1551,23 @@ describe('fluxo completo no navegador', () => {
     await user.click(within(drivePanel).getByRole('button', { name: 'Sincronizar arquivos' }))
     await waitFor(() => expect(googleDriveMocks.list).toHaveBeenCalledTimes(8))
     expect(googleDriveMocks.download).toHaveBeenCalledTimes(2)
+  })
+
+  it('importa OFX pelo seletor local mesmo quando o arquivo tem extensão CSV', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const ofx = [
+      'OFXHEADER:100', 'DATA:OFXSGML', 'VERSION:102', '<OFX>', '<BANKMSGSRSV1><STMTTRNRS><STMTRS><BANKTRANLIST>',
+      '<DTSTART>20260101000000', '<DTEND>20260101000000', '<STMTTRN>', '<TRNTYPE>DEBIT', '<DTPOSTED>20260101000000',
+      '<TRNAMT>-42.00', '<FITID>FIT-LOCAL', '<CHECKNUM>DOC-LOCAL', '<MEMO>Pix Qrcode Est Des Loja Exemplo',
+      '</BANKTRANLIST><LEDGERBAL><BALAMT>958.00<DTASOF>20260101000000</LEDGERBAL></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>',
+    ].join('\n')
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File([ofx], 'extrato.csv', { type: 'text/csv' }))
+    expect(await screen.findByText('OFX validado')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Usar extrato' }))
+    await user.click(screen.getByText('Ver detalhes'))
+    expect(screen.getByText(/Saldo informado no OFX:/)).toHaveTextContent('R$ 958,00')
+    expect(screen.getByText(/Extrato carregado · 1 lançamentos/)).toBeInTheDocument()
   })
 
   it('mantém status reais no lote Drive com 9 faturas válidas e 1 duplicado financeiro', async () => {
@@ -1488,5 +1659,42 @@ describe('fluxo completo no navegador', () => {
     await user.click(screen.getByRole('button', { name: 'Sincronizar arquivos' }))
     await waitFor(() => expect(googleDriveMocks.download).toHaveBeenCalledTimes(2))
     expect(screen.getByRole('region', { name: 'Fontes do Google Drive' })).toHaveTextContent('Extratos: 1')
+  })
+
+  it('ao confirmar compra sobre uma linha disputada, tombstoneia apenas o owner anterior e mantém um vínculo ativo', async () => {
+    const user = userEvent.setup()
+    const makeStatement = (identity: string, transactionId: string, purchaseDate: string): CardStatement => ({
+      ...structuredClone(syntheticStatement), fileName: `${identity}.pdf`, statementIdentity: identity, dueDate: '2025-07-12',
+      transactions: [{ ...syntheticStatement.transactions[1], id: transactionId, date: purchaseDate, purchaseDate, invoiceDueDate: '2025-07-12', statementDueDate: '2025-07-12', amount: 4000, originalDescription: 'LOJA TESTE', description: 'LOJA TESTE' }],
+    })
+    const may = makeStatement('invoice-may', 'may-purchase', '2025-06-10')
+    const june = makeStatement('invoice-june', 'june-purchase', '2025-06-11')
+    const sheet = { id: 'target-row', source: 'SHEET' as const, sheetRecordId: 'target-row', bankTransactionId: null, date: '2025-07-12', description: 'Loja teste', originalDescription: 'LOJA TESTE', amount: 4000, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Crédito_Bradesco', category: 'Compras', month: '07 - Julho', year: '2025', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const decision = (source: CardStatement) => {
+      const identity = cardTransactionIdentity(source, source.transactions[0])
+      return { key: `STATEMENT_MATCH_CONFIRMED:${JSON.stringify([identity])}`, schemaVersion: 1 as const, kind: 'STATEMENT_MATCH_CONFIRMED', identities: [identity], selected: [sheetIdentity(sheet)], updatedAt: '2026-06-01T00:00:00.000Z' }
+    }
+    const oldOwner = decision(may), selectedOwner = decision(june)
+    savedDecisionStore.set(oldOwner.key, oldOwner); savedDecisionStore.set(selectedOwner.key, selectedOwner)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    vi.mocked(readCardStatementPdf).mockImplementation(async (file) => file.name === 'invoice-may.pdf' ? may : june)
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha teste', transactions: [sheet], rowCount: 1 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha teste', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar fatura PDF'), [new File(['may'], 'invoice-may.pdf', { type: 'application/pdf' }), new File(['june'], 'invoice-june.pdf', { type: 'application/pdf' })])
+    await waitFor(() => expect(screen.getAllByText(/^Fatura /)).toHaveLength(2))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Usar este lançamento' })).toHaveLength(2))
+    const junePurchase = screen.getByText('11/06/2025 · LOJA TESTE').closest('article')
+    expect(junePurchase).not.toBeNull()
+    await user.click(within(junePurchase!).getByRole('button', { name: 'Usar este lançamento' }))
+    await waitFor(() => expect(decisionSyncMocks.tombstone).toHaveBeenCalled())
+    await waitFor(() => expect(savedDecisionStore.size).toBe(1))
+    expect(savedDecisionStore.has(oldOwner.key)).toBe(false)
+    expect([...savedDecisionStore.values()][0].key).toBe(selectedOwner.key)
+    expect(decisionSyncMocks.tombstone).toHaveBeenCalledTimes(1)
+    expect(decisionSyncMocks.tombstone).toHaveBeenCalledWith(oldOwner)
   })
 })

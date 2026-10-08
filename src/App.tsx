@@ -1,19 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, ReactNode } from 'react'
-import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, ColumnMap, CsvDocument, ExcludedBankRow, LedgerTransaction, ReconciliationItem, Transaction } from './domain/types'
+import type { BankStatementFormat, BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, ColumnMap, CsvDocument, ExcludedBankRow, LedgerTransaction, ReconciliationItem, Transaction } from './domain/types'
 import { readCsvFile, initialColumnMap } from './importers/csv'
 import { parseBankCsvSections, parseLedgerRows } from './importers/transactions'
+import { readBankStatementFile } from './importers/bankStatement'
 import { cardStatementFinancialIdentity, deriveCardPurchaseStatus, findExistingCostYearCandidates, identifyStatementPayments, readCardStatementPdf, reconcileCardStatement } from './importers/cardStatement'
-import { normalizeDate } from './importers/normalize'
+import { bankDisplayDescription, normalizeDate, normalizeDescription } from './importers/normalize'
+import { counterpartyLabel, descriptionWithoutCounterparty } from './importers/counterparty'
 import { canonicalCompositionKey, findPlausibleLedgerCandidates, pairKey, reconcile } from './matching/reconcile'
-import { exportCardPayments, exportDuplicates, exportMissing, exportOutOfScope, exportReviews, exportSummary } from './features/export'
+import { exportAuditDiagnosticJson, exportAuditFindings, exportCardPayments, exportDuplicates, exportMissing, exportOutOfScope, exportReviews, exportSummary } from './features/export'
 import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity } from './domain/identity'
 import { auditPersistedDecisions } from './domain/decisionAudit'
 import { retainActiveInvoiceSources, retainCurrentDriveBankSources } from './domain/sourceLifecycle'
-import { auditConsistency, filterAuditFindings, summarizeAudit, type AuditFilter, type ConsistencyAuditResult } from './domain/consistencyAudit'
+import { auditConsistency, filterAuditFindings, summarizeAudit, type AuditFilter, type AuditMode, type ConsistencyAuditResult } from './domain/consistencyAudit'
 import { dismissAuditFinding, isAuditFindingDismissed, loadAuditFindingVisibility, restoreAuditFinding, saveAuditFindingVisibility } from './domain/auditFindingVisibility'
 import { AuditFindingCard } from './components/AuditFindingCard'
-import { clearPersistedDecisions, decisionKey, deletePersistedDecision, listPersistedDecisions, savePersistedDecision } from './domain/localDecisions'
+import { clearPersistedDecisions, decisionKey, deletePersistedDecision, listPersistedDecisions, replacePersistedDecision, savePersistedDecision } from './domain/localDecisions'
+import { conflictingDecisionsForStatementRow, conflictingStatementAssignments, resolveStatementMatchAssignments } from './domain/statementMatchAssignments'
 import type { DecisionKind, PersistedDecision } from './domain/localDecisions'
 import { GoogleSheetsPanel } from './components/GoogleSheetsPanel'
 import type { GoogleSheetsConnectionInfo } from './components/GoogleSheetsPanel'
@@ -25,8 +28,10 @@ import { AddCostYearDialog } from './components/AddCostYearDialog'
 import { BankCsvUploadCard, bankCsvRequiresManualMapping } from './components/BankCsvUploadCard'
 import { BalanceAuditPanel, StatementBalanceAccordion } from './components/BalanceAuditPanel'
 import { MissingSummary } from './components/MissingSummary'
+import type { MissingAddDecision } from './features/missingEligibility'
 import { auditBankBalance, selectMissingExpenses } from './domain/bankBalanceAudit'
 import { canAddMissingToCostYear } from './features/missingEligibility'
+import { summarizeCardPurchases } from './features/cardStatementCounts'
 import { GoogleSheetsError, appendCostYearRecord, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { addDecisionTombstone, listDecisionTombstones, readGoogleSheetDecisionsReadOnly, removeDecisionTombstone, syncGoogleSheetDecisions, syncOneGoogleSheetDecision, syncOneGoogleSheetDeletion } from './integrations/googleSheetDecisions'
 import { forgetGoogleSheetLink, GOOGLE_SHEET_TAB_NAME, loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
@@ -39,7 +44,7 @@ import type { DriveFileIndexEntry, DriveFolderKind, DriveFolderSnapshots, SavedD
 type Mode = 'sheet' | 'bank'
 type SourceStatus = 'EMPTY' | 'LOADED' | 'VALIDATED' | 'ACCEPTED'
 type Dataset = { sheet: LedgerTransaction[]; bank: BankTransaction[] }
-type UploadState = { fileName: string; csv: CsvDocument; map: ColumnMap; valid: Transaction[]; issues: { row: number; message: string }[]; rowCount: number; ignoredRows: number; excludedRows: ExcludedBankRow[]; auxiliaryIncludedCount: number; auxiliaryOutsidePeriodCount: number } | null
+type UploadState = { fileName: string; csv: CsvDocument; map: ColumnMap; valid: Transaction[]; issues: { row: number; message: string }[]; rowCount: number; ignoredRows: number; excludedRows: ExcludedBankRow[]; auxiliaryIncludedCount: number; auxiliaryOutsidePeriodCount: number; format?: BankStatementFormat | 'CSV_GENERIC'; declaredPeriodStart?: string | null; declaredPeriodEnd?: string | null; actualPeriodStart?: string | null; actualPeriodEnd?: string | null; balanceEvidence?: { amount: number; date: string } | null } | null
 type CardPdfEntry = { key: string; fingerprint: string; fileName: string; status: 'PROCESSING' | 'PROCESSED' | 'DIVERGENCE' | 'ERROR'; statement: CardStatement | null; legacyStatementIdentity?: string; error?: string; source?: 'MANUAL' | 'DRIVE'; driveFileId?: string; driveFileIds?: string[]; manualSourceIds?: string[] }
 type MissingWriteTarget = { kind: 'BANK'; bank: BankTransaction } | { kind: 'STATEMENT'; statement: CardStatement; transaction: CardStatementTransaction }
 const emptyData: Dataset = { sheet: [], bank: [] }
@@ -117,7 +122,7 @@ export default function App() {
   const [driveSyncBusy, setDriveSyncBusy] = useState(false)
   const [pendingSourceOperations, setPendingSourceOperations] = useState(0)
   const [driveConnected, setDriveConnected] = useState(false)
-  const [driveStatementFiles, setDriveStatementFiles] = useState<{ id: string; name: string; periodStart: string | null; periodEnd: string | null; transactionCount: number; overlapCount: number; excludedRows: ExcludedBankRow[] }[]>([])
+  const [driveStatementFiles, setDriveStatementFiles] = useState<{ id: string; name: string; periodStart: string | null; periodEnd: string | null; actualPeriodStart: string | null; actualPeriodEnd: string | null; transactionCount: number; overlapCount: number; excludedRows: ExcludedBankRow[]; format: BankStatementFormat; balanceEvidence: { amount: number; date: string } | null }[]>([])
   const suppressedDriveFileIds = useRef(new Set<string>())
   const driveProcessedInSession = useRef(new Map<string, string>())
   const driveFileStatusInSession = useRef(new Map<string, DriveFileProcessingStatus>())
@@ -129,6 +134,7 @@ export default function App() {
   const [statementOnlyIssues, setStatementOnlyIssues] = useState(false)
   const [consistencyAudit, setConsistencyAudit] = useState<ConsistencyAuditResult | null>(null)
   const [consistencyAuditBusy, setConsistencyAuditBusy] = useState(false)
+  const consistencyAuditRunLock = useRef(false)
   const [consistencyAuditError, setConsistencyAuditError] = useState('')
   const [consistencyAuditFilter, setConsistencyAuditFilter] = useState<AuditFilter>('ALL')
   const [consistencyAuditSourceNote, setConsistencyAuditSourceNote] = useState('')
@@ -255,6 +261,47 @@ export default function App() {
       }
     } catch {
       setError('Não foi possível salvar esta decisão neste dispositivo. Ela continuará disponível apenas nesta sessão.')
+    }
+  }
+
+  async function persistStatementMatchReplacingOwners(statement: CardStatement, transaction: CardStatementTransaction, sheet: LedgerTransaction) {
+    const identity = cardTransactionIdentity(statement, transaction)
+    const aliases = cardTransactionIdentityVariants(statement, transaction, cardPdfs.find((entry) => entry.statement === statement)?.legacyStatementIdentity)
+    const targetIdentity = sheetIdentity(sheet)
+    const superseded = conflictingDecisionsForStatementRow(savedDecisions, aliases, targetIdentity)
+    const existingSameOwner = savedDecisions.find((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED'
+      && aliases.includes(decision.identities[0])
+      && decision.selected.some((selected) => selected === targetIdentity || data.sheet.some((row) => row.id === selected && sheetIdentity(row) === targetIdentity)))
+    const decisionIdentity = existingSameOwner?.identities[0] ?? identity
+    const key = existingSameOwner?.key ?? decisionKey('STATEMENT_MATCH_CONFIRMED', [decisionIdentity])
+    const tombstones = superseded.map((decision) => {
+      addDecisionTombstone(decision)
+      return { decision, updatedAt: listDecisionTombstones()[decision.key]?.updatedAt ?? new Date().toISOString() }
+    })
+    try {
+      const record = await replacePersistedDecision({ key, kind: 'STATEMENT_MATCH_CONFIRMED', identities: [decisionIdentity], selected: [targetIdentity] }, superseded.map((decision) => decision.key))
+      decisionStateRevision.current += 1
+      setSavedDecisions(await listPersistedDecisions())
+      setError('')
+      if (googleSheetLink?.spreadsheetId) {
+        tombstones.forEach(({ decision }) => markDecisionPending(decision.key, true))
+        markDecisionPending(key, true)
+        if (googleAccessToken.current) {
+          try {
+            for (const { decision, updatedAt } of tombstones) {
+              await syncOneGoogleSheetDeletion(googleSheetLink.spreadsheetId, googleAccessToken.current, decision, updatedAt)
+              removeDecisionTombstone(decision.key); markDecisionPending(decision.key, false)
+            }
+            await syncOneGoogleSheetDecision(googleSheetLink.spreadsheetId, googleAccessToken.current, record)
+            markDecisionPending(key, false); setGoogleDecisionStatus('Vínculo atualizado e decisões sincronizadas.')
+          } catch { setGoogleDecisionStatus('Vínculo atualizado neste dispositivo; sincronização pendente.') }
+        }
+      }
+      return true
+    } catch {
+      tombstones.forEach(({ decision }) => removeDecisionTombstone(decision.key))
+      setError('Não foi possível substituir a confirmação neste dispositivo. Nenhum vínculo foi alterado.')
+      return false
     }
   }
 
@@ -447,7 +494,9 @@ export default function App() {
             const loaded = driveStatementFiles.find((entry) => entry.id === file.id)
             statementOutcomes.set(file.id, {
               fileId: file.id, fileName: file.name, status: previous?.processingStatus === 'ERROR' ? 'ERROR' : 'PROCESSED',
+              format: loaded?.format,
               periodStart: loaded?.periodStart, periodEnd: loaded?.periodEnd, transactionCount: loaded?.transactionCount,
+              actualPeriodStart: loaded?.actualPeriodStart, actualPeriodEnd: loaded?.actualPeriodEnd,
               overlapCount: loaded?.overlapCount, excludedRowCount: loaded?.excludedRows.length,
               detail: previous?.processingStatus === 'ERROR' ? 'A última leitura deste arquivo registrou erro.' : undefined,
             })
@@ -461,7 +510,7 @@ export default function App() {
             if (old) removeCardPdfDriveSource(old.key, file.id)
           }
           const blob = await downloadGoogleDriveFile(file.id, accessToken)
-          const localFile = new File([blob], file.name, { type: file.mimeType || (kind === 'invoices' ? 'application/pdf' : 'text/csv'), lastModified: file.modifiedTime ? Date.parse(file.modifiedTime) : Date.now() })
+          const localFile = new File([blob], file.name, { type: file.mimeType || (kind === 'invoices' ? 'application/pdf' : file.name.toLowerCase().endsWith('.ofx') ? 'application/x-ofx' : 'text/csv'), lastModified: file.modifiedTime ? Date.parse(file.modifiedTime) : Date.now() })
           let fileHadError = false
           if (kind === 'invoices') {
             const outcome = await processCardPdfFiles([{ file: localFile, driveFileId: file.id }], 'DRIVE')
@@ -471,31 +520,28 @@ export default function App() {
             if (fileOutcome.financialIdentity) drivePdfSemanticIdentities.current.set(file.id, fileOutcome.financialIdentity)
             fileHadError = fileOutcome.status === 'PARSE_ERROR' || fileOutcome.status === 'PROCESSING_ERROR'
           } else {
-            const csv = await readCsvFile(localFile)
-            const map = initialColumnMap(csv.headers, 'bank') as ColumnMap
-            const parsed = parseBankCsvSections(csv, map)
-            if (bankCsvRequiresManualMapping({ fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, auxiliaryTransactionCount: parsed.auxiliaryIncludedCount })) {
-              throw new Error('O formato precisa de configuração manual de colunas. Importe este CSV pelo seletor local para revisar o mapeamento.')
-            }
-            if (!parsed.transactions.length) throw new Error('Nenhuma movimentação válida foi encontrada no CSV.')
-            const fileTransactions = parsed.transactions.map((transaction) => ({ ...transaction, statementSourceId: file.id, statementFileName: file.name }))
+            const parsed = await readBankStatementFile(localFile)
+            if (parsed.format === 'CSV_GENERIC') throw new Error('Layout de extrato não reconhecido.')
+            const statementFormat = parsed.format as BankStatementFormat
+            if (!parsed.transactions.length) throw new Error('Nenhuma movimentação válida foi encontrada no extrato.')
+            const fileTransactions = parsed.transactions.map((transaction) => ({ ...transaction, statementSourceId: file.id, statementSourceIds: [file.id], statementFileName: file.name }))
             driveBankFiles.current = { ...driveBankFiles.current, [file.id]: fileTransactions }
             const stats = mergeDriveBankSourcesWithStats(manualBankTransactions.current, driveBankFiles.current)
             setDriveStatementFiles((currentFiles) => {
               const previous = currentFiles.filter((item) => item.id !== file.id)
-              const next = [...previous, { id: file.id, name: file.name, periodStart: csv.statementPeriodStart, periodEnd: csv.statementPeriodEnd, transactionCount: fileTransactions.length, overlapCount: stats.overlapBySource[file.id] ?? 0, excludedRows: parsed.excludedRows ?? [] }]
+              const next = [...previous, { id: file.id, name: file.name, periodStart: parsed.declaredPeriodStart, periodEnd: parsed.declaredPeriodEnd, actualPeriodStart: parsed.actualPeriodStart, actualPeriodEnd: parsed.actualPeriodEnd, transactionCount: fileTransactions.length, overlapCount: stats.overlapBySource[file.id] ?? 0, excludedRows: parsed.excludedRows, format: statementFormat, balanceEvidence: parsed.balanceEvidence }]
               return next.map((entry) => ({ ...entry, overlapCount: stats.overlapBySource[entry.id] ?? 0 }))
             })
             const merged = stats.transactions
             setData((currentData) => ({ ...currentData, bank: merged }))
             setSourceStatus((currentStatus) => ({ ...currentStatus, bank: 'ACCEPTED' }))
-            fileHadError = csv.parseErrors.length > 0 || parsed.issues.length > 0
+            fileHadError = parsed.issues.length > 0
             statementOutcomes.set(file.id, {
               fileId: file.id, fileName: file.name, status: fileHadError ? 'WARNING' : 'PROCESSED',
-              periodStart: csv.statementPeriodStart, periodEnd: csv.statementPeriodEnd,
+              periodStart: parsed.declaredPeriodStart, periodEnd: parsed.declaredPeriodEnd, actualPeriodStart: parsed.actualPeriodStart, actualPeriodEnd: parsed.actualPeriodEnd, format: statementFormat === 'OFX' ? 'OFX' : statementFormat === 'BRADESCO_CSV_INTERNET_BANKING' ? 'CSV Internet Banking' : 'CSV Mobile',
               transactionCount: fileTransactions.length, ignoredRowCount: parsed.ignoredRows,
-              excludedRowCount: parsed.excludedRows?.length ?? 0, overlapCount: stats.overlapBySource[file.id] ?? 0,
-              detail: fileHadError ? `${csv.parseErrors.length + parsed.issues.length} aviso(s) na leitura; movimentações válidas foram carregadas.` : undefined,
+              excludedRowCount: parsed.excludedRows.length, overlapCount: stats.overlapBySource[file.id] ?? 0,
+              detail: fileHadError ? `${parsed.issues.length} aviso(s) na leitura; movimentações válidas foram carregadas.` : undefined,
             })
           }
           if (fileHadError) errors += 1
@@ -539,9 +585,10 @@ export default function App() {
         financialIdentity: drivePdfSemanticIdentities.current.get(file.id),
       })
       const invoiceSummary = summarizeDriveInvoiceOutcomes(invoiceFolderFiles.length, invoiceFileResults)
-      const statementFileResults = statementFolderFiles.map((file) => statementOutcomes.get(file.id) ?? {
+      const finalStatementMerge = mergeDriveBankSourcesWithStats(manualBankTransactions.current, driveBankFiles.current)
+      const statementFileResults = statementFolderFiles.map((file) => ({ ...(statementOutcomes.get(file.id) ?? {
         fileId: file.id, fileName: file.name, status: 'IGNORED' as const, detail: 'Arquivo não foi processado nesta sincronização.',
-      })
+      }), overlapCount: finalStatementMerge.overlapBySource[file.id] ?? 0 }))
       const timestamp = new Date().toISOString()
       setDriveLastSync(timestamp)
       try { saveDriveLastSync(timestamp) } catch { /* Timestamp is an optional local convenience. */ }
@@ -821,10 +868,20 @@ export default function App() {
     const usedSheetIds = new Set<string>()
     const parsed = cardPdfs.filter((entry): entry is CardPdfEntry & { statement: CardStatement } => entry.statement != null)
       .sort((a, b) => (a.statement.dueDate ?? '').localeCompare(b.statement.dueDate ?? '') || a.key.localeCompare(b.key))
+    const confirmedSheetOwners = new Map<string, string>()
+    const savedStatementMatches = savedDecisions.filter((item) => item.kind === 'STATEMENT_MATCH_CONFIRMED')
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.key.localeCompare(b.key))
+    const activeAssignments = resolveStatementMatchAssignments(savedStatementMatches, parsed.map(({ statement, legacyStatementIdentity }) => ({ statement, legacyStatementIdentity })), data.sheet)
+    const conflictingAssignments = conflictingStatementAssignments(activeAssignments)
+    for (const assignment of activeAssignments) confirmedSheetOwners.set(assignment.row.id, conflictingAssignments.has(sheetIdentity(assignment.row)) ? '__CONFLICTING_MANUAL_OWNERS__' : assignment.ownerKey)
     return parsed.map((entry) => {
       const confirmations = new Map<string, string>()
+      const entryAssignments = activeAssignments.filter((assignment) => assignment.statement.statementIdentity === entry.statement.statementIdentity)
+      for (const assignment of entryAssignments) {
+        if (!conflictingAssignments.has(sheetIdentity(assignment.row))) confirmations.set(assignment.transactionId, assignment.row.id)
+      }
       const editedConfirmationRows = new Map<string, LedgerTransaction>()
-      for (const record of savedDecisions.filter((item) => item.kind === 'STATEMENT_MATCH_CONFIRMED')) {
+      for (const record of savedStatementMatches) {
         const transaction = entry.statement.transactions.find((item) => cardTransactionIdentityVariants(entry.statement, item, entry.legacyStatementIdentity).includes(record.identities[0]))
         const sheet = data.sheet.find((item) => sheetIdentity(item) === record.selected[0])
         if (transaction && sheet) {
@@ -848,13 +905,25 @@ export default function App() {
         }))
         rejectedCandidates.set(transaction.id, rejectedIds)
       }
-      const result = reconcileCardStatement(entry.statement, data.sheet, confirmations, rejectedCandidates)
+      const result = reconcileCardStatement(entry.statement, data.sheet, confirmations, rejectedCandidates, confirmedSheetOwners)
       const matches = result.matches.map((match) => {
-        let derived = deriveCardPurchaseStatus(match, { ignored: ignored.has(match.transaction.id), consumedSheetIds: usedSheetIds })
+        const manualAssignment = entryAssignments.find((assignment) => assignment.transactionId === match.transaction.id)
+        const manualTargetStillValid = manualAssignment
+          && !conflictingAssignments.has(sheetIdentity(manualAssignment.row))
+          && findExistingCostYearCandidates(entry.statement, match.transaction, [manualAssignment.row]).some((row) => row.id === manualAssignment.row.id)
+        // Rehydrate the persisted target directly by sheetRecordId. The pure candidate
+        // ranking may prefer another invoice-cycle row and must not erase a valid choice.
+        const explicitlyConfirmed = manualTargetStillValid
+          ? { ...match, status: 'CARD_MATCHED' as const, sheet: manualAssignment.row, candidates: [manualAssignment.row], evidence: [...(match.evidence ?? []), 'Confirmação manual válida aplicada'] }
+          : match
+        let derived = deriveCardPurchaseStatus(explicitlyConfirmed, { ignored: ignored.has(match.transaction.id), consumedSheetIds: confirmations.has(match.transaction.id) ? undefined : usedSheetIds })
+        const canonicalSubjectId = cardTransactionIdentity(entry.statement, match.transaction)
+        const contestedRows = [...conflictingAssignments.values()].flat().filter((assignment) => assignment.subjectId === canonicalSubjectId).map((assignment) => assignment.row)
         const editedCandidate = editedConfirmationRows.get(match.transaction.id)
         if (editedCandidate && (derived.status === 'CARD_MISSING' || derived.status === 'CARD_REVIEW')) derived = { ...derived, status: 'CARD_REVIEW', sheet: null, candidates: [editedCandidate], evidence: ['Vínculo anterior reavaliado após alteração da linha', 'Valor exato', 'Crédito_Bradesco', 'A data ou descrição editada exige confirmação'] }
+        if (contestedRows.length) derived = { ...derived, status: 'CARD_REVIEW', sheet: null, candidates: contestedRows, evidence: ['Confirmações manuais incompatíveis reservam a mesma linha', 'Revise qual vínculo deve permanecer'] }
         const candidates = cardReviewOverrides[cardTransactionIdentity(entry.statement, match.transaction)]
-        return candidates?.length && !confirmations.has(match.transaction.id) && ['CARD_MISSING', 'CARD_REVIEW', 'CARD_MATCHED'].includes(derived.status)
+        return candidates?.length && !contestedRows.length && !confirmations.has(match.transaction.id) && ['CARD_MISSING', 'CARD_REVIEW', 'CARD_MATCHED'].includes(derived.status)
           ? { ...derived, status: 'CARD_REVIEW' as const, sheet: null, candidates }
           : derived
       })
@@ -867,7 +936,7 @@ export default function App() {
     })
   }, [cardPdfs, data.sheet, savedDecisions, statementPayments, cardReviewOverrides])
   const visibleStatementResults = useMemo(() => statementOnlyIssues
-    ? statementResults.filter((item) => item.matches.some((match) => match.status === 'CARD_MISSING' || match.status === 'CARD_REVIEW')
+    ? statementResults.filter((item) => item.matches.some((match) => match.status === 'CARD_MISSING' || match.status === 'CARD_MISSING_CONFIRMED' || match.status === 'CARD_REVIEW')
       || item.statement.errors.length > 0 || item.payment == null || item.statement.accountingDifference != null && item.statement.accountingDifference !== 0)
     : statementResults, [statementResults, statementOnlyIssues])
   const persistedDecisionAudit = useMemo(() => sourceStatus.sheet === 'ACCEPTED'
@@ -915,16 +984,20 @@ export default function App() {
     const previousStatus = sourceStatus[mode]
     setSourceStatus((current) => ({ ...current, [mode]: 'LOADED' }))
     try {
-      const csv = await readCsvFile(file)
-      const map = initialColumnMap(csv.headers, mode) as ColumnMap
-      const parsed = mode === 'sheet' ? parseLedgerRows(csv.rows, map) : parseBankCsvSections(csv, map)
-      const auxiliaryIncludedCount = mode === 'bank' ? (parsed as ReturnType<typeof parseBankCsvSections>).auxiliaryIncludedCount : 0
-      const auxiliaryOutsidePeriodCount = mode === 'bank' ? (parsed as ReturnType<typeof parseBankCsvSections>).auxiliaryOutsidePeriodCount : 0
-      setUploads((current) => ({ ...current, [mode]: { fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, excludedRows: mode === 'bank' ? parsed.excludedRows ?? [] : [], auxiliaryIncludedCount, auxiliaryOutsidePeriodCount } }))
+      if (mode === 'sheet') {
+        const csv = await readCsvFile(file)
+        const map = initialColumnMap(csv.headers, 'sheet') as ColumnMap
+        const parsed = parseLedgerRows(csv.rows, map)
+        setUploads((current) => ({ ...current, sheet: { fileName: file.name, csv, map, valid: parsed.transactions, issues: [...csv.parseErrors.map((message, index) => ({ row: index + 2, message })), ...parsed.issues], rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, excludedRows: [], auxiliaryIncludedCount: 0, auxiliaryOutsidePeriodCount: 0 } }))
+      } else {
+        const parsed = await readBankStatementFile(file)
+        const issues = parsed.issues
+        setUploads((current) => ({ ...current, bank: { fileName: file.name, csv: parsed.csv, map: parsed.map, valid: parsed.transactions, issues, rowCount: parsed.rowCount, ignoredRows: parsed.ignoredRows, excludedRows: parsed.excludedRows, auxiliaryIncludedCount: parsed.auxiliaryIncludedCount, auxiliaryOutsidePeriodCount: parsed.auxiliaryOutsidePeriodCount, format: parsed.format, declaredPeriodStart: parsed.declaredPeriodStart, declaredPeriodEnd: parsed.declaredPeriodEnd, actualPeriodStart: parsed.actualPeriodStart, actualPeriodEnd: parsed.actualPeriodEnd, balanceEvidence: parsed.balanceEvidence } }))
+      }
       setSourceStatus((current) => ({ ...current, [mode]: 'VALIDATED' }))
     } catch {
       setSourceStatus((current) => ({ ...current, [mode]: previousStatus }))
-      setError(`Não foi possível ler o CSV selecionado para ${mode === 'sheet' ? 'a planilha' : 'o extrato'}.`)
+      setError(mode === 'sheet' ? 'Não foi possível ler o CSV selecionado para a planilha.' : 'Não foi possível ler o extrato selecionado. Layout não reconhecido ou arquivo inválido.')
     }
   }
 
@@ -1103,6 +1176,7 @@ export default function App() {
     setUploads((current) => {
       const entry = current[mode]
       if (!entry) return current
+      if (mode === 'bank' && entry.format === 'OFX') return current
       const map = { ...entry.map, [key]: value }
       const parsed = mode === 'sheet' ? parseLedgerRows(entry.csv.rows, map) : parseBankCsvSections(entry.csv, map)
       const auxiliaryIncludedCount = mode === 'bank' ? (parsed as ReturnType<typeof parseBankCsvSections>).auxiliaryIncludedCount : 0
@@ -1317,11 +1391,12 @@ export default function App() {
     const transaction = statement.transactions.find((item) => item.id === transactionId), sheet = data.sheet.find((item) => item.id === sheetId)
     if (transaction && sheet) {
       const identity = cardTransactionIdentity(statement, transaction)
+      const currentAliases = cardTransactionIdentityVariants(statement, transaction, cardPdfs.find((entry) => entry.statement === statement)?.legacyStatementIdentity)
       const rejectedDecision = savedDecisions.find((record) => record.kind === 'CARD_REVIEW_REJECTED_CANDIDATES'
-        && cardTransactionIdentityVariants(statement, transaction, cardPdfs.find((entry) => entry.statement === statement)?.legacyStatementIdentity).includes(record.identities[0]))
+        && currentAliases.includes(record.identities[0]))
       if (rejectedDecision) await removeDecision(rejectedDecision.kind, rejectedDecision.identities)
       setCardReviewOverrides((current) => { const next = { ...current }; delete next[identity]; return next })
-      await persistDecision('STATEMENT_MATCH_CONFIRMED', [identity], [sheetIdentity(sheet)])
+      await persistStatementMatchReplacingOwners(statement, transaction, sheet)
     }
   }
 
@@ -1418,7 +1493,8 @@ export default function App() {
     const rejectedDecision = savedDecisions.find((record) => record.kind === 'CARD_REVIEW_REJECTED_CANDIDATES' && item.aliases.includes(record.identities[0]))
     if (rejectedDecision) await removeDecision(rejectedDecision.kind, rejectedDecision.identities)
     setCardReviewOverrides((current) => { const next = { ...current }; delete next[item.fingerprint]; return next })
-    await persistDecision('STATEMENT_MATCH_CONFIRMED', [item.fingerprint], [sheetIdentity(candidate)])
+    const saved = await persistStatementMatchReplacingOwners(item.statement, item.transaction, candidate)
+    if (!saved) return
     setConsistencyAuditError('Vínculo salvo para este item. Execute a auditoria novamente para atualizar o relatório.')
   }
 
@@ -1445,6 +1521,7 @@ export default function App() {
           ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, sourceName: transactions[0]?.statementFileName ?? sourceId, transactions })),
         ],
         currentBankItems: result.items,
+        missingActionVisibility: Object.fromEntries(result.items.map((item) => [item.bank.id, selectMissingExpenses([item]).length > 0 && bankAddEligibility(item).eligible])),
         bankRefundGroups: result.bankRefundGroups,
         sheets: auditSheets,
         statements: [{ statement: { ...item.statement, transactions: [item.transaction] } }],
@@ -1461,13 +1538,16 @@ export default function App() {
         const findings = [...previous.findings.filter((finding) => finding.item?.fingerprint !== item.fingerprint), ...refreshed.findings]
         const pureStates = { ...previous.pureStates, ...refreshed.pureStates }
         const currentStates = { ...previous.currentStates, ...refreshed.currentStates }
-        return { ...previous, auditedAt: refreshed.auditedAt, items, findings, pureStates, currentStates, summary: summarizeAudit(findings, items) }
+        return { ...previous, auditedAt: refreshed.auditedAt, items, findings, pureStates, currentStates, summary: summarizeAudit(findings, items, previous.summary.evaluatedPurchases, previous.mode) }
       })
       setConsistencyAuditError(refreshed.items[0]?.diagnosis ?? 'Reanálise concluída. Nenhuma decisão ou lançamento foi alterado.')
     } catch (error) { setConsistencyAuditError(error instanceof Error ? error.message : 'Não foi possível reanalisar esta compra.') }
   }
 
-  async function runConsistencyAudit() {
+  async function runConsistencyAudit(mode: AuditMode = 'PROFUNDA') {
+    if (consistencyAuditRunLock.current) return
+    const auditStartedAt = performance.now()
+    consistencyAuditRunLock.current = true
     setConsistencyAuditBusy(true)
     setConsistencyAuditError('')
     setConsistencyAuditSourceNote('')
@@ -1475,7 +1555,7 @@ export default function App() {
       let auditSheets = data.sheet
       let remoteDecisions: PersistedDecision[] = []
       let remoteTombstones: PersistedDecision[] = []
-      if (sheetSource === 'google' && googleSheetLink?.spreadsheetId && googleAccessToken.current) {
+      if (mode === 'PROFUNDA' && sheetSource === 'google' && googleSheetLink?.spreadsheetId && googleAccessToken.current) {
         try {
           const [ledger, decisions] = await Promise.all([
             readGoogleSheetLedger(googleSheetLink.spreadsheetId, googleAccessToken.current),
@@ -1488,19 +1568,22 @@ export default function App() {
         } catch (remoteError) {
           setConsistencyAuditSourceNote(`Não foi possível reler as fontes remotas (${remoteError instanceof Error ? remoteError.message : 'erro de leitura'}). Relatório parcial usando fontes atuais carregadas e decisões locais; nenhuma alteração foi feita.`)
         }
-      } else if (sheetSource === 'google' && googleSheetLink?.spreadsheetId) {
+      } else if (mode === 'PROFUNDA' && sheetSource === 'google' && googleSheetLink?.spreadsheetId) {
         setConsistencyAuditSourceNote('Google precisa ser reconectado para reler as fontes remotas. Auditoria parcial usando os dados já carregados nesta sessão; nenhuma alteração foi feita.')
       } else {
         setConsistencyAuditSourceNote('Auditoria das fontes carregadas nesta sessão e das decisões locais; nenhuma alteração foi feita.')
       }
       const localDecisions = await listPersistedDecisions()
+      if (mode === 'PROFUNDA') await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
       const auditResult = auditConsistency({
+        mode,
         banks: data.bank,
         bankSourceRows: [
           ...(manualBankTransactions.current.length ? [{ sourceId: 'manual', sourceName: uploads.bank?.fileName ?? 'Extrato local', transactions: manualBankTransactions.current }] : []),
           ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, sourceName: transactions[0]?.statementFileName ?? sourceId, transactions })),
         ],
         currentBankItems: result.items,
+        missingActionVisibility: Object.fromEntries(result.items.map((item) => [item.bank.id, selectMissingExpenses([item]).length > 0 && bankAddEligibility(item).eligible])),
         bankRefundGroups: result.bankRefundGroups,
         missingCounterCollections: [
           { source: 'card superior', items: selectMissingExpenses(result.items) },
@@ -1516,6 +1599,15 @@ export default function App() {
           const sourceIds = entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : [])
           return identity && sourceIds.length > 1 ? [{ identity, sourceIds }] : []
         }),
+        sourceProvenance: [
+          ...(manualBankTransactions.current.length ? [{ sourceId: 'manual', entityIds: manualBankTransactions.current.map((transaction) => transaction.id) }] : []),
+          ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, entityIds: transactions.map((transaction) => transaction.id) })),
+          ...cardPdfs.flatMap((entry) => {
+            if (!entry.statement) return []
+            const sourceIds = [...(entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : [])), ...(entry.manualSourceIds ?? (entry.source === 'MANUAL' ? [entry.fingerprint] : []))]
+            return sourceIds.map((sourceId) => ({ sourceId, entityIds: [entry.statement!.statementIdentity, ...entry.statement!.transactions.map((transaction) => transaction.id)] }))
+          }),
+        ],
         sheets: auditSheets,
         statements: cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []),
         currentCardMatches: statementResults.flatMap((entry) => entry.matches.map((match) => ({ statementIdentity: entry.statement.statementIdentity, transactionId: match.transaction.id, match }))),
@@ -1525,17 +1617,20 @@ export default function App() {
         remoteTombstones,
         localTombstones: listDecisionTombstones(),
       })
+      if (mode === 'PROFUNDA' && import.meta.env.DEV) {
+        console.info(`Auditoria Profunda concluída em ${(performance.now() - auditStartedAt).toFixed(1)} ms`)
+      }
       setConsistencyAudit(auditResult)
       setConsistencyAuditFilter('ALL')
       setTab('auditor')
     } catch (auditError) {
       setConsistencyAuditError(auditError instanceof Error ? auditError.message : 'Não foi possível concluir a auditoria.')
-    } finally { setConsistencyAuditBusy(false) }
+    } finally { consistencyAuditRunLock.current = false; setConsistencyAuditBusy(false) }
   }
 
   const activeAuditFindings = consistencyAudit?.findings.filter((finding) => !isAuditFindingDismissed(finding, dismissedAuditFindings)) ?? []
   const hiddenAuditFindings = consistencyAudit?.findings.filter((finding) => isAuditFindingDismissed(finding, dismissedAuditFindings)) ?? []
-  const activeAuditSummary = consistencyAudit ? summarizeAudit(activeAuditFindings, consistencyAudit.items) : null
+  const activeAuditSummary = consistencyAudit ? summarizeAudit(activeAuditFindings, consistencyAudit.items, consistencyAudit.summary.evaluatedPurchases, consistencyAudit.mode) : null
   const auditDisplayedFindings = consistencyAudit
     ? consistencyAuditFilter === 'HIDDEN'
       ? hiddenAuditFindings
@@ -1553,7 +1648,7 @@ export default function App() {
     const next = restoreAuditFinding(finding, dismissedAuditFindings)
     saveAuditFindingVisibility(next)
     setDismissedAuditFindings(next)
-    setConsistencyAuditFilter(finding.severity === 'CRITICAL' ? 'CRITICAL' : finding.severity === 'REVIEW' ? 'REVIEW' : finding.severity === 'LEGACY' || finding.severity === 'MAINTENANCE' ? 'LEGACY' : 'ALL')
+    setConsistencyAuditFilter(finding.severity === 'CRITICAL' ? 'CRITICAL' : finding.severity === 'REVIEW' ? 'REVIEW' : finding.status === 'LEGACY' || finding.status === 'MAINTENANCE' ? 'LEGACY' : 'ALL')
   }
 
   useEffect(() => {
@@ -1605,7 +1700,7 @@ export default function App() {
           const items = [...previous.items.filter((item) => !affected.has(item.fingerprint)), ...refreshed.items.filter((item) => affected.has(item.fingerprint))]
           const findings = [...previous.findings.filter((finding) => !affected.has(finding.item?.fingerprint ?? '')
             && !(finding.code === 'DOUBLE_CLAIM' && (finding.technical?.row as Record<string, unknown> | undefined)?.sheetIdentity === pending.rowIdentity)), ...relatedFindings]
-          return { ...previous, auditedAt: refreshed.auditedAt, items, findings, decisionAudit: refreshed.decisionAudit, pureStates: { ...previous.pureStates, ...refreshed.pureStates }, currentStates: { ...previous.currentStates, ...refreshed.currentStates }, summary: summarizeAudit(findings, items) }
+          return { ...previous, auditedAt: refreshed.auditedAt, items, findings, decisionAudit: refreshed.decisionAudit, pureStates: { ...previous.pureStates, ...refreshed.pureStates }, currentStates: { ...previous.currentStates, ...refreshed.currentStates }, summary: summarizeAudit(findings, items, previous.summary.evaluatedPurchases, previous.mode) }
         })
         setConsistencyAuditError('Reanálise dos subjects relacionados concluída. A decisão foi tombstonada; nenhuma linha da CUSTOS ANO foi alterada.')
       } catch (error) {
@@ -1648,7 +1743,7 @@ export default function App() {
           </section>
           <section className="how-section"><span className="step-label">02 / O QUE ACONTECE</span><div className="how-grid"><HowCard number="01" title="Validar" copy="Confira cabeçalhos, linhas válidas e possíveis problemas."/><HowCard number="02" title="Comparar" copy="Valores, datas e descrições formam candidatos explicáveis."/><HowCard number="03" title="Revisar" copy="Você confirma ou ignora cada caso incerto."/></div></section>
         </> : <>
-          <section className="results-heading"><div><span className="eyebrow">CONCILIAÇÃO LOCAL</span><h1>Visão geral</h1><p>Compare o resultado, refine o período e revise os casos sinalizados.</p></div><div className="audit-global-actions"><button className="button button-outline" onClick={() => void runConsistencyAudit()} disabled={consistencyAuditBusy}>{consistencyAuditBusy ? 'Auditando…' : 'Auditar consistência'}</button><button className="button button-outline" onClick={() => setScreen('home')}>← Voltar aos arquivos</button></div></section>
+          <section className="results-heading"><div><span className="eyebrow">CONCILIAÇÃO LOCAL</span><h1>Visão geral</h1><p>Compare o resultado, refine o período e revise os casos sinalizados.</p></div><div className="audit-global-actions"><button className="button button-outline" onClick={() => void runConsistencyAudit('PROFUNDA')} disabled={consistencyAuditBusy}>{consistencyAuditBusy ? 'Executando auditoria…' : 'Auditar consistência'}</button><button className="button button-outline" onClick={() => setScreen('home')}>← Voltar aos arquivos</button></div></section>
           <section className="results-sync-bar" aria-label="Sincronização das decisões"><div><strong role={googleDecisionStatus.startsWith('Decisões mantidas') ? 'alert' : 'status'} aria-live={googleDecisionStatus.startsWith('Decisões mantidas') ? 'assertive' : 'polite'}>{decisionSyncSummary}</strong><small>{googleSheetLink ? 'As decisões ficam neste dispositivo e sincronizam pela planilha vinculada.' : 'As decisões ficam salvas neste dispositivo.'}</small></div>{googleSheetInfo?.connected ? <button className="button button-outline" disabled={googleDecisionStatus === 'Sincronizando decisões…'} onClick={syncDecisionsManually}>{googleDecisionStatus === 'Sincronizando decisões…' ? 'Sincronizando…' : 'Sincronizar decisões'}</button> : googleSheetLink ? <button className="button button-outline" onClick={() => setScreen('home')}>Reconectar Google</button> : null}</section>
           <FilterBar years={years} year={filterYear} month={filterMonth} fromDate={fromDate} toDate={toDate} onYear={setFilterYear} onMonth={setFilterMonth} onFrom={setFromDate} onTo={setToDate}/>
           {missingWriteNotice && <p className="cost-write-notice" role="status">{missingWriteNotice}</p>}
@@ -1662,31 +1757,31 @@ export default function App() {
             <Metric label="Fora do escopo" value={shownOutOfScope.length} tone="blue" icon="ℹ" onClick={() => setTab('outofscope')}/>
           </div>
           <div className="tab-row" role="tablist" aria-label="Seções da conciliação"><Tab active={tab === 'overview'} onClick={() => setTab('overview')}>Resumo</Tab><Tab active={tab === 'review'} onClick={() => setTab('review')}>Revisão <span className="tab-count">{shownReview.length}</span></Tab><Tab active={tab === 'missing'} onClick={() => setTab('missing')}>Ausentes <span className="tab-count">{shownMissing.length}</span></Tab><Tab active={tab === 'card'} onClick={() => setTab('card')}>Faturas <span className="tab-count">{shownCardDivergences.length}</span></Tab>{statementResults.length > 0 && <Tab active={tab === 'statement'} onClick={() => setTab('statement')}>Faturas PDF <span className="tab-count">{statementResults.reduce((sum, result) => sum + result.matches.filter((match) => match.status === 'CARD_MISSING').length, 0)}</span></Tab>}{consistencyAudit && <Tab active={tab === 'auditor'} onClick={() => setTab('auditor')}>Auditoria <span className="tab-count">{activeAuditSummary?.attention ?? 0}</span></Tab>}<Tab active={tab === 'duplicates'} onClick={() => setTab('duplicates')}>Duplicidades <span className="tab-count">{filteredDuplicates.length}</span></Tab><Tab active={tab === 'outofscope'} onClick={() => setTab('outofscope')}>Fora do escopo <span className="tab-count">{shownOutOfScope.length}</span></Tab><Tab active={tab === 'flags'} onClick={() => setTab('flags')}>Sinalizações</Tab></div>
-          {tab === 'auditor' && consistencyAudit && <section className="consistency-audit"><header className="panel audit-summary"><div><span className="eyebrow">SOMENTE LEITURA</span><h2>Auditoria de consistência</h2><small>Executada em {new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(consistencyAudit.auditedAt))}</small></div><button className="button button-outline" onClick={() => void runConsistencyAudit()} disabled={consistencyAuditBusy}>{consistencyAuditBusy ? 'Auditando…' : 'Executar novamente'}</button><p>{consistencyAuditSourceNote}</p></header>{consistencyAuditError && <p className="cost-write-notice" role="status">{consistencyAuditError}</p>}<div className="audit-counts"><strong>⚠ {activeAuditSummary?.attention ?? 0} problemas que exigem atenção</strong><strong>{activeAuditSummary?.critical ?? 0} críticos</strong><strong>{activeAuditSummary?.review ?? 0} para revisão</strong><strong>{activeAuditSummary?.maintenance ?? 0} manutenções</strong><strong>{activeAuditSummary?.legacy ?? 0} legados</strong><strong>{hiddenAuditFindings.length} avisos ocultos</strong><strong>{consistencyAudit.summary.evaluatedPurchases} compras avaliadas</strong><strong>{activeAuditSummary?.informational ?? 0} informativos</strong></div><details className="panel audit-inventory"><summary>Compras avaliadas · {consistencyAudit.items.length}</summary>{consistencyAudit.items.map((item) => <div className="audit-transaction" key={item.fingerprint}><strong>{item.transaction.originalDescription}</strong><span>{dateLabel(item.transaction.purchaseDate)} · {formatCents(item.transaction.amount)}</span><details><summary>Detalhes técnicos da avaliação</summary><pre>{JSON.stringify({ diagnostico: item.diagnosis, estadoPuro: item.pure.status, estadoAtual: item.current?.status ?? null, fingerprint: item.fingerprint }, null, 2)}</pre></details></div>)}</details><div className="audit-filter"><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('ALL')}>Todos ({activeAuditFindings.length})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('CRITICAL')}>Críticos ({activeAuditSummary?.critical ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('REVIEW')}>Revisão ({activeAuditSummary?.review ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('LEGACY')}>Legado/Manutenção ({(activeAuditSummary?.maintenance ?? 0) + (activeAuditSummary?.legacy ?? 0)})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('HIDDEN')}>Ocultos ({hiddenAuditFindings.length})</button></div>{auditDisplayedFindings.length ? auditDisplayedFindings.map((finding) => <AuditFindingCard key={finding.id} finding={finding} visibility={dismissedAuditFindings} hiddenView={consistencyAuditFilter === 'HIDDEN'} onDismiss={hideAuditFinding} onRestore={restoreHiddenAuditFinding} onDiscardObsolete={(item) => void auditDiscardObsoleteDoubleClaim(item)} onViewPurchase={(item) => { if (!item.item) return; setAuditFocusTransactionId(item.item.transaction.id); setAuditFocusStatementIdentity(item.item.statement.statementIdentity); setTab('statement'); setStatementOnlyIssues(false) }} onUseCandidate={(item) => { if (item.item) void auditUseCandidate(item.item) }} onInvalidateDecision={(_item, decision, explanation) => void auditInvalidateDecision(decision, explanation)} onReanalyze={(item) => { if (item.item) void auditRecalculateItem(item.item) }}/>) : <div className="panel"><EmptyState title={consistencyAuditFilter === 'HIDDEN' ? 'Nenhum aviso oculto' : 'Nenhuma inconsistência neste filtro'} copy={consistencyAuditFilter === 'HIDDEN' ? 'Os avisos ocultados aparecerão aqui.' : 'O relatório não encontrou problemas para mostrar nesta categoria.'}/></div>}</section>}
+          {tab === 'auditor' && consistencyAudit && <section className="consistency-audit"><header className="panel audit-summary"><div><span className="eyebrow">SOMENTE LEITURA</span><h2>Auditoria de consistência</h2><small>Executada em {new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(consistencyAudit.auditedAt))}</small></div><button className="button button-outline" onClick={() => void runConsistencyAudit('PROFUNDA')} disabled={consistencyAuditBusy}>{consistencyAuditBusy ? 'Executando auditoria…' : 'Executar novamente'}</button><p>{consistencyAuditSourceNote}</p></header>{consistencyAuditError && <p className="cost-write-notice" role="status">{consistencyAuditError}</p>}<div className="audit-counts"><strong>✓ {consistencyAudit.summary.validatedInvariants} invariantes validadas</strong><strong>⚠ {activeAuditSummary?.attention ?? 0} problemas que exigem atenção</strong><strong>⛔ {activeAuditSummary?.critical ?? 0} críticos</strong><strong>{activeAuditSummary?.review ?? 0} para revisão</strong><strong>{activeAuditSummary?.maintenance ?? 0} manutenções</strong><strong>{activeAuditSummary?.legacy ?? 0} legados</strong><strong>{hiddenAuditFindings.length} avisos ocultos</strong><strong>{consistencyAudit.summary.evaluatedPurchases} compras avaliadas</strong><strong>ℹ {activeAuditSummary?.informational ?? 0} informativos</strong></div><details className="panel audit-inventory"><summary>Compras avaliadas · {consistencyAudit.items.length}</summary>{consistencyAudit.items.map((item) => <div className="audit-transaction" key={item.fingerprint}><strong>{item.transaction.originalDescription}</strong><span>{dateLabel(item.transaction.purchaseDate)} · {formatCents(item.transaction.amount)}</span><details><summary>Detalhes técnicos da avaliação</summary><pre>{JSON.stringify({ diagnostico: item.diagnosis, estadoPuro: item.pure.status, estadoAtual: item.current?.status ?? null, fingerprint: item.fingerprint }, null, 2)}</pre></details></div>)}</details><div className="audit-filter"><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('ALL')}>Todos ({activeAuditFindings.length})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('CRITICAL')}>Críticos ({activeAuditSummary?.critical ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('REVIEW')}>Revisão ({activeAuditSummary?.review ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('LEGACY')}>Legado/Manutenção ({(activeAuditSummary?.maintenance ?? 0) + (activeAuditSummary?.legacy ?? 0)})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('HIDDEN')}>Ocultos ({hiddenAuditFindings.length})</button></div>{auditDisplayedFindings.length ? auditDisplayedFindings.map((finding) => <AuditFindingCard key={finding.id} finding={finding} visibility={dismissedAuditFindings} hiddenView={consistencyAuditFilter === 'HIDDEN'} onDismiss={hideAuditFinding} onRestore={restoreHiddenAuditFinding} onDiscardObsolete={(item) => void auditDiscardObsoleteDoubleClaim(item)} onViewPurchase={(item) => { if (!item.item) return; setAuditFocusTransactionId(item.item.transaction.id); setAuditFocusStatementIdentity(item.item.statement.statementIdentity); setTab('statement'); setStatementOnlyIssues(false) }} onUseCandidate={(item) => { if (item.item) void auditUseCandidate(item.item) }} onInvalidateDecision={(_item, decision, explanation) => void auditInvalidateDecision(decision, explanation)} onReanalyze={(item) => { if (item.item) void auditRecalculateItem(item.item) }}/>) : <div className="panel"><EmptyState title={consistencyAuditFilter === 'HIDDEN' ? 'Nenhum aviso oculto' : 'Nenhuma inconsistência neste filtro'} copy={consistencyAuditFilter === 'HIDDEN' ? 'Os avisos ocultados aparecerão aqui.' : 'O relatório não encontrou problemas para mostrar nesta categoria.'}/></div>}</section>}
           {tab === 'overview' && <>
             <div className="summary-grid"><section className="panel"><PanelTitle title="Movimentação no período" note="Valores apresentados em reais"/><div className="totals-list"><AmountRow label="Total de movimentações do banco" amount={filteredItems.filter((item) => item.bank.direction === 'DEBIT' || item.bank.direction === 'CREDIT').reduce((sum, item) => sum + item.bank.amount, 0)} /><AmountRow label="Saídas" amount={filteredItems.filter((item) => item.bank.direction === 'DEBIT').reduce((sum, item) => sum + item.bank.amount, 0)}/><AmountRow label="Entradas" amount={filteredItems.filter((item) => item.bank.direction === 'CREDIT').reduce((sum, item) => sum + item.bank.amount, 0)}/><AmountRow label="Lançamentos da planilha" amount={filteredSheet.reduce((sum, item) => sum + item.amount, 0)} strong/></div></section>
-              <section className="panel"><PanelTitle title="Arquivos usados" note="Dados temporários nesta sessão"/><div className="file-summary"><FileLine icon="▤" title="Tabela CUSTOS ANO" detail={`${data.sheet.length} linhas válidas`} /><FileLine icon="◈" title={driveStatementFiles.length > 0 ? `Extratos bancários · ${driveStatementFiles.length + (manualBankTransactions.current.length ? 1 : 0)} arquivos` : 'Extrato bancário'} detail={`${data.bank.length} movimentações únicas${uploads.bank?.csv.statementPeriodStart && uploads.bank.csv.statementPeriodEnd ? ` · ${dateLabel(uploads.bank.csv.statementPeriodStart)} a ${dateLabel(uploads.bank.csv.statementPeriodEnd)}` : ''}`} />{uploads.bank?.auxiliaryIncludedCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryIncludedCount} lançamento(s) dentro do período foram incorporados de Últimos Lançamentos.</small> : null}{uploads.bank?.auxiliaryOutsidePeriodCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryOutsidePeriodCount} lançamento(s) auxiliares fora do período foram ignorados.</small> : null}</div>{manualBankTransactions.current.length > 0 && <BalanceAuditPanel audit={bankBalanceAudit}/>}{driveStatementFiles.map((file) => { const statementTransactions = driveBankFiles.current[file.id] ?? []; return <StatementBalanceAccordion fileName={file.name} audit={auditBankBalance(statementTransactions, file.excludedRows)} key={file.id}/> })}</section></div>
-            {shownBankRefundGroups.length > 0 && <details className="panel bank-refund-groups"><summary><strong>Devoluções bancárias · {shownBankRefundGroups.length}</strong><small>Despesas e devoluções relacionadas antes da análise de ausências</small></summary><div>{shownBankRefundGroups.map((group) => { const refund = data.bank.find((item) => item.id === group.refundTransactionId); const originals = group.originalTransactionIds.map((id) => data.bank.find((item) => item.id === id)).filter((item): item is BankTransaction => Boolean(item)); return <article className="issue-row" key={group.id}><span className={`status-icon ${group.status === 'REVIEW' ? 'amber' : 'green'}`}>{group.status === 'REVIEW' ? '!' : '✓'}</span><div><strong>{group.status === 'REFUNDED' ? 'Pagamento devolvido integralmente' : group.status === 'PARTIAL' ? 'Devolução parcial' : 'Devolução precisa de revisão'}</strong>{group.status === 'REVIEW' ? <><p>{refund ? `${dateLabel(refund.date)} · ${refund.originalDescription} · ${formatCents(refund.amount)}` : 'Devolução'} combina com mais de uma saída PIX anterior:</p>{originals.map((item) => <small key={item.id}>{dateLabel(item.date)} · {item.originalDescription} · {formatCents(item.amount)}</small>)}</> : <><p>{originals[0] ? `${originals[0].originalDescription} de ${formatCents(group.grossAmount ?? originals[0].amount)}` : 'Saída bancária'} · {originals[0] ? dateLabel(originals[0].date) : ''}{refund ? ` → devolvido em ${dateLabel(refund.date)}` : ''}</p><small>Devolução: {formatCents(group.refundAmount)} · líquido: {formatCents(group.netAmount ?? 0)}</small></>}</div></article>})}</div></details>}
+              <section className="panel"><PanelTitle title="Arquivos usados" note="Dados temporários nesta sessão"/><div className="file-summary"><FileLine icon="▤" title="Tabela CUSTOS ANO" detail={`${data.sheet.length} linhas válidas`} /><FileLine icon="◈" title={driveStatementFiles.length > 0 ? `Extratos bancários · ${driveStatementFiles.length + (manualBankTransactions.current.length ? 1 : 0)} arquivos` : 'Extrato bancário'} detail={`${data.bank.length} movimentações únicas${uploads.bank?.csv.statementPeriodStart && uploads.bank.csv.statementPeriodEnd ? ` · ${dateLabel(uploads.bank.csv.statementPeriodStart)} a ${dateLabel(uploads.bank.csv.statementPeriodEnd)}` : ''}`} />{uploads.bank?.auxiliaryIncludedCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryIncludedCount} lançamento(s) dentro do período foram incorporados de Últimos Lançamentos.</small> : null}{uploads.bank?.auxiliaryOutsidePeriodCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryOutsidePeriodCount} lançamento(s) auxiliares fora do período foram ignorados.</small> : null}</div>{manualBankTransactions.current.length > 0 && (uploads.bank?.balanceEvidence ? <small className="auxiliary-import-note">Saldo informado no OFX: {formatCents(uploads.bank.balanceEvidence.amount)} em {dateLabel(uploads.bank.balanceEvidence.date)}.</small> : <BalanceAuditPanel audit={bankBalanceAudit}/>)}{driveStatementFiles.map((file) => { const statementTransactions = driveBankFiles.current[file.id] ?? []; return file.format === 'OFX' && file.balanceEvidence ? <small key={file.id} className="auxiliary-import-note">{file.name}: saldo OFX informado de {formatCents(file.balanceEvidence.amount)} em {dateLabel(file.balanceEvidence.date)}.</small> : <StatementBalanceAccordion fileName={file.name} audit={auditBankBalance(statementTransactions, file.excludedRows)} key={file.id}/> })}</section></div>
+            {shownBankRefundGroups.length > 0 && <details className="panel bank-refund-groups"><summary><strong>Devoluções bancárias · {shownBankRefundGroups.length}</strong><small>Despesas e devoluções relacionadas antes da análise de ausências</small></summary><div>{shownBankRefundGroups.map((group) => { const refund = data.bank.find((item) => item.id === group.refundTransactionId); const originals = group.originalTransactionIds.map((id) => data.bank.find((item) => item.id === id)).filter((item): item is BankTransaction => Boolean(item)); return <article className="issue-row" key={group.id}><span className={`status-icon ${group.status === 'REVIEW' ? 'amber' : 'green'}`}>{group.status === 'REVIEW' ? '!' : '✓'}</span><div><strong>{group.status === 'REFUNDED' ? 'Pagamento devolvido integralmente' : group.status === 'PARTIAL' ? 'Devolução parcial' : 'Devolução precisa de revisão'}</strong>{group.status === 'REVIEW' ? <><p>{refund ? `${dateLabel(refund.date)} · ${refund.originalDescription} · ${formatCents(refund.amount)}` : 'Devolução'} combina com mais de uma saída PIX anterior:</p>{refund && <CounterpartyNote transaction={refund}/>} {originals.map((item) => <div key={item.id}><small>{dateLabel(item.date)} · {item.originalDescription} · {formatCents(item.amount)}</small><CounterpartyNote transaction={item}/></div>)}</> : <><p>{originals[0] ? `${originals[0].originalDescription} de ${formatCents(group.grossAmount ?? originals[0].amount)}` : 'Saída bancária'} · {originals[0] ? dateLabel(originals[0].date) : ''}{refund ? ` → devolvido em ${dateLabel(refund.date)}` : ''}</p>{originals[0] && <CounterpartyNote transaction={originals[0]}/>} {refund && <CounterpartyNote transaction={refund}/>}<small>Devolução: {formatCents(group.refundAmount)} · líquido: {formatCents(group.netAmount ?? 0)}</small></>}</div></article>})}</div></details>}
             <section className="panel recent-panel"><PanelTitle title="Atividade para acompanhar" note="Os itens abaixo precisam da sua atenção" action={<button className="text-button" onClick={() => setTab('review')}>Ver revisão →</button>}/>{shownReview.length + shownMissing.length ? <div className="activity-list">{[...shownReview, ...shownMissing].slice(0, 5).map((item) => <ActivityItem key={item.bank.id} item={item}/>)}</div> : <EmptyState title="Tudo em dia por aqui" copy="Nenhuma ausência ou correspondência pendente para o período selecionado."/>}</section>
             {shownMatched.length > 0 && <details className="panel matched-details" open={shownMatched.some((item) => item.candidate?.reasons.includes('Correspondência 1:1 escolhida globalmente'))}><summary><span><strong>Correspondências encontradas · {shownMatched.length}</strong><small>Abra para ver evidências, descrição e confiança</small></span><span aria-hidden="true">⌄</span></summary><div className="matched-list">{shownMatched.map((item) => <MatchedDetail key={item.bank.id} item={item} confirmedPreviously={savedDecisions.some((record) => record.kind === 'PAIR_CONFIRMED' && record.identities[0] === bankIdentity(item.bank))} onUndo={() => { if (item.sheet) void removeDecision('PAIR_CONFIRMED', [bankIdentity(item.bank)]) }}/>)}</div></details>}
             {cardPdfs.length > 0 && <section className="panel"><PanelTitle title="Faturas PDF desta conciliação" note="Totais agregados; cada arquivo mantém sua análise independente."/>{cardPdfs.map((entry) => { const item = statementResults.find((result) => result.entry.key === entry.key); const status = entry.status === 'PROCESSING' ? 'Processando…' : entry.status === 'PROCESSED' ? '✓ Processado' : entry.status === 'DIVERGENCE' ? '⚠ Divergência' : '⚠ Erro de parsing'; return <div className="card-pdf-status" key={entry.key}><div><strong>{entry.fileName}</strong><small>{status}{item ? ` · Vencimento ${item.statement.dueDate ? dateLabel(item.statement.dueDate) : 'não identificado'} · Total ${item.statement.reportedTotal == null ? 'indisponível' : formatCents(item.statement.reportedTotal)} · ${item.matches.filter((match) => match.status === 'CARD_MISSING').length} compra(s) ausente(s)` : entry.error ? ` · ${entry.error}` : ''}</small>{item && <small>{item.payment ? `Pagamento identificado: ${dateLabel(item.payment.date)} · ${formatCents(item.payment.amount)}` : 'Pagamento bancário não identificado'}</small>}</div></div>})}</section>}
             {filteredItems.some((item) => item.compositionStatus === 'MATCHED') && <section className="review-list"><PanelTitle title="Pagamentos de cartão conciliados" note="Uma saída bancária pode corresponder a vários lançamentos Crédito_Bradesco"/>{filteredItems.filter((item) => item.compositionStatus === 'MATCHED').map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}</section>}
           </>}
           {tab === 'review' && <div className="review-list">{shownReview.map((item) => item.bank.type === 'CARD_PAYMENT' ? <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/> : <ReviewCard key={item.bank.id} item={item} onConfirm={() => decide(item, 'confirm')} onReject={() => decide(item, 'reject')} onIgnore={() => decide(item, 'ignore')}/>)}{!shownReview.length && <EmptyState title="Nenhum item para revisar" copy="A conciliação não encontrou itens pendentes neste período."/>}</div>}
-          {tab === 'missing' && <div className="review-list"><MissingSummary items={shownMissing}/>{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')} onAddToSheet={() => openBankMissing(item)} canAddToSheet={bankAddEligibility(item).eligible} />)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
+          {tab === 'missing' && <div className="review-list"><MissingSummary items={shownMissing}/>{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')} onAddToSheet={() => openBankMissing(item)} eligibility={bankAddEligibility(item)} />)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
           {tab === 'card' && <div className="review-list">{shownCardDivergences.map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}{!shownCardDivergences.length && <EmptyState title="Nenhuma divergência de cartão" copy="Todas as faturas têm uma composição confirmada ou não há pagamentos de cartão neste período."/>}</div>}
           {tab === 'statement' && <><section className="statement-filter panel" aria-label="Filtro das faturas"><strong>Exibição</strong><button className={`button ${statementOnlyIssues ? 'button-outline' : 'button-primary'}`} onClick={() => setStatementOnlyIssues(false)}>Todas</button><button className={`button ${statementOnlyIssues ? 'button-primary' : 'button-outline'}`} onClick={() => setStatementOnlyIssues(true)}>Só pendências</button></section>{visibleStatementResults.map((item) => <CardStatementResults key={item.entry.key} statement={item.statement} payment={item.payment} matches={item.matches} matchedTotal={item.matchedTotal} difference={item.difference} confirmations={item.confirmations} onlyIssues={statementOnlyIssues} focusTransactionId={item.statement.statementIdentity === auditFocusStatementIdentity ? auditFocusTransactionId : ''} onConfirm={(transactionId, sheetId) => confirmStatementMatch(item.statement, transactionId, sheetId)} onRejectCandidates={(transactionId, sheetIds) => rejectCardReviewCandidates(item.statement, transactionId, sheetIds)} onIgnore={(transactionId) => ignoreCardPurchase(item.statement, transactionId)} onAddMissing={(match) => openCardMissing(item.statement, match)} onUndo={(kind, identities) => { void undoStatementDecision(kind, item.statement, identities) }}/>) }{!visibleStatementResults.length && <EmptyState title="Nenhuma pendência nas faturas" copy="As faturas conciliadas foram ocultadas pelo filtro Só pendências."/>}</>}
-          {tab === 'outofscope' && <div className="issue-columns"><section className="panel"><PanelTitle title="Movimentações fora da conciliação de despesas" note="Entradas, investimentos, transferências e tipos sem natureza confirmada"/>{shownOutOfScope.length ? <>{investFacilYields.length > 0 && <details className="investment-yield-group"><summary><strong>Rendimentos Invest Fácil</strong><span>{investFacilYields.length} créditos · total {formatCents(investFacilYields.reduce((sum, item) => sum + item.bank.amount, 0))}</span><small>Créditos de rendimento agrupados; não são lançados em CUSTOS ANO.</small></summary><div>{investFacilYields.map((item) => <p key={item.bank.id}>{dateLabel(item.bank.date)} · {item.bank.originalDescription} · {formatCents(item.bank.amount)}</p>)}</div></details>}{otherOutOfScope.map((item) => <div className="issue-row" key={item.bank.id}><span className="status-icon blue">ℹ</span><div><strong>{item.bank.originalDescription}</strong><p>{dateLabel(item.bank.date)} · {item.bank.directionKnown === false ? 'Direção não identificada' : item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} · {formatCents(item.bank.amount)}</p><small>{item.sheet ? `Correspondência de investimento: ${item.sheet.originalDescription} · ${formatCents(item.sheet.amount)}` : outOfScopeReason(item.bank.type)}</small></div></div>)}</> : <EmptyState title="Nenhuma movimentação fora do escopo" copy="Todas as movimentações deste período estão em outras seções."/>}</section></div>}
+          {tab === 'outofscope' && <div className="issue-columns"><section className="panel"><PanelTitle title="Movimentações fora da conciliação de despesas" note="Entradas, investimentos, transferências e tipos sem natureza confirmada"/>{shownOutOfScope.length ? <>{investFacilYields.length > 0 && <details className="investment-yield-group"><summary><strong>Rendimentos Invest Fácil</strong><span>{investFacilYields.length} créditos · total {formatCents(investFacilYields.reduce((sum, item) => sum + item.bank.amount, 0))}</span><small>Créditos de rendimento agrupados; não são lançados em CUSTOS ANO.</small></summary><div>{investFacilYields.map((item) => <div key={item.bank.id}><p>{dateLabel(item.bank.date)} · {bankDisplayDescription(item.bank.originalDescription)} · {formatCents(item.bank.amount)}</p><CounterpartyNote transaction={item.bank}/></div>)}</div></details>}{otherOutOfScope.map((item) => <div className="issue-row" key={item.bank.id}><span className="status-icon blue">ℹ</span><div><strong>{bankDisplayDescription(item.bank.originalDescription)}</strong><p>{dateLabel(item.bank.date)} · {item.bank.directionKnown === false ? 'Direção não identificada' : item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} · {formatCents(item.bank.amount)}</p><CounterpartyNote transaction={item.bank}/><small>{item.sheet ? `Correspondência de investimento: ${item.sheet.originalDescription} · ${formatCents(item.sheet.amount)}` : outOfScopeReason(item.bank.type)}</small></div></div>)}</> : <EmptyState title="Nenhuma movimentação fora do escopo" copy="Todas as movimentações deste período estão em outras seções."/>}</section></div>}
           {tab === 'duplicates' && <section className="panel"><PanelTitle title="Possíveis duplicidades na CUSTOS ANO" note="Sugestões baseadas em lançamentos da planilha; nada é removido automaticamente"/>{filteredDuplicates.length ? filteredDuplicates.map((group, index) => <div className="issue-row duplicate-group" key={`${group.source}-${index}`}><span className="status-icon orange">Ⅱ</span><div><strong>Confira este grupo · {group.transactionIds.length} lançamentos</strong>{group.transactionIds.map((id) => { const sheet = data.sheet.find((entry) => entry.id === id); return sheet ? <p className="duplicate-entry" key={id}>{dateLabel(sheet.date)} · {sheet.originalDescription} · {formatCents(sheet.amount)}{sheet.paymentMethod ? ` · ${sheet.paymentMethod}` : ''}</p> : null })}<small>Possíveis duplicidades precisam de confirmação manual.</small></div></div>) : <EmptyState title="Nenhuma duplicidade sugerida" copy="Nenhuma linha da CUSTOS ANO com data, valor e descrição parecida foi encontrada."/>}</section>}
           {tab === 'flags' && <section className="panel"><PanelTitle title="Lançamentos da planilha não encontrados no extrato" note="Podem pertencer a outra conta, período ou meio de pagamento"/>{unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).length ? unmatchedFilteredSheet.filter((item) => !ignoredSheetIds.has(sheetIdentity(item))).map((sheet) => <div className="issue-row" key={sheet.id}><span className="status-icon blue">↗</span><div><strong>{sheet.originalDescription}</strong><p>{dateLabel(sheet.date)} · {formatCents(sheet.amount)} · {sheet.category || 'Sem categoria'}</p><small>Não encontrado no extrato importado.</small><button className="text-button" onClick={() => ignoreSheet(sheet.id)}>Ignorar este lançamento</button></div></div>) : <EmptyState title="Sem sinalizações" copy="Não há lançamentos da planilha pendentes neste período."/>}</section>}
-          <ExportBar result={{ ...result, duplicateGroups: filteredDuplicates }} items={filteredItems} banks={data.bank} sheets={data.sheet}/>
+          <ExportBar result={{ ...result, duplicateGroups: filteredDuplicates }} items={filteredItems} banks={data.bank} sheets={data.sheet} consistencyAudit={consistencyAudit} hiddenAuditFindingIds={new Set(consistencyAudit?.findings.filter((finding) => isAuditFindingDismissed(finding, dismissedAuditFindings)).map((finding) => finding.id) ?? [])}/>
           <footer className="results-footer"><span>▣ Confirmações salvas neste dispositivo{googleSheetLink ? ' e sincronizadas quando Google está conectado.' : '.'}</span><button className="text-button" onClick={clearSession}>Limpar dados desta sessão</button><button className="text-button" onClick={() => void clearSavedDecisions()}>Limpar confirmações salvas</button></footer>
         </>}
       </main>
       {screen === 'home' && showStickyReconcile && <div className="sticky-reconcile" aria-label="Ação de conciliação"><button className="button button-primary button-launch" aria-label={isSourceProcessing ? 'Processando arquivos...' : 'Conciliar agora'} onClick={runReconciliation} disabled={!canLaunchReconciliation}>{isSourceProcessing ? 'Processando arquivos...' : <>Conciliar agora <span aria-hidden="true">↗</span></>}</button></div>}
       <PwaUpdateNotice />
       {screen === 'results' && missingToAdd && <AddCostYearDialog transaction={missingToAdd.kind === 'BANK' ? missingToAdd.bank : undefined} initial={missingToAdd.kind === 'STATEMENT' ? { description: missingToAdd.transaction.installment != null && missingToAdd.transaction.totalInstallments != null ? '(' + missingToAdd.transaction.installment + '/' + missingToAdd.transaction.totalInstallments + ') ' + missingToAdd.transaction.originalDescription : missingToAdd.transaction.originalDescription, sheetDate: missingToAdd.transaction.invoiceDueDate ?? missingToAdd.transaction.statementDueDate ?? missingToAdd.statement.dueDate ?? missingToAdd.transaction.purchaseDate, purchaseDate: missingToAdd.transaction.purchaseDate, invoiceDueDate: missingToAdd.transaction.invoiceDueDate ?? missingToAdd.transaction.statementDueDate ?? missingToAdd.statement.dueDate, amount: missingToAdd.transaction.amount, paymentSource: 'STATEMENT' } : undefined} categories={costCategories} connected={Boolean(googleSheetInfo?.connected && googleAccessToken.current)} saving={writingMissingId === (missingToAdd.kind === 'BANK' ? bankIdentity(missingToAdd.bank) : cardTransactionIdentity(missingToAdd.statement, missingToAdd.transaction)) || reconnectingForWrite} error={missingWriteError} onCancel={() => { if (!writingMissingId) { setMissingToAdd(null); setMissingWriteError('') } }} onReconnect={() => void reconnectGoogleForCostWrite()} onSubmit={(record) => void addMissingToCostYear(missingToAdd, record)} />}
-      <footer className="site-footer"><span>Conciliador Financeiro <span>·</span> Extratos e PDFs permanecem no dispositivo.</span><span>Aplicação local · CSV, Google Sheets e fatura PDF</span><span>Build de teste PWA</span></footer>
+      <footer className="site-footer"><span>Conciliador Financeiro <span>·</span> Extratos e PDFs permanecem no dispositivo.</span><span>Aplicação local · CSV, Google Sheets e fatura PDF</span></footer>
     </div>
   )
 }
@@ -1715,13 +1810,13 @@ function UploadCard({ title, subtitle, mode, status, upload, onSelect, onMapChan
   const [showAllIssues, setShowAllIssues] = useState(false)
   const [showBankPreview, setShowBankPreview] = useState(false)
   const accepted = status === 'ACCEPTED' && upload
-  if (mode === 'bank' && upload && !bankCsvRequiresManualMapping(upload)) return <BankCsvUploadCard upload={upload} accepted={Boolean(accepted)} onMapChange={(key, value) => onMapChange(mode, key, value)} onAccept={onAccept} onClear={onClear} onSelect={(event) => onSelect(mode, event)} fieldTitles={fieldTitles} requiredFields={requiredFields[mode]} optionalFields={optionalFields[mode]}/>
+  if (mode === 'bank' && upload && (upload.format === 'OFX' || !bankCsvRequiresManualMapping(upload))) return <BankCsvUploadCard upload={upload} accepted={Boolean(accepted)} onMapChange={(key, value) => onMapChange(mode, key, value)} onAccept={onAccept} onClear={onClear} onSelect={(event) => onSelect(mode, event)} fieldTitles={fieldTitles} requiredFields={requiredFields[mode]} optionalFields={optionalFields[mode]}/>
   return <article className={`upload-card ${upload ? 'upload-card-loaded' : ''} ${accepted ? 'upload-card-accepted' : ''}`}><div className="upload-top"><span className={`upload-icon ${mode}`}>{mode === 'sheet' ? '▤' : '◈'}</span><span className="upload-state">{accepted ? '✓ Fonte aceita' : status === 'LOADED' ? 'Lendo arquivo…' : upload ? 'CSV validado' : 'CSV · Seleção local'}</span></div><h3>{title}</h3><p className="upload-subtitle">{subtitle}</p>
-    {!upload && status === 'LOADED' ? <div className="file-drop" role="status">Lendo o arquivo neste dispositivo…</div> : !upload ? <label className="file-drop"><input type="file" aria-label="Selecionar arquivo CSV" accept=".csv,text/csv" onChange={(event) => onSelect(mode, event)}/><span className="file-plus">＋</span><strong>Selecionar arquivo CSV</strong><small>Separador vírgula ou ponto e vírgula · UTF-8</small></label> : accepted ? <>
+    {!upload && status === 'LOADED' ? <div className="file-drop" role="status">Lendo o arquivo neste dispositivo…</div> : !upload ? <label className="file-drop"><input type="file" aria-label={mode === 'bank' ? 'Selecionar extrato bancário' : 'Selecionar arquivo CSV'} accept={mode === 'bank' ? '.csv,.ofx,text/csv,application/x-ofx' : '.csv,text/csv'} onChange={(event) => onSelect(mode, event)}/><span className="file-plus">＋</span><strong>{mode === 'bank' ? 'Selecionar extrato bancário' : 'Selecionar arquivo CSV'}</strong><small>{mode === 'bank' ? 'CSV do banco ou OFX · processamento local' : 'Separador vírgula ou ponto e vírgula · UTF-8'}</small></label> : accepted ? <>
       <div className="accepted-file"><span className="accepted-check" aria-hidden="true">✓</span><div><strong>{upload.fileName}</strong><small>{upload.valid.length} movimentações carregadas</small><small>{upload.issues.length === 1 ? '1 linha com problema não importada' : `${upload.issues.length} linhas com problemas não importadas`}</small></div></div>
       {upload.csv.metadataRowsIgnored > 0 && <small className="ignored-row-note">{upload.csv.metadataRowsIgnored} linha(s) de metadados antes do cabeçalho.</small>}
       {upload.issues.length > 0 && <div className="issue-preview"><div><span className="status-icon amber">!</span><span><strong>{upload.issues.length} problema(s) preservados para consulta</strong><small>Somente as linhas válidas foram aceitas.</small></span><button className="text-button" onClick={() => setShowAllIssues(!showAllIssues)}>{showAllIssues ? 'Recolher' : 'Detalhes'}</button></div>{showAllIssues && <ul>{upload.issues.slice(0, 8).map((issue, index) => <li key={index}>Linha {issue.row}: {issue.message}</li>)}</ul>}</div>}
-      <div className="accepted-actions"><label className="button button-outline replace-file"><input type="file" aria-label="Selecionar arquivo CSV" accept=".csv,text/csv" onChange={(event) => onSelect(mode, event)}/>Substituir arquivo</label><button className="button button-quiet button-small" onClick={onClear}>Remover</button></div>
+      <div className="accepted-actions"><label className="button button-outline replace-file"><input type="file" aria-label={mode === 'bank' ? 'Selecionar extrato bancário' : 'Selecionar arquivo CSV'} accept={mode === 'bank' ? '.csv,.ofx,text/csv,application/x-ofx' : '.csv,text/csv'} onChange={(event) => onSelect(mode, event)}/>Substituir arquivo</label><button className="button button-quiet button-small" onClick={onClear}>Remover</button></div>
     </> : <>
       <div className="selected-file"><span>▤</span><div><strong>{upload.fileName}</strong><small>{upload.rowCount} linhas detectadas · delimitador {upload.csv.delimiter === ',' ? 'vírgula' : upload.csv.delimiter === ';' ? 'ponto e vírgula' : upload.csv.delimiter || 'automático'}</small></div><button className="icon-button" aria-label="Remover arquivo" onClick={onClear}>×</button></div>
       {mode === 'bank' && <p className="bank-needs-confirmation">Precisamos confirmar algumas colunas</p>}
@@ -1810,8 +1905,10 @@ function CardStatementResults({ statement, payment, matches, matchedTotal, diffe
   const [exceptionLimit, setExceptionLimit] = useState(5)
   useEffect(() => { if (focusTransactionId) { setExpanded(true); setShowAll(true); setShowMatched(true); setExceptionLimit(Number.MAX_SAFE_INTEGER) } }, [focusTransactionId])
   const purchases = matches.filter((match) => match.transaction.type === 'PURCHASE')
+  const purchaseCounts = summarizeCardPurchases(purchases)
   const refunded = purchases.filter((match) => match.status === 'CARD_REFUNDED')
   const refundGroups = statement.refundGroups ?? []
+  const refundedValue = refundGroups.reduce((sum, group) => sum + group.refundAmount, 0)
   const refunds = statement.transactions.filter((item) => item.type === 'REFUND')
   const purchasesTotal = purchases.reduce((sum, match) => sum + match.transaction.amount, 0)
   const reconcilablePurchasesTotal = purchases.filter((match) => match.status !== 'CARD_REFUNDED').reduce((sum, match) => sum + match.transaction.amount, 0)
@@ -1820,13 +1917,14 @@ function CardStatementResults({ statement, payment, matches, matchedTotal, diffe
   const localFinancialDebits = purchasesTotal + adjustmentDebits
   const matched = purchases.filter((match) => match.status === 'CARD_MATCHED' || match.status === 'CARD_GROUP_MATCHED')
   const review = purchases.filter((match) => match.status === 'CARD_REVIEW')
-  const missing = purchases.filter((match) => match.status === 'CARD_MISSING')
+  const missing = purchases.filter((match) => match.status === 'CARD_MISSING' || match.status === 'CARD_MISSING_CONFIRMED')
   const ignored = purchases.filter((match) => match.status === 'CARD_IGNORED')
-  const invoiceIssue = statement.errors.length > 0 || payment == null || statement.accountingDifference != null && statement.accountingDifference !== 0 || statement.purchasesDebitsTotal != null && statement.purchasesDebitsTotal !== localFinancialDebits
-  const hasIssues = missing.length > 0 || review.length > 0 || invoiceIssue
-  const isFullyResolved = !hasIssues && ignored.length + matched.length + refunded.length === purchases.length
+  const invoiceIntegrityIssue = statement.errors.length > 0 || statement.accountingDifference != null && statement.accountingDifference !== 0 || statement.purchasesDebitsTotal != null && statement.purchasesDebitsTotal !== localFinancialDebits
+  const paymentMissing = payment == null
+  const hasIssues = missing.length > 0 || review.length > 0 || invoiceIntegrityIssue || paymentMissing
+  const isFullyResolved = !hasIssues && purchaseCounts.ignored + purchaseCounts.matched + purchaseCounts.refunded === purchases.length
   const cardIds = [...new Set(statement.transactions.map((item) => item.cardIdentifier))]
-  const title = cardIds.length === 1 ? `Cartão final ${cardIds[0].slice(-4)}` : `${cardIds.length} cartões`
+  const title = `Fatura · ${statement.dueDate ? dateLabel(statement.dueDate) : 'vencimento não identificado'}`
   const renderGroup = (heading: string, entries: CardStatementMatch[]) => entries.length > 0 && <section className="statement-priority-group" key={heading}><h3>{heading} · {entries.length}</h3>{cardIds.map((cardIdentifier) => {
     const cardMatches = entries.filter((match) => match.transaction.cardIdentifier === cardIdentifier)
     if (!cardMatches.length) return null
@@ -1839,20 +1937,21 @@ function CardStatementResults({ statement, payment, matches, matchedTotal, diffe
   const allClear = isFullyResolved
   const isExpanded = expanded ?? hasIssues
   return <article className={`statement-results panel ${allClear ? 'statement-results-clear' : 'statement-results-issue'}`}>
-    <header className="statement-invoice-summary"><span className={`status-icon ${allClear ? 'green' : hasIssues ? 'red' : 'amber'}`}>{allClear ? '✓' : hasIssues ? '!' : '↻'}</span><div className="statement-invoice-summary-main"><strong>{title}</strong><small>Vencimento: {statement.dueDate ? dateLabel(statement.dueDate) : 'não identificado'}{statement.nextClosingDate ? ` · Fechamento: ${dateLabel(statement.nextClosingDate)}` : ''}</small><small>{purchases.length - refunded.length} compras conciliáveis · {matched.length} conciliadas · {review.length} revisão · {missing.length} ausentes{ignored.length ? ` · ${ignored.length} ignoradas` : ''}{refunded.length ? ` · ${refunded.length} parcelas estornadas` : ''}</small><strong>{formatCents(statement.reportedTotal ?? purchasesTotal)}</strong><small>{payment ? `Pagamento identificado · ${dateLabel(payment.date)} · ${formatCents(payment.amount)}` : 'Pagamento da fatura não identificado'}</small></div><button className="button button-outline statement-expand-button" aria-expanded={isExpanded} onClick={() => { setExpanded(!isExpanded); if (isExpanded) { setShowAll(false); setShowMatched(false); setShowIgnored(false); setExpandedRefundGroups(new Set()) } }}>{isExpanded ? 'Recolher' : allClear ? 'Mostrar tudo' : 'Mostrar detalhes'}</button></header>
+    <header className="statement-invoice-summary"><span className={`status-icon ${allClear ? 'green' : hasIssues ? 'red' : 'amber'}`}>{allClear ? '✓' : hasIssues ? '!' : '↻'}</span><div className="statement-invoice-summary-main"><strong>{title}</strong><small>{cardIds.length} {cardIds.length === 1 ? 'cartão' : 'cartões'} · final {cardIds.map((id) => id.slice(-4)).join(', ')}{statement.nextClosingDate ? ` · Fechamento: ${dateLabel(statement.nextClosingDate)}` : ''}</small><small>Compras: {purchaseCounts.matched} conciliadas · {purchaseCounts.review} revisão · {purchaseCounts.missing} ausentes{purchaseCounts.ignored ? ` · ${purchaseCounts.ignored} ignoradas` : ''}</small>{purchaseCounts.refunded > 0 && <small>{refundGroups.length} {refundGroups.length === 1 ? 'compra estornada' : 'compras estornadas'}{refundGroups.some((group) => group.installmentCount > 1) ? ` · ${refundGroups.filter((group) => group.installmentCount > 1).reduce((sum, group) => sum + group.installmentCount, 0)} parcelas` : ''} · {formatCents(refundedValue)}</small>}<strong>Total: {formatCents(statement.reportedTotal ?? purchasesTotal)}</strong><small>{payment ? `Pagamento da fatura identificado · ${dateLabel(payment.date)} · ${formatCents(payment.amount)}` : 'Pagamento da fatura: não identificado'}</small></div><button className="button button-outline statement-expand-button" aria-expanded={isExpanded} onClick={() => { setExpanded(!isExpanded); if (isExpanded) { setShowAll(false); setShowMatched(false); setShowIgnored(false); setExpandedRefundGroups(new Set()) } }}>{isExpanded ? 'Recolher' : allClear ? 'Mostrar tudo' : 'Mostrar detalhes'}</button></header>
     {isExpanded && <div className="statement-expanded-content">
       {statement.errors.map((message) => <p className="statement-warning" key={message}>{message}</p>)}
-      {!payment && <p className="statement-payment-note">Nenhum pagamento bancário com o total da fatura foi identificado perto do vencimento. A conciliação das compras continua separada.</p>}
+      {!payment && <p className="statement-payment-note">Pagamento da fatura não identificado no extrato. Esse resultado é independente da conciliação das compras individuais.</p>}
       {statement.accountingDifference != null && statement.accountingDifference !== 0 && <p className="statement-warning">A relação matemática da fatura apresenta divergência.</p>}
-      {!onlyIssues && refundGroups.map((group) => { const detailsOpen = expandedRefundGroups.has(group.id); return <section className="statement-collapsed-group" key={group.id}><strong>✓ Compra cancelada · {group.installmentCount} parcelas · {formatCents(group.refundAmount)} estornados</strong><button className="button button-outline" aria-expanded={detailsOpen} onClick={() => setExpandedRefundGroups((current) => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next })}>{detailsOpen ? 'Ocultar detalhes do estorno' : 'Ver detalhes do estorno'}</button>{detailsOpen && <div className="card-refund-group-details"><p>{group.merchant} · cartão final {group.cardIdentifier.slice(-4)} · {dateLabel(group.date)}</p><AmountRow label="Débitos do grupo" amount={group.purchaseGroupAmount}/><AmountRow label="Crédito associado" amount={-group.refundAmount}/><AmountRow label="Líquido" amount={group.netAmount} strong/>{statement.transactions.filter((item) => item.refundGroupId === group.id || group.transactionIds.includes(item.id)).map((transaction) => <small key={transaction.id}>{dateLabel(transaction.purchaseDate || transaction.date)} · {transaction.originalDescription} · parcela {transaction.installment}/{transaction.totalInstallments} · {formatCents(transaction.amount)}</small>)}{(() => { const credit = statement.transactions.find((item) => item.id === group.refundTransactionId) ?? statement.transactions.find((item) => item.type === 'REFUND' && item.cardIdentifier === group.cardIdentifier && item.date === group.date && item.amount === group.refundAmount); return credit && <small>{dateLabel(credit.date)} · Crédito {credit.originalDescription} · {formatCents(-credit.amount)}</small> })()}</div>}</section> })}
+      {!onlyIssues && refundGroups.map((group) => { const detailsOpen = expandedRefundGroups.has(group.id); return <section className="statement-collapsed-group" key={group.id}><strong>✓ Compra estornada{group.installmentCount > 1 ? ` · ${group.installmentCount} parcelas` : ''} · {formatCents(group.refundAmount)}</strong><button className="button button-outline" aria-expanded={detailsOpen} onClick={() => setExpandedRefundGroups((current) => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next })}>{detailsOpen ? 'Ocultar detalhes do estorno' : 'Ver detalhes do estorno'}</button>{detailsOpen && <div className="card-refund-group-details"><p>{group.merchant} · cartão final {group.cardIdentifier.slice(-4)} · {dateLabel(group.date)}</p><AmountRow label="Débitos do grupo" amount={group.purchaseGroupAmount}/><AmountRow label="Crédito associado" amount={-group.refundAmount}/><AmountRow label="Líquido" amount={group.netAmount} strong/>{statement.transactions.filter((item) => item.type === 'PURCHASE' && (item.refundGroupId === group.id || group.transactionIds.includes(item.id))).map((transaction) => <small key={transaction.id}>{dateLabel(transaction.purchaseDate || transaction.date)} · {transaction.originalDescription}{transaction.installment != null ? ` · parcela ${transaction.installment}/${transaction.totalInstallments}` : ''} · {formatCents(transaction.amount)}</small>)}{(() => { const credit = statement.transactions.find((item) => item.id === group.refundTransactionId) ?? statement.transactions.find((item) => item.type === 'REFUND' && item.cardIdentifier === group.cardIdentifier && item.date === group.date && item.amount === group.refundAmount); return credit && <small>{dateLabel(credit.date)} · Crédito {credit.originalDescription} · {formatCents(-credit.amount)}</small> })()}</div>}</section> })}
       {visibleExceptions.length > 0 && renderGroup('Ausentes', visibleExceptions.filter((match) => match.status === 'CARD_MISSING'))}
       {visibleExceptions.length > 0 && renderGroup('Revisar', visibleExceptions.filter((match) => match.status === 'CARD_REVIEW'))}
       {!showAll && exceptionMatches.length > exceptionLimit && <button className="button button-outline" onClick={() => setExceptionLimit((count) => count + 5)}>Mostrar mais ({exceptionMatches.length - exceptionLimit})</button>}
-      {exceptionMatches.length === 0 && hasIssues && <p className="statement-caution">A fatura tem uma inconsistência de total ou pagamento; as compras individuais estão conciliadas.</p>}
+      {exceptionMatches.length === 0 && invoiceIntegrityIssue && <p className="statement-caution">A fatura apresenta divergência interna de valores. Compras individuais: {purchaseCounts.matched} de {purchaseCounts.eligible} conciliadas.</p>}
+      {exceptionMatches.length === 0 && paymentMissing && !invoiceIntegrityIssue && <p className="statement-payment-note">Compras individuais: {purchaseCounts.matched} de {purchaseCounts.eligible} conciliadas. O pagamento agregado da fatura não foi localizado e é acompanhado separadamente.</p>}
       {!onlyIssues && matched.length > 0 && <section className="statement-collapsed-group"><strong>✓ {matched.length} compras conciliadas</strong><button className="button button-outline" onClick={() => setShowMatched((value) => !value)}>{showMatched ? 'Ocultar conciliadas' : 'Mostrar conciliadas'}</button>{showEveryPurchase && renderGroup('Conciliadas', matched)}</section>}
       {!onlyIssues && ignored.length > 0 && <section className="statement-collapsed-group"><strong>Itens ignorados · {ignored.length}</strong><button className="button button-outline" onClick={() => setShowIgnored((value) => !value)}> {showIgnored ? 'Ocultar ignorados' : 'Mostrar ignorados'}</button>{showIgnored && renderGroup('Ignoradas', ignored)}</section>}
       {!onlyIssues && showAll && refunds.length > 0 && <section className="statement-priority-group"><h3>Créditos/estornos · {refunds.length}</h3>{refunds.map((transaction) => <article className="statement-transaction" key={transaction.id}><span className="status-icon green">↩</span><div className="statement-transaction-main"><strong>{dateLabel(transaction.date)} · {transaction.originalDescription}</strong><small>Data real do crédito/estorno</small><span className="statement-status green">CRÉDITO/ESTORNO</span></div><strong className="activity-amount">{formatCents(-transaction.amount)}</strong></article>)}</section>}
-      {showAll && <section className="statement-totals"><AmountRow label="Débitos brutos das compras extraídas" amount={purchasesTotal}/>{refunded.length > 0 && <AmountRow label="Compras ativas para matching após estornos" amount={reconcilablePurchasesTotal}/>}{adjustmentDebits > 0 && <AmountRow label="Encargos/taxas extraídos" amount={adjustmentDebits}/>}{statement.previousBalance != null && <AmountRow label="Saldo anterior" amount={statement.previousBalance}/>}{statement.creditsPaymentsTotal != null && <AmountRow label="Créditos/Pagamentos" amount={statement.creditsPaymentsTotal}/>}{statement.reportedTotal != null && <AmountRow label="Total da fatura" amount={statement.reportedTotal}/>}{statement.previousPayment != null && <p className="statement-payment-note">Pagamento anterior identificado: {formatCents(statement.previousPayment)} · excluído das compras da fatura.</p>}{statement.accountingDifference != null && <strong className={statement.accountingDifference === 0 ? 'good-text' : 'warning-text'}>{statement.accountingDifference === 0 ? '✓ Saldo anterior − créditos/pagamentos + compras/débitos = total da fatura' : '⚠ A relação matemática da fatura não fecha'}</strong>}{statement.cardSubtotals.map((subtotal) => <AmountRow key={subtotal.cardIdentifier} label={`Subtotal cartão final ${subtotal.cardIdentifier.slice(-4)}`} amount={subtotal.amount}/>)}<AmountRow label="Compras correspondentes confirmadas em Crédito_Bradesco" amount={matchedTotal} strong/><AmountRow label="Diferença ainda não conciliada" amount={difference} strong/><p className="statement-caution">Os detalhes da fatura permanecem disponíveis para auditoria. A diferença não classifica automaticamente uma compra como esquecida.</p></section>}
+      {showAll && <details className="statement-financial-details"><summary>Mostrar detalhes financeiros</summary><section className="statement-totals"><AmountRow label="Débitos brutos das compras extraídas" amount={purchasesTotal}/>{refunded.length > 0 && <AmountRow label="Compras ativas para matching após estornos" amount={reconcilablePurchasesTotal}/>}{adjustmentDebits > 0 && <AmountRow label="Encargos/taxas extraídos" amount={adjustmentDebits}/>}{statement.previousBalance != null && <AmountRow label="Saldo anterior" amount={statement.previousBalance}/>}{statement.creditsPaymentsTotal != null && <AmountRow label="Créditos/Pagamentos" amount={statement.creditsPaymentsTotal}/>}{statement.reportedTotal != null && <AmountRow label="Total da fatura" amount={statement.reportedTotal}/>}{statement.previousPayment != null && <p className="statement-payment-note">Pagamento anterior identificado: {formatCents(statement.previousPayment)} · excluído das compras da fatura.</p>}{statement.accountingDifference != null && <strong className={statement.accountingDifference === 0 ? 'good-text' : 'warning-text'}>{statement.accountingDifference === 0 ? '✓ Saldo anterior − créditos/pagamentos + compras/débitos = total da fatura' : '⚠ A relação matemática da fatura não fecha'}</strong>}{statement.cardSubtotals.map((subtotal) => <AmountRow key={subtotal.cardIdentifier} label={`Subtotal cartão final ${subtotal.cardIdentifier.slice(-4)}`} amount={subtotal.amount}/>)}<AmountRow label="Compras correspondentes confirmadas em Crédito_Bradesco" amount={matchedTotal} strong/><AmountRow label="Diferença ainda não conciliada" amount={difference} strong/><p className="statement-caution">Os detalhes da fatura permanecem disponíveis para auditoria. A diferença não classifica automaticamente uma compra como esquecida.</p></section></details>}
       {isExpanded && !showAll && <button className="button button-outline" onClick={() => { setShowAll(true); setShowMatched(true); setShowIgnored(true); setExceptionLimit(Number.MAX_SAFE_INTEGER) }}>Mostrar tudo</button>}
     </div>}
   </article>
@@ -1877,9 +1976,9 @@ function AmountRow({ label, amount, strong = false }: { label: string; amount: n
 function FileLine({ icon, title, detail }: { icon: string; title: string; detail: string }) { return <div className="file-line"><span>{icon}</span><div><strong>{title}</strong><small>{detail}</small></div><span className="check-mark">✓</span></div> }
 function Tab({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) { return <button role="tab" aria-selected={active} className={`tab-button ${active ? 'active' : ''}`} onClick={onClick}>{children}</button> }
 function EmptyState({ title, copy }: { title: string; copy: string }) { return <div className="empty-state"><span aria-hidden="true">✓</span><strong>{title}</strong><p>{copy}</p></div> }
-function ActivityItem({ item }: { item: ReconciliationItem }) { return <div className="activity-item"><span className={`status-icon ${item.status === 'REVIEW' ? 'amber' : 'red'}`}>{item.status === 'REVIEW' ? '!' : '⌕'}</span><div><strong>{item.status === 'REVIEW' ? 'Possível correspondência' : 'Possível lançamento ausente'}</strong><small>{dateLabel(item.bank.date)} · {item.bank.originalDescription}{item.sheet ? ` ↔ ${item.sheet.originalDescription}` : ''}</small></div><strong className="activity-amount">{formatCents(item.bank.amount)}</strong></div> }
+function ActivityItem({ item }: { item: ReconciliationItem }) { return <div className="activity-item"><span className={`status-icon ${item.status === 'REVIEW' ? 'amber' : 'red'}`}>{item.status === 'REVIEW' ? '!' : '⌕'}</span><div><strong>{item.status === 'REVIEW' ? 'Possível correspondência' : 'Possível lançamento ausente'}</strong><small>{dateLabel(item.bank.date)} · {bankDisplayDescription(item.bank.originalDescription)}{item.sheet ? ` ↔ ${item.sheet.originalDescription}` : ''}</small></div><strong className="activity-amount">{formatCents(item.bank.amount)}</strong></div> }
 function MatchReason({ reason }: { reason: string }) { const caution = /genérica|baixa similaridade|não confirmada|dia.*diferença|descrição diferente|mais de uma candidata/i.test(reason); return <span><b>{caution ? '△' : '✓'}</b> {reason}</span> }
-function MatchedDetail({ item, confirmedPreviously, onUndo }: { item: ReconciliationItem; confirmedPreviously: boolean; onUndo: () => void }) { return <article className="matched-detail"><div><strong>{dateLabel(item.bank.date)} · {item.bank.originalDescription}</strong><p>{formatCents(item.bank.amount)} · {item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} ↔ {item.sheet?.originalDescription ?? 'Planilha'}</p></div><span className="confidence">{item.candidate?.confidence ?? 96}% de confiança</span><div className="match-reasons">{item.candidate?.reasons.map((reason) => <MatchReason key={reason} reason={reason}/>)}</div><small>{confirmedPreviously ? '✓ Conciliado anteriormente; decisão salva neste dispositivo.' : item.candidate?.matchMethod === 'STRUCTURAL' ? 'Match automático: valor, data, direção e solução global 1:1.' : item.candidate?.matchMethod === 'MANUAL' ? 'Correspondência confirmada por você.' : 'Pontuação combinada de valor, data e descrição.'}</small>{confirmedPreviously && <button className="text-button" onClick={onUndo}>Desfazer confirmação</button>}</article> }
+function MatchedDetail({ item, confirmedPreviously, onUndo }: { item: ReconciliationItem; confirmedPreviously: boolean; onUndo: () => void }) { return <article className="matched-detail"><div><strong>{dateLabel(item.bank.date)} · {bankDisplayDescription(item.bank.originalDescription)}</strong><p>{formatCents(item.bank.amount)} · {item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} ↔ {item.sheet?.originalDescription ?? 'Planilha'}</p></div><span className="confidence">{item.candidate?.confidence ?? 96}% de confiança</span><div className="match-reasons">{item.candidate?.reasons.map((reason) => <MatchReason key={reason} reason={reason}/>)}</div><small>{confirmedPreviously ? '✓ Conciliado anteriormente; decisão salva neste dispositivo.' : item.candidate?.matchMethod === 'STRUCTURAL' ? 'Match automático: valor, data, direção e solução global 1:1.' : item.candidate?.matchMethod === 'MANUAL' ? 'Correspondência confirmada por você.' : 'Pontuação combinada de valor, data e descrição.'}</small>{confirmedPreviously && <button className="text-button" onClick={onUndo}>Desfazer confirmação</button>}</article> }
 function ReviewCard({ item, onConfirm, onReject, onIgnore }: { item: ReconciliationItem; onConfirm: () => void; onReject: () => void; onIgnore: () => void }) {
   const reasonText = item.reviewReason === 'REFUND_AMBIGUITY' ? 'Há mais de uma saída anterior compatível com esta devolução. Confira o vínculo antes de decidir.' : item.reviewReason === 'ASSIGNMENT_CONFLICT' ? 'O lançamento plausível está reservado por outra movimentação que também precisa de revisão.' : item.reviewReason === 'DIRECTION_UNCERTAIN' ? 'O arquivo não informa com segurança se o valor entrou ou saiu da conta.' : ''
   return <article className="review-card"><div className="review-card-title"><span className="status-icon amber">!</span><div><span className="step-label">{item.sheet ? 'POSSÍVEL CORRESPONDÊNCIA' : 'MOVIMENTAÇÃO PARA CLASSIFICAR'}</span><h2>{item.sheet ? 'Confira este par de lançamentos' : item.bank.direction === 'CREDIT' ? 'Entrada bancária fora da conciliação de despesas' : 'Movimentação para revisar'}</h2></div><span className="confidence">{item.candidate ? `${item.candidate.confidence}% de confiança` : 'Revisão necessária'}</span></div><div className="comparison-grid"><TransactionBox label="BANCO / CARTÃO" transaction={item.bank} /><span className="compare-arrow">↔</span><TransactionBox label="CUSTOS ANO" transaction={item.sheet}/></div><div className="match-reasons">{item.candidate?.reasons.map((reason) => <MatchReason key={reason} reason={reason}/>)}{reasonText && <span>{reasonText}</span>}{!item.sheet && item.bank.direction === 'CREDIT' && <span>ℹ Entrada não tratada como despesa ausente</span>}</div><div className="review-actions">{item.sheet && <><button className="button button-primary" onClick={onConfirm}>✓ Confirmar</button><button className="button button-outline" onClick={onReject}>Não é a mesma</button></>}<button className="text-button" onClick={onIgnore}>Ignorar</button></div></article>
@@ -1919,9 +2018,32 @@ function CardSummaryNotice({ item }: { item: ReconciliationItem }) {
   </section>
 }
 function outOfScopeReason(type: BankTransaction['type']) { return ({ INCOME: 'Entrada identificada; não é uma despesa ausente.', INVESTMENT: 'Movimentação de investimento, como aplicação ou resgate.', INVESTMENT_INCOME: 'Rendimento de investimento; não é uma despesa ausente.', TRANSFER: 'Transferência entre contas.', OTHER: 'Natureza não confirmada; não foi presumida como despesa.', EXPENSE: 'Despesa fora da lista principal.', CARD_PAYMENT: 'Pagamento de fatura, tratado pela composição do cartão.', REFUND: 'Devolução ou estorno bancário; analisado junto à saída original.' } as const)[type] }
-function TransactionBox({ label, transaction }: { label: string; transaction: BankTransaction | LedgerTransaction | null }) { return <div className="transaction-box"><span className="step-label">{label}</span>{transaction ? <><strong className="transaction-date">{dateLabel(transaction.date)}</strong><strong className="transaction-description">{transaction.originalDescription}</strong><strong className="transaction-amount">{formatCents(transaction.amount)}</strong><span className="transaction-meta">{transaction.source === 'BANK' && transaction.directionKnown === false ? 'Direção não identificada no arquivo' : transaction.direction === 'DEBIT' ? 'Saída' : 'Entrada'}{transaction.paymentMethod ? ` · Forma de pagamento: ${transaction.paymentMethod}` : ''}{transaction.source === 'SHEET' && transaction.category ? ` · ${transaction.category}` : ''}</span></> : <span className="no-candidate">Nenhum lançamento sugerido para comparar.</span>}</div> }
-function MissingCard({ item, onIgnore, onAddToSheet, canAddToSheet }: { item: ReconciliationItem; onIgnore: () => void; onAddToSheet: () => void; canAddToSheet: boolean }) { return <article className="missing-card"><span className="status-icon red">⌕</span><div className="missing-content"><span className="step-label">POSSÍVEL LANÇAMENTO AUSENTE</span><h2>{item.bank.originalDescription}</h2><p>{dateLabel(item.bank.date)} · Saída{item.bank.paymentMethod ? ` · Forma de pagamento: ${item.bank.paymentMethod}` : ''}</p><strong className="transaction-amount">{formatCents(item.bank.amount)}</strong><small>Nenhum lançamento correspondente foi encontrado na CUSTOS ANO.</small></div>{canAddToSheet && <button className="button button-primary" onClick={onAddToSheet}>Adicionar à CUSTOS ANO</button>}<button className="button button-outline" onClick={onIgnore}>Ignorar</button></article> }
+function CounterpartyNote({ transaction }: { transaction: BankTransaction }) {
+  const label = counterpartyLabel({ description: transaction.originalDescription, direction: transaction.direction, type: transaction.type })
+  if (transaction.counterpartyName) {
+    const remainingDescription = normalizeDescription(descriptionWithoutCounterparty(transaction.originalDescription, transaction.counterpartyName))
+    if (remainingDescription === normalizeDescription(transaction.counterpartyName)) return null
+    return <p className="counterparty-note"><span className="counterparty-note-label">{label}:</span> <strong>{transaction.counterpartyName}</strong></p>
+  }
+  const variants = [...new Map((transaction.counterpartyEvidence ?? []).map((item) => [item.name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase('pt-BR'), item])).values()]
+  if (variants.length < 2) return null
+  return <details className="counterparty-conflict"><summary>Contrapartes diferentes nas fontes</summary>{variants.map((item) => <small key={`${item.source}:${item.name}`}>{item.source}: {item.name}</small>)}</details>
+}
+function TransactionBox({ label, transaction }: { label: string; transaction: BankTransaction | LedgerTransaction | null }) { return <div className="transaction-box"><span className="step-label">{label}</span>{transaction ? <><strong className="transaction-date">{dateLabel(transaction.date)}</strong><strong className="transaction-description">{transaction.source === 'BANK' ? bankDisplayDescription(transaction.originalDescription) : transaction.originalDescription}</strong>{transaction.source === 'BANK' && <CounterpartyNote transaction={transaction}/>}<strong className="transaction-amount">{formatCents(transaction.amount)}</strong><span className="transaction-meta">{transaction.source === 'BANK' && transaction.directionKnown === false ? 'Direção não identificada no arquivo' : transaction.direction === 'DEBIT' ? 'Saída' : 'Entrada'}{transaction.paymentMethod ? ` · Forma de pagamento: ${transaction.paymentMethod}` : ''}{transaction.source === 'SHEET' && transaction.category ? ` · ${transaction.category}` : ''}</span></> : <span className="no-candidate">Nenhum lançamento sugerido para comparar.</span>}</div> }
+function MissingCard({ item, onIgnore, onAddToSheet, eligibility }: { item: ReconciliationItem; onIgnore: () => void; onAddToSheet: () => void; eligibility: MissingAddDecision }) {
+  const blockedReason: Partial<Record<MissingAddDecision['reason'], string>> = {
+    ALREADY_IN_SHEET: 'A movimentação já está registrada na CUSTOS ANO.',
+    ALREADY_ADDED: 'A inclusão desta movimentação já foi registrada.',
+    UNSUPPORTED_WRITE: 'Não é possível adicionar: faltam data, descrição ou valor válidos.',
+    NOT_EXPENSE: 'Este tipo de movimentação não pode ser adicionado como despesa individual.',
+    CARD_PAYMENT: 'Pagamento agregado de fatura; conciliado separadamente das despesas individuais.',
+    OUT_OF_SCOPE_TRANSFER: 'Transferências ficam fora das despesas conciliáveis.',
+    OUT_OF_SCOPE_INVESTMENT: 'Movimentações de investimento ficam fora das despesas conciliáveis.',
+    NOT_DEBIT: 'Somente saídas da conta podem ser adicionadas como despesa.',
+  }
+  return <article className="missing-card"><span className="status-icon red">⌕</span><div className="missing-content"><span className="step-label">POSSÍVEL LANÇAMENTO AUSENTE</span><h2>{bankDisplayDescription(item.bank.originalDescription)}</h2><CounterpartyNote transaction={item.bank}/><p>{dateLabel(item.bank.date)} · Saída{item.bank.paymentMethod ? ` · Forma de pagamento: ${item.bank.paymentMethod}` : ''}</p><strong className="transaction-amount">{formatCents(item.bank.amount)}</strong><small>Nenhum lançamento correspondente foi encontrado na CUSTOS ANO.</small>{!eligibility.eligible && blockedReason[eligibility.reason] && <small className="missing-action-reason">{blockedReason[eligibility.reason]}</small>}</div>{eligibility.eligible && <button className="button button-primary" onClick={onAddToSheet}>Adicionar à CUSTOS ANO</button>}<button className="button button-outline" onClick={onIgnore}>Ignorar</button></article>
+}
 function FilterBar({ years, year, month, fromDate, toDate, onYear, onMonth, onFrom, onTo }: { years: string[]; year: string; month: string; fromDate: string; toDate: string; onYear: (value: string) => void; onMonth: (value: string) => void; onFrom: (value: string) => void; onTo: (value: string) => void }) {
   return <section className="filter-bar"><div className="filter-heading"><span>⌕</span><strong>Filtrar período</strong></div><label>Ano<select value={year} onChange={(event) => onYear(event.target.value)}><option value="all">Todos os anos</option>{years.map((item) => <option key={item}>{item}</option>)}</select></label><label>Mês<select value={month} onChange={(event) => onMonth(event.target.value)}><option value="all">Todos os meses</option>{Array.from({ length: 12 }, (_, index) => <option key={index + 1} value={String(index + 1).padStart(2, '0')}>{String(index + 1).padStart(2, '0')} - {new Intl.DateTimeFormat('pt-BR', { month: 'long', timeZone: 'UTC' }).format(new Date(Date.UTC(2026, index, 1)))}</option>)}</select></label><label>De<input type="date" value={fromDate} onChange={(event) => onFrom(event.target.value)}/></label><label>Até<input type="date" value={toDate} onChange={(event) => onTo(event.target.value)}/></label></section>
 }
-function ExportBar({ result, items, banks, sheets }: { result: ReturnType<typeof reconcile>; items: ReconciliationItem[]; banks: BankTransaction[]; sheets: LedgerTransaction[] }) { return <section className="export-bar"><div><strong>Exportar resultados</strong><small>Os arquivos são gerados neste dispositivo.</small></div><div className="export-actions"><button className="button button-quiet" onClick={() => exportMissing(items)}>↓ Ausências</button><button className="button button-quiet" onClick={() => exportReviews(items)}>↓ Revisão</button><button className="button button-quiet" onClick={() => exportCardPayments(items)}>↓ Faturas de cartão</button><button className="button button-quiet" onClick={() => exportOutOfScope(items)}>↓ Fora do escopo</button><button className="button button-quiet" onClick={() => exportDuplicates(result, banks, sheets)}>↓ Duplicidades</button><button className="button button-quiet" onClick={() => exportSummary(result, items)}>↓ Resumo</button></div></section> }
+function ExportBar({ result, items, banks, sheets, consistencyAudit, hiddenAuditFindingIds }: { result: ReturnType<typeof reconcile>; items: ReconciliationItem[]; banks: BankTransaction[]; sheets: LedgerTransaction[]; consistencyAudit: ConsistencyAuditResult | null; hiddenAuditFindingIds: Set<string> }) { return <section className="export-bar"><div><strong>Exportar resultados</strong><small>Os arquivos são gerados neste dispositivo.</small></div><div className="export-actions"><button className="button button-quiet" onClick={() => exportMissing(items)}>↓ Ausências</button><button className="button button-quiet" onClick={() => exportReviews(items)}>↓ Revisão</button><button className="button button-quiet" onClick={() => exportCardPayments(items)}>↓ Faturas de cartão</button><button className="button button-quiet" onClick={() => exportOutOfScope(items)}>↓ Fora do escopo</button><button className="button button-quiet" onClick={() => exportDuplicates(result, banks, sheets)}>↓ Duplicidades</button><button className="button button-quiet" onClick={() => exportSummary(result, items)}>↓ Resumo</button><button className="button button-quiet" disabled={!consistencyAudit} title={consistencyAudit ? 'Exporta todos os findings da auditoria mais recente, inclusive avisos ocultos.' : 'Execute a auditoria de consistência para habilitar a exportação.'} onClick={() => { if (consistencyAudit) exportAuditFindings(consistencyAudit.findings, hiddenAuditFindingIds, consistencyAudit.auditedAt, consistencyAudit.mode) }}>↓ Auditoria{consistencyAudit ? ` (${consistencyAudit.findings.length})` : ''}</button><button className="button button-quiet" disabled={!consistencyAudit} title="Baixa o diagnóstico técnico completo da mesma execução da auditoria." onClick={() => { if (consistencyAudit) exportAuditDiagnosticJson(consistencyAudit, hiddenAuditFindingIds) }}>↓ Diagnóstico técnico JSON</button></div></section> }

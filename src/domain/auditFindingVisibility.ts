@@ -2,7 +2,6 @@ import type { AuditFinding, AuditSeverity } from './consistencyAudit'
 import { stableFingerprint } from './identity'
 
 const STORAGE_KEY = 'conciliador.auditFindingVisibility.v1'
-const SEVERITY_RANK: Record<AuditSeverity, number> = { INFO: 1, LEGACY: 2, MAINTENANCE: 3, REVIEW: 4, CRITICAL: 5 }
 
 export type DismissedAuditFinding = {
   fingerprint: string
@@ -25,16 +24,38 @@ function stableValue(value: unknown, key = ''): unknown {
   return value
 }
 
-/** Semantic identity excludes presentation text, severity, audit timestamps, and list order. */
-export function auditFindingFingerprint(finding: AuditFinding): string {
+const semanticAnchorKeys = new Set(['subjectFingerprint', 'subjectId', 'bankId', 'transactionId', 'entityId', 'statementIdentity', 'sourceId', 'identity', 'fingerprint', 'sheetIdentity', 'sheetRecordId', 'decisionKey', 'decisionId'])
+function semanticAnchors(value: unknown): unknown[] {
+  if (!value || typeof value !== 'object') return []
+  if (Array.isArray(value)) return value.flatMap(semanticAnchors)
+  return Object.entries(value as Record<string, unknown>).flatMap(([key, child]) => [
+    ...(semanticAnchorKeys.has(key) && (typeof child === 'string' || typeof child === 'number') ? [[key, child]] : []),
+    ...semanticAnchors(child),
+  ])
+}
+
+/** Stable identity for the user preference, independent of a finding's runtime ID and presentation. */
+export function auditHideKey(finding: AuditFinding): string {
+  const subjectFingerprint = finding.item?.fingerprint ?? stableFingerprint([JSON.stringify(semanticAnchors(finding.technical ?? {}))])
+  const targetRow = finding.technical?.row as Record<string, unknown> | undefined
+  const targetFingerprint = finding.code === 'DOUBLE_CLAIM'
+    ? stableFingerprint([String(targetRow?.sheetIdentity ?? targetRow?.sheetRecordId ?? targetRow?.id ?? 'unknown-row')])
+    : finding.code === 'DERIVED_STATE_MISMATCH'
+      ? stableFingerprint([JSON.stringify(stableValue({ pure: finding.technical?.pure, current: finding.technical?.current, pipeline: finding.technical?.pipeline }))])
+    : null
+  return `audit:${stableFingerprint([JSON.stringify({ code: finding.code, invariantId: finding.invariantId, subjectFingerprint, targetFingerprint })])}`
+}
+
+/** Previous key format retained only to migrate existing user hide preferences on first encounter. */
+function legacyAuditFindingFingerprint(finding: AuditFinding): string {
   const technical = stableValue(finding.technical ?? {})
   const subject = finding.item?.fingerprint ?? null
   const itemEvidence = finding.item ? stableValue({
-    pureState: finding.item.pure.status,
+    pureState: finding.item.pure?.status ?? null,
     currentState: finding.item.current?.status ?? null,
-    candidates: finding.item.candidates.map((row) => row.sheetRecordId || row.id),
-    decisions: finding.item.decisions.map(({ decision, status }) => ({ key: decision.key, status, selected: decision.selected })),
-    discarded: finding.item.discarded.map(({ row, reason }) => ({ id: row.sheetRecordId || row.id, reason })),
+    candidates: finding.item.candidates?.map((row) => row.sheetRecordId || row.id) ?? [],
+    decisions: finding.item.decisions?.map(({ decision, status }) => ({ key: decision.key, status, selected: decision.selected })) ?? [],
+    discarded: finding.item.discarded?.map(({ row, reason }) => ({ id: row.sheetRecordId || row.id, reason })) ?? [],
   }) : null
   const identity = {
     code: finding.code,
@@ -47,6 +68,9 @@ export function auditFindingFingerprint(finding: AuditFinding): string {
   }
   return `audit:${stableFingerprint([JSON.stringify(identity)])}`
 }
+
+/** @deprecated Use auditHideKey. Kept as an alias for existing integrations. */
+export const auditFindingFingerprint = auditHideKey
 
 export function loadAuditFindingVisibility(storage: Pick<Storage, 'getItem'> = localStorage): AuditFindingVisibility {
   try {
@@ -67,24 +91,27 @@ export function saveAuditFindingVisibility(visibility: AuditFindingVisibility, s
 }
 
 export function dismissAuditFinding(finding: AuditFinding, current: AuditFindingVisibility, dismissedAt = new Date().toISOString()): AuditFindingVisibility {
-  const fingerprint = auditFindingFingerprint(finding)
-  return { ...current, [fingerprint]: { fingerprint, code: finding.code, severityAtDismissal: finding.severity, dismissedAt } }
+  const fingerprint = auditHideKey(finding)
+  const next = { ...current }
+  delete next[legacyAuditFindingFingerprint(finding)]
+  return { ...next, [fingerprint]: { fingerprint, code: finding.code, severityAtDismissal: finding.severity, dismissedAt } }
 }
 
 export function restoreAuditFinding(finding: AuditFinding, current: AuditFindingVisibility): AuditFindingVisibility {
   const next = { ...current }
-  delete next[auditFindingFingerprint(finding)]
+  delete next[auditHideKey(finding)]
+  delete next[legacyAuditFindingFingerprint(finding)]
   return next
 }
 
-/** A more severe version is shown as active without mutating the saved user preference. */
+/** A finding stays hidden while its semantic key is persisted; severity is presentation, not identity. */
 export function isAuditFindingDismissed(finding: AuditFinding, visibility: AuditFindingVisibility): boolean {
-  const saved = visibility[auditFindingFingerprint(finding)]
-  return Boolean(saved && SEVERITY_RANK[finding.severity] <= SEVERITY_RANK[saved.severityAtDismissal])
+  const saved = visibility[auditHideKey(finding)] ?? visibility[legacyAuditFindingFingerprint(finding)]
+  return Boolean(saved)
 }
 
 export function auditFindingDismissal(finding: AuditFinding, visibility: AuditFindingVisibility): DismissedAuditFinding | undefined {
-  const saved = visibility[auditFindingFingerprint(finding)]
+  const saved = visibility[auditHideKey(finding)] ?? visibility[legacyAuditFindingFingerprint(finding)]
   return saved && isAuditFindingDismissed(finding, visibility) ? saved : undefined
 }
 

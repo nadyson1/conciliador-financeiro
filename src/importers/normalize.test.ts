@@ -1,11 +1,35 @@
 import { describe, expect, it } from 'vitest'
-import { classifySheetRecord, descriptionSimilarity, investmentAction, normalizeAmount, normalizeDate, normalizeDescription, transactionType } from './normalize'
+import { bankDisplayDescription, classifySheetRecord, descriptionSimilarity, investmentAction, normalizeAmount, normalizeBankDescription, normalizeDate, normalizeDescription, transactionType } from './normalize'
 import { parseCsvText } from './csv'
 import { parseBankRows, parseLedgerRows } from './transactions'
 import { initialColumnMap } from './csv'
 import { reconcile } from '../matching/reconcile'
+import { selectMissingExpenses, summarizeMissingExpenses } from '../domain/bankBalanceAudit'
 
 describe('CSV local e formatos brasileiros', () => {
+  it.each([
+    ['Pix Qrcode Din', 'Pix QR Code Dinâmico', 'Pix', 'EXPENSE'],
+    ['PIX QR CODE DINAMICO', 'Pix QR Code Dinâmico', 'Pix', 'EXPENSE'],
+    ['Pix   Qrcode   Est', 'Pix QR Code Estático', 'Pix', 'EXPENSE'],
+    ['Pix Qrcode Estático', 'Pix QR Code Estático', 'Pix', 'EXPENSE'],
+    ['Pix Enviado', 'Pix Enviado', 'Pix', 'EXPENSE'],
+    ['Compra Visa', 'Compra no débito', 'Débito', 'EXPENSE'],
+    ['Seguro Cart Deb', 'Seguro cartão de débito', 'Débito automático', 'EXPENSE'],
+    ['Gasto c Credito', 'Pagamento de fatura', '', 'CARD_PAYMENT'],
+    ['GASTOS CARTAO DE CREDITO', 'Pagamento de fatura', '', 'CARD_PAYMENT'],
+  ])('normaliza semanticamente %s', (raw, friendly, payment, type) => {
+    expect(normalizeBankDescription(raw)).toMatchObject({ normalizedDescription: friendly, suggestedPaymentMethod: payment, transactionType: type })
+    expect(bankDisplayDescription(raw)).toBe(friendly)
+  })
+
+  it('mantém a descrição original e a contraparte junto à semântica amigável', () => {
+    const parsed = parseBankRows([
+      { Data: '16/03/2026', Histórico: 'Pix Qrcode Din Des: Maria Francisca Borge', Débito: '17,00', Crédito: '' },
+    ], { date: 'Data', description: 'Histórico', amount: '', debit: 'Débito', credit: 'Crédito' })
+    expect(parsed.transactions[0]).toMatchObject({ description: 'Pix Qrcode Din Des: Maria Francisca Borge', originalDescription: 'Pix Qrcode Din Des: Maria Francisca Borge', counterpartyName: 'Maria Francisca Borge' })
+    expect(bankDisplayDescription(parsed.transactions[0].originalDescription)).toBe('Pix QR Code Dinâmico')
+  })
+
   it('detecta CSV com vírgula, BOM, acentos e campos entre aspas', () => {
     const parsed = parseCsvText('\uFEFFData,Descrição,Valor\r\n08/01/2026,"Café, centro",13,50')
     expect(parsed.delimiter).toBe(',')
@@ -79,6 +103,13 @@ describe('CSV local e formatos brasileiros', () => {
     expect(transactionType('PIX QR CODE DINAMICO')).toBe('EXPENSE')
     expect(transactionType('PIX QR CODE ESTATICO')).toBe('EXPENSE')
     expect(transactionType('SEGURO CART DEB BRADESCO')).toBe('EXPENSE')
+    expect(transactionType('Pix Qrcode Din')).toBe('EXPENSE')
+    expect(transactionType('Pix Qrcode Est')).toBe('EXPENSE')
+    expect(transactionType('Seguro Cart Deb')).toBe('EXPENSE')
+    expect(transactionType('Compra Visa')).toBe('EXPENSE')
+    expect(transactionType('Pix Enviado')).toBe('EXPENSE')
+    expect(transactionType('Gasto c Credito')).toBe('CARD_PAYMENT')
+    expect(transactionType('GASTOS CARTAO DE CREDITO')).toBe('CARD_PAYMENT')
     expect(transactionType('CONTA DE TELEFONE')).toBe('EXPENSE')
     expect(transactionType('PIX ENTRE CONTAS PROPRIAS')).toBe('TRANSFER')
     expect(transactionType('PIX ENVIADO PARA MINHA OUTRA CONTA')).toBe('TRANSFER')
@@ -93,6 +124,25 @@ describe('CSV local e formatos brasileiros', () => {
   it('usa descrição inequívoca de recebimento quando o CSV não traz coluna de direção', () => {
     const parsed = parseBankRows([{ Data: '08/01/2026', Descrição: 'Pix recebido', Valor: '45,00' }], { date: 'Data', description: 'Descrição', amount: 'Valor' })
     expect(parsed.transactions[0]).toMatchObject({ type: 'INCOME', direction: 'CREDIT' })
+  })
+
+  it('normaliza variantes do Internet Banking em despesa PIX, débito ou pagamento agregado', () => {
+    const rows = parseBankRows([
+      { Data: '02/03/2026', Descrição: 'Pix Qrcode Din', Débito: '126,00' },
+      { Data: '02/03/2026', Descrição: 'Seguro Cart Deb', Débito: '4,99' },
+      { Data: '02/03/2026', Descrição: 'Compra Visa', Débito: '2,39' },
+      { Data: '02/03/2026', Descrição: 'Pix Enviado', Débito: '17,00' },
+      { Data: '12/03/2026', Descrição: 'Gasto c Credito', Débito: '549,96' },
+    ], { date: 'Data', description: 'Descrição', amount: '', debit: 'Débito' })
+
+    expect(rows.transactions.map((item) => [item.type, item.direction, item.directionKnown])).toEqual([
+      ['EXPENSE', 'DEBIT', true], ['EXPENSE', 'DEBIT', true], ['EXPENSE', 'DEBIT', true], ['EXPENSE', 'DEBIT', true], ['CARD_PAYMENT', 'DEBIT', true],
+    ])
+    const reconciled = reconcile(rows.transactions, [])
+    const missing = selectMissingExpenses(reconciled.items)
+    expect(missing.map((item) => item.bank.originalDescription)).toEqual(['Pix Qrcode Din', 'Seguro Cart Deb', 'Compra Visa', 'Pix Enviado'])
+    expect(summarizeMissingExpenses(missing)).toEqual({ count: 4, total: 15038 })
+    expect(reconciled.items.find((item) => item.bank.originalDescription === 'Gasto c Credito')?.status).toBe('CARD_DIVERGENCE')
   })
 
   it('usa forma de pagamento Investimento para classificar linha da CUSTOS ANO', () => {

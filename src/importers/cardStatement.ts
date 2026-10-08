@@ -59,6 +59,16 @@ function cardId(line: string): string | null {
   return match ? `${match[1]} XXXX XXXX ${match[2]}` : null
 }
 
+function selectedInternetBankingCardId(lines: string[]): string | null {
+  const selectedIndex = lines.findIndex((line) => /^cart[aã]o selecionado$/i.test(normalized(line).trim()))
+  if (selectedIndex < 0) return null
+  for (const line of lines.slice(selectedIndex + 1, selectedIndex + 5)) {
+    const match = line.match(/^(?:\*{4}|x{4})(?:\s+(?:\*{4}|x{4})){2}\s+(\d{4})$/i)
+    if (match) return `XXXX XXXX XXXX ${match[1]}`
+  }
+  return null
+}
+
 function parseInstallment(value: string): { installment: number | null; totalInstallments: number | null; description: string } {
   const match = value.match(/(?:^|\s)\(?\s*(\d{1,2})\s*\/\s*(\d{1,2})\s*\)?(?=\s|$)/)
   if (!match) return { installment: null, totalInstallments: null, description: value.trim() }
@@ -79,6 +89,8 @@ export function detectBradescoInvoiceLayout(pages: string[][]): BradescoInvoiceL
     /cartao selecionado/,
     /data de vencimento:/,
     /gastos referentes ao cartao:\s*final\s+\d{4}/,
+    /\bdata\s*\|?\s*lancamentos\b/,
+    /total da fatura\s*:/,
   ]
   if (internetBankingMarkers.filter((marker) => marker.test(text)).length >= 3) return 'INTERNET_BANKING'
   const mobileMarkers = [
@@ -121,6 +133,10 @@ function parseInternetBankingPages(pages: string[][], fileName: string): CardSta
   const totalMatch = header.match(/total da fatura:[^\d\n]*R\$\s*([\d.]+,\d{2})/i)
     ?? header.match(/total da fatura\s*\(final[^\n]*\):\s*R\$\s*([\d.]+,\d{2})/i)
   const reportedTotal = totalMatch ? parseBrazilianMoney(totalMatch[1]) : null
+  const hasExplicitCardBlocks = allLines.some((line) => /gastos referentes ao cart[aã]o:\s*final\s+\d{4}/i.test(line))
+  const hasTransactionsTable = allLines.some((line) => /^data\b/i.test(normalized(line)) && /\blancamentos\b/i.test(normalized(line)))
+  const selectedCard = hasExplicitCardBlocks ? null : selectedInternetBankingCardId(allLines)
+  const canUseSelectedCardFallback = Boolean(selectedCard && hasTransactionsTable && dueDate && reportedTotal != null && reportedTotal > 0)
   const paymentMethodLine = allLines.find((line) => /^forma de pagamento:/i.test(line))
   const invoicePaymentMethod = paymentMethodLine?.split(':').slice(1).join(':').replace(/[|]/g, ' ').trim() || null
   const bestPurchaseLine = allLines.find((line) => /^melhor data de compra:/i.test(line))
@@ -136,7 +152,7 @@ function parseInternetBankingPages(pages: string[][], fileName: string): CardSta
   const transactions: CardStatementTransaction[] = []
   const financialAdjustments: CardStatementFinancialAdjustment[] = []
   const cardSubtotals: CardStatement['cardSubtotals'] = []
-  let activeCard = ''
+  let activeCard = canUseSelectedCardFallback ? selectedCard! : ''
   let pendingDay: string | null = null
   let pendingRows: string[] = []
   let pendingExplicitDate: string | null = null
@@ -226,7 +242,16 @@ function parseInternetBankingPages(pages: string[][], fileName: string): CardSta
       resetCardContext()
       continue
     }
-    if (/total da fatura\s*\(final/i.test(normalized(line))) { activeCard = ''; resetCardContext(); continue }
+    const finalCardTotal = line.match(/total da fatura\s*\(final\s+(\d{4})\)\s*:?/i)
+    if (/total da fatura\s*\(final/i.test(normalized(line))) {
+      if (canUseSelectedCardFallback && activeCard && finalCardTotal?.[1] === activeCard.slice(-4)) {
+        const subtotal = moneyFromLine(line)
+        if (subtotal != null && !cardSubtotals.some((item) => item.cardIdentifier === activeCard)) {
+          cardSubtotals.push({ cardIdentifier: activeCard, amount: subtotal })
+        }
+      }
+      activeCard = ''; resetCardContext(); continue
+    }
     if (/^resumo das despesas\b/i.test(normalized(line))) { activeCard = ''; resetCardContext(); continue }
     if (!activeCard) continue
 
@@ -268,6 +293,7 @@ function parseInternetBankingPages(pages: string[][], fileName: string): CardSta
     transaction.id = `card-${statementIdentity}-${stableFingerprint([transaction.cardIdentifier, transaction.date, transaction.originalDescription, transaction.amount, transaction.direction, transaction.installment, transaction.totalInstallments])}`
   })
   const refundGroups = identifyAggregatedRefundGroups(transactions)
+  refundGroups.push(...identifyOneToOneRefundGroups(transactions, new Set(refundGroups.map((group) => group.refundTransactionId))))
   const purchaseTotal = transactions.filter((item) => item.type === 'PURCHASE').reduce((sum, item) => sum + item.amount, 0)
   const refundTotal = transactions.filter((item) => item.type === 'REFUND').reduce((sum, item) => sum + item.amount, 0)
   const adjustmentDebitTotal = financialAdjustments.filter((item) => item.direction === 'DEBIT').reduce((sum, item) => sum + item.amount, 0)
@@ -322,18 +348,33 @@ export function identifyAggregatedRefundGroups(transactions: CardStatementTransa
     const transactionIds = orderedRows.map((row) => row.id)
     const id = `refund-group-${stableFingerprint([group.cardIdentifier, group.date, group.merchant, ...transactionIds, credit.id, group.amount])}`
     orderedRows.forEach((row) => { row.financialStatus = 'REFUNDED'; row.refundGroupId = id })
+    credit.refundGroupId = id
     return { id, cardIdentifier: group.cardIdentifier, date: group.date, merchant: orderedRows[0].originalDescription, transactionIds, refundTransactionId: credit.id, purchaseGroupAmount: group.amount, refundAmount: credit.amount, netAmount: group.amount - credit.amount, installmentCount: group.total }
   })
 }
 
-function markOneToOneRefunds(transactions: CardStatementTransaction[], groupedRefundIds: Set<string>): void {
-  const pairedRefunds = new Set(groupedRefundIds)
-  for (const purchase of transactions.filter((item) => item.type === 'PURCHASE' && item.financialStatus !== 'REFUNDED')) {
-    const refund = transactions.find((item) => item.type === 'REFUND' && !pairedRefunds.has(item.id)
-      && item.cardIdentifier === purchase.cardIdentifier && item.date === purchase.date && item.amount === purchase.amount
-      && normalizeDescription(item.originalDescription) === normalizeDescription(purchase.originalDescription))
-    if (refund) { purchase.financialStatus = 'REFUNDED'; pairedRefunds.add(refund.id) }
+/** Pair uniquely attributable, exact-value purchase/refund rows within the same invoice. */
+export function identifyOneToOneRefundGroups(transactions: CardStatementTransaction[], alreadyPairedRefundIds: Set<string> = new Set()): CardStatementRefundGroup[] {
+  const purchases = transactions.filter((item) => item.type === 'PURCHASE' && item.financialStatus !== 'REFUNDED')
+  const refunds = transactions.filter((item) => item.type === 'REFUND' && item.direction === 'CREDIT' && !alreadyPairedRefundIds.has(item.id) && !item.refundGroupId)
+  const related = (purchase: CardStatementTransaction, refund: CardStatementTransaction) => {
+    const description = normalizeDescription(purchase.originalDescription)
+    return Boolean(description) && purchase.cardIdentifier === refund.cardIdentifier && purchase.amount === refund.amount
+      && description === normalizeDescription(refund.originalDescription) && purchase.date === refund.date
   }
+  const purchaseOptions = new Map(purchases.map((purchase) => [purchase.id, refunds.filter((refund) => related(purchase, refund))]))
+  const refundOptions = new Map(refunds.map((refund) => [refund.id, purchases.filter((purchase) => related(purchase, refund))]))
+  const pairs = purchases.flatMap((purchase) => {
+    const candidates = purchaseOptions.get(purchase.id) ?? []
+    return candidates.length === 1 && (refundOptions.get(candidates[0].id)?.length ?? 0) === 1 ? [{ purchase, refund: candidates[0] }] : []
+  })
+  return pairs.map(({ purchase, refund }) => {
+    const id = `refund-pair-${stableFingerprint([purchase.cardIdentifier, purchase.date, normalizeDescription(purchase.originalDescription), purchase.amount, purchase.id, refund.id])}`
+    purchase.financialStatus = 'REFUNDED'
+    purchase.refundGroupId = id
+    refund.refundGroupId = id
+    return { id, cardIdentifier: purchase.cardIdentifier, date: purchase.date, merchant: purchase.originalDescription, transactionIds: [purchase.id], refundTransactionId: refund.id, purchaseGroupAmount: purchase.amount, refundAmount: refund.amount, netAmount: purchase.amount - refund.amount, installmentCount: 1 }
+  })
 }
 
 function amountFromCardHeader(line: string): number | null {
@@ -497,7 +538,7 @@ function parseMobileAppPages(pages: string[][], fileName: string): CardStatement
     transaction.id = `card-${statementIdentity}-${stableFingerprint([transaction.cardIdentifier, transaction.date, transaction.originalDescription, transaction.amount, transaction.direction, transaction.installment, transaction.totalInstallments])}`
   })
   const refundGroups = identifyAggregatedRefundGroups(transactions)
-  markOneToOneRefunds(transactions, new Set(refundGroups.map((group) => group.refundTransactionId)))
+  refundGroups.push(...identifyOneToOneRefundGroups(transactions, new Set(refundGroups.map((group) => group.refundTransactionId))))
   for (const subtotal of cardSubtotals) {
     const actual = transactions.filter((transaction) => transaction.cardIdentifier === subtotal.cardIdentifier).reduce((sum, transaction) => sum + (transaction.direction === 'DEBIT' ? transaction.amount : -transaction.amount), 0)
     if (actual !== subtotal.amount) errors.push(`Divergência entre lançamentos extraídos e subtotal informado para o cartão final ${subtotal.cardIdentifier.slice(-4)}.`)
@@ -713,7 +754,7 @@ export function explainCostYearCandidateRejection(statement: CardStatement, tran
   return `data fora da tolerância: planilha ${row.date}, vencimento ${invoiceDueDate ?? 'não informado'}, compra ${purchaseDate}; distância de ${days} dias (máximo 7 dias da compra histórica)`
 }
 
-export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTransaction[], confirmedMatches: Map<string, string> = new Map(), rejectedCandidates: Map<string, ReadonlySet<string>> = new Map()): CardStatementReconciliation {
+export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTransaction[], confirmedMatches: Map<string, string> = new Map(), rejectedCandidates: Map<string, ReadonlySet<string>> = new Map(), reservedSheetOwners: ReadonlyMap<string, string> = new Map()): CardStatementReconciliation {
   const purchases = statement.transactions.filter((transaction) => transaction.type === 'PURCHASE' && transaction.financialStatus !== 'REFUNDED')
   // Google Sheets descriptions are user-authored and may not have been classified
   // as EXPENSE by the bank-oriented classifier. Keep the payment method as the
@@ -722,9 +763,11 @@ export function reconcileCardStatement(statement: CardStatement, sheet: LedgerTr
   const isInstallment = (transaction: CardStatementTransaction) => transaction.installment != null && transaction.totalInstallments != null
   const invoiceDueDate = (transaction: CardStatementTransaction) => transaction.invoiceDueDate ?? transaction.statementDueDate ?? statement.dueDate
   const purchaseDate = (transaction: CardStatementTransaction) => transaction.purchaseDate || transaction.date
+  const subjectKey = (transaction: CardStatementTransaction) => `${statement.statementIdentity}\u001f${transaction.id}`
   const candidateSearch = (transaction: CardStatementTransaction, rows: LedgerTransaction[]) => {
     const rejected = rejectedCandidates.get(transaction.id)
-    return findExistingCostYearCandidates(statement, transaction, rows).filter((row) => !rejected?.has(row.id))
+    return findExistingCostYearCandidates(statement, transaction, rows).filter((row) => !rejected?.has(row.id)
+      && (!reservedSheetOwners.has(row.id) || reservedSheetOwners.get(row.id) === subjectKey(transaction)))
   }
   const confirmedSheetIds = new Set<string>()
   const validConfirmed = new Map<string, LedgerTransaction>()

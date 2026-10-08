@@ -1,5 +1,5 @@
 import Papa from 'papaparse'
-import type { CsvDocument } from '../domain/types'
+import type { BankStatementFormat, CsvDocument } from '../domain/types'
 
 export function parseCsvText(text: string): CsvDocument {
   const source = text.replace(/^\uFEFF/, '')
@@ -13,7 +13,7 @@ export function parseCsvText(text: string): CsvDocument {
     .sort((a, b) => b.score - a.score || a.row - b.row)[0]
   const delimiter = headerCandidate?.delimiter ?? Papa.parse<string[]>(source, { preview: 1 }).meta.delimiter ?? ','
   const metadataRowsIgnored = headerCandidate?.row ?? 0
-  const parseSource = headerCandidate ? source.split(/\r?\n/).slice(metadataRowsIgnored).join('\n') : source
+  const parseSource = headerCandidate ? source.split(/\r\n|\n|\r/).slice(metadataRowsIgnored).join('\n') : source
   const result = Papa.parse<Record<string, string>>(parseSource, {
     header: true,
     delimiter,
@@ -21,7 +21,8 @@ export function parseCsvText(text: string): CsvDocument {
     dynamicTyping: false,
     transformHeader: (header) => header.replace(/^\uFEFF/, '').trim(),
   })
-  const headers = result.meta.fields ?? []
+  const rawHeaders = result.meta.fields ?? []
+  const headers = rawHeaders.filter((header) => header.trim() !== '')
   const allRows = (result.data ?? []).map((row) => {
     const clean: Record<string, string> = {}
     for (const header of headers) clean[header] = String(row[header] ?? '').trim()
@@ -29,6 +30,14 @@ export function parseCsvText(text: string): CsvDocument {
   }).filter((row) => Object.values(row).some(Boolean))
   const bradescoLike = Boolean(detectColumn(headers, 'date') && detectColumn(headers, 'description')
     && (detectColumn(headers, 'debit') || detectColumn(headers, 'credit')) && detectColumn(headers, 'balance'))
+  const hasInternetBankingCompanions = allRows.some((row) => !normalizeHeader(row[detectColumn(headers, 'date')])
+    && Boolean(row[detectColumn(headers, 'description')])
+    && !row[detectColumn(headers, 'debit')] && !row[detectColumn(headers, 'credit')])
+  const bankStatementFormat: BankStatementFormat | undefined = bradescoLike
+    ? rawHeaders.some((header) => !header.trim()) && hasInternetBankingCompanions
+      ? 'BRADESCO_CSV_INTERNET_BANKING'
+      : 'BRADESCO_CSV_MOBILE'
+    : undefined
   let auxiliaryStart = -1
   let principalEnd = allRows.length
   let statementPeriodStart: string | null = null
@@ -49,7 +58,7 @@ export function parseCsvText(text: string): CsvDocument {
   }
   const rows = allRows.slice(0, principalEnd)
   const auxiliaryRows = auxiliaryStart >= 0 ? allRows.slice(auxiliaryStart + 1) : []
-  const physicalLines = source.split(/\r?\n/)
+  const physicalLines = source.split(/\r\n|\n|\r/)
   const firstDataLine = metadataRowsIgnored + 1
   const nonEmptyDataLineNumbers = physicalLines
     .map((line, index) => ({ line, number: index + 1 }))
@@ -58,6 +67,9 @@ export function parseCsvText(text: string): CsvDocument {
     .map(({ number }) => number)
   const parseErrors = result.errors
     .filter((error) => {
+      // Internet Banking omits trailing empty columns in many valid rows.
+      // Required financial fields are validated by the row parser below.
+      if (error.code === 'TooFewFields') return false
       if (error.code !== 'TooManyFields') return true
       const extra = (result.data[error.row ?? 0] as Record<string, unknown> | undefined)?.__parsed_extra
       // Bancos frequentemente terminam linhas de resumo com um separador vazio.
@@ -79,6 +91,7 @@ export function parseCsvText(text: string): CsvDocument {
     parseErrors,
     delimiter: result.meta.delimiter,
     metadataRowsIgnored,
+    bankStatementFormat,
   }
 }
 
@@ -103,8 +116,15 @@ function headerScore(cells: string[]): number {
 }
 
 export async function readCsvFile(file: File): Promise<CsvDocument> {
+  return parseCsvText(await readLocalFileText(file))
+}
+
+export async function readLocalFileText(file: File): Promise<string> {
   const text = await file.text()
-  return parseCsvText(text)
+  if (!text.includes('\uFFFD') || typeof file.arrayBuffer !== 'function') return text
+  const bytes = await file.arrayBuffer()
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes) }
+  catch { return new TextDecoder('windows-1252').decode(bytes) }
 }
 
 export function normalizeHeader(value: string): string {

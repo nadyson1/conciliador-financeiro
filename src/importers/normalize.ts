@@ -116,15 +116,58 @@ export function descriptionSimilarity(left: string, right: string): number {
 export function transactionType(description: string, paymentMethod = ''): 'EXPENSE' | 'INVESTMENT' | 'INVESTMENT_INCOME' | 'INCOME' | 'TRANSFER' | 'CARD_PAYMENT' | 'REFUND' | 'OTHER' {
   const value = normalizeDescription(description)
   const payment = normalizeDescription(paymentMethod)
-  if (/^gastos cartao de credito(?: |$)/.test(value)) return 'CARD_PAYMENT'
+  if (/^gastos? (?:cartao(?: de)?|c|com) credito(?: |$)/.test(value)) return 'CARD_PAYMENT'
   if (/^(?:devolucao|estorno|reembolso)(?: pix| transferencia| compra| pagamento)?(?: |$)/.test(value) || /\b(?:devolucao|estorno|reembolso)\b/.test(value)) return 'REFUND'
   if (/^rentab invest facilcred(?: |$)/.test(value)) return 'INVESTMENT_INCOME'
   if (/resg|resgate|venc(?:imento)? cdb|resg venc/.test(value)) return 'INVESTMENT'
   if (/aplicacao/.test(value) || payment === 'investimento') return 'INVESTMENT'
   if (/transferencia|ted|\bdoc\b|movimentacao interna|entre contas|transf\b|pix (?:para|entre) contas proprias|pix para minha conta|pix para conta propria|pix enviado .{0,40}(?:conta propria|contas proprias|minha (?:outra )?conta|conta de minha titularidade|mesma titularidade)/.test(value)) return 'TRANSFER'
   if (/pix recebido|recebimento pix|credito pix/.test(value)) return 'INCOME'
-  if (/pix enviado|envio pix|pix qr code (?:dinamico|estatico)|compra|comp cartao|seguro cart deb bradesco|conta de telefone|mercado|supermercado|farmacia|drogaria|posto de combustivel/.test(value)) return 'EXPENSE'
+  if (/pix enviado|envio pix|pix (?:qr code|qrcode) (?:din(?:amico)?|est(?:atico)?)(?: |$)|compra|comp cartao|seguro cart(?:ao)? deb(?:ito)?(?: bradesco)?(?: |$)|conta de telefone|mercado|supermercado|farmacia|drogaria|posto de combustivel/.test(value)) return 'EXPENSE'
   return 'OTHER'
+}
+
+export type BankDescriptionSemantics = {
+  /** Friendly text for UI; raw text remains the transaction identity/provenance source. */
+  normalizedDescription: string
+  transactionType: ReturnType<typeof transactionType>
+  suggestedPaymentMethod: string
+}
+
+/** Central semantic mapping for common abbreviated bank descriptions. */
+export function normalizeBankDescription(description: string): BankDescriptionSemantics {
+  const value = normalizeDescription(description)
+  const type = transactionType(description)
+  if (/^pix (?:qrcode|qr code) din(?:amico)?(?: |$)/.test(value)) {
+    return { normalizedDescription: 'Pix QR Code Dinâmico', transactionType: type, suggestedPaymentMethod: 'Pix' }
+  }
+  if (/^pix (?:qrcode|qr code) est(?:atico)?(?: |$)/.test(value)) {
+    return { normalizedDescription: 'Pix QR Code Estático', transactionType: type, suggestedPaymentMethod: 'Pix' }
+  }
+  if (/^pix enviado(?: |$)/.test(value)) {
+    return { normalizedDescription: 'Pix Enviado', transactionType: type, suggestedPaymentMethod: 'Pix' }
+  }
+  if (/^(?:compra (?:cartao )?visa|compra visa)(?: |$)/.test(value)) {
+    return { normalizedDescription: 'Compra no débito', transactionType: type, suggestedPaymentMethod: 'Débito' }
+  }
+  if (/^seguro cart deb(?:ito)?(?: bradesco)?(?: |$)/.test(value)) {
+    return { normalizedDescription: 'Seguro cartão de débito', transactionType: type, suggestedPaymentMethod: 'Débito automático' }
+  }
+  if (type === 'CARD_PAYMENT') {
+    return { normalizedDescription: 'Pagamento de fatura', transactionType: type, suggestedPaymentMethod: '' }
+  }
+  if (/^conta de telefone(?: |$)/.test(value)) {
+    return { normalizedDescription: 'Conta de telefone', transactionType: type, suggestedPaymentMethod: 'Débito automático' }
+  }
+  if (/^aplicacao cdb(?: |$)/.test(value)) {
+    return { normalizedDescription: 'Aplicação em CDB', transactionType: type, suggestedPaymentMethod: 'Investimento' }
+  }
+  return { normalizedDescription: description.trim(), transactionType: type, suggestedPaymentMethod: '' }
+}
+
+/** Friendly display label; unlike the raw description this must never be used as identity. */
+export function bankDisplayDescription(description: string): string {
+  return normalizeBankDescription(description).normalizedDescription
 }
 
 /** Classifies a CUSTOS ANO row with sheet semantics and payment-method precedence. */

@@ -155,7 +155,7 @@ describe('painel de fontes Google Drive', () => {
     fireEvent.click(screen.getByText(/Status dos extratos · 1/))
     const card = container.querySelector<HTMLElement>('.drive-statement-list .drive-file-card')!
     expect(within(card).getByText('extrato-com-nome-longo-de-outubro.csv')).toBeInTheDocument()
-    expect(within(card).getByText('01/10/2026 → 07/10/2026')).toBeInTheDocument()
+    expect(within(card).getByText('Período declarado: 01/10/2026 → 07/10/2026')).toBeInTheDocument()
     expect(within(card).getByText('18 movimentações processadas')).toBeInTheDocument()
     expect(card).toHaveClass('tone-success')
   })
@@ -174,6 +174,18 @@ describe('painel de fontes Google Drive', () => {
     expect(header).toHaveAttribute('aria-expanded', 'true')
     expect(within(header).getByText('▾')).toBeInTheDocument()
     expect(within(details).getByText('extrato.csv')).toBeInTheDocument()
+  })
+
+  it('mostra o formato e separa o período declarado das movimentações presentes', () => {
+    const summary: DriveSyncSummary = {
+      invoicesFound: 0, statementsFound: 1, alreadyKnown: 0, newProcessed: 1, errors: 0, removedFromFolders: 0,
+      statementFileOutcomes: [{ fileId: 'ofx', fileName: 'extrato.ofx', status: 'PROCESSED', format: 'OFX', periodStart: '01/01/2026', periodEnd: '01/01/2026', actualPeriodStart: '01/01/2026', actualPeriodEnd: '02/01/2026', transactionCount: 2 }],
+    }
+    render(<GoogleDrivePanel {...baseProps} summary={summary}/> )
+    fireEvent.click(screen.getByText(/Status dos extratos · 1/))
+    expect(screen.getByText('Formato: OFX')).toBeInTheDocument()
+    expect(screen.getByText('Período declarado: 01/01/2026 → 01/01/2026')).toBeInTheDocument()
+    expect(screen.getByText('Movimentações presentes: 01/01/2026 → 02/01/2026')).toBeInTheDocument()
   })
 
   it('usa Status dos extratos como bloco único e mantém Remover da sessão no arquivo carregado', () => {

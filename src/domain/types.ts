@@ -4,6 +4,7 @@ export type TransactionType = 'EXPENSE' | 'INVESTMENT' | 'INVESTMENT_INCOME' | '
 export type InvestmentAction = 'APPLICATION' | 'RESCUE' | null
 export type MatchStatus = 'MATCHED' | 'REVIEW' | 'REFUNDED' | 'CARD_DIVERGENCE' | 'CARD_PAYMENT_IDENTIFIED' | 'MISSING' | 'DUPLICATE' | 'UNMATCHED_SHEET' | 'IGNORED' | 'OUT_OF_SCOPE'
 export type ReconciliationReasonCode = 'MISSING_NO_CANDIDATE' | 'LEGACY_PAYMENT_ALIAS' | 'OUT_OF_SCOPE_TRANSFER' | 'OUT_OF_SCOPE_INVESTMENT' | 'NOT_EXPENSE'
+export type BankStatementFormat = 'BRADESCO_CSV_MOBILE' | 'BRADESCO_CSV_INTERNET_BANKING' | 'OFX'
 
 export interface LedgerTransaction {
   id: string
@@ -35,6 +36,11 @@ export interface BankTransaction {
   statementSourceId?: string
   statementSourceIds?: string[]
   statementFileName?: string
+  sourceDescriptions?: string[]
+  sourceTransactionIds?: string[]
+  statementFormats?: BankStatementFormat[]
+  counterpartyName?: string
+  counterpartyEvidence?: CounterpartyEvidence[]
   source: 'BANK'
   sheetRecordId: null
   bankTransactionId: string
@@ -72,7 +78,11 @@ export interface CsvDocument {
   parseErrors: string[]
   delimiter: string
   metadataRowsIgnored: number
+  bankStatementFormat?: BankStatementFormat
 }
+
+export type CounterpartySource = 'CSV_MOBILE' | 'CSV_INTERNET_BANKING' | 'OFX_NAME' | 'OFX_MEMO'
+export interface CounterpartyEvidence { name: string; source: CounterpartySource }
 
 export interface ColumnMap {
   date: string
@@ -125,6 +135,7 @@ export interface MatchCandidate {
   reasons: string[]
   dateDistance: number
   descriptionSimilarity: number
+  counterpartySimilarity?: number
   matchMethod?: 'SCORED' | 'STRUCTURAL' | 'MANUAL'
 }
 
@@ -139,6 +150,7 @@ export interface ReconciliationItem {
   cardSummary?: CardPaymentSummary | null
   reasonCode?: ReconciliationReasonCode
   reviewReason?: 'REFUND_AMBIGUITY' | 'ASSIGNMENT_CONFLICT' | 'DIRECTION_UNCERTAIN'
+  assignmentConflictOwnerBankId?: string
 }
 
 export interface CardPaymentSummary {

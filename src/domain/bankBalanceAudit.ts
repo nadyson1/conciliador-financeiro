@@ -121,7 +121,7 @@ export function auditBankBalance(transactions: BankTransaction[], excludedRows: 
 export function selectMissingExpenses<T extends { status: string; bank: BankTransaction }>(items: T[]): T[] {
   return items.filter(({ status, bank }) => status === 'MISSING'
     && bank.direction === 'DEBIT'
-    && (bank.type === 'EXPENSE' || bank.type === 'OTHER'))
+    && bank.type === 'EXPENSE')
 }
 
 export function summarizeMissingExpenses(items: { status: string; bank: BankTransaction }[]) {

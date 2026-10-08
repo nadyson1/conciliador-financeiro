@@ -36,7 +36,20 @@ describe('motor de conciliação', () => {
     const result = reconcile([bank('b1', 'Café'), bank('b2', 'Café')], [sheet('s1', 'Café')])
     expect(result.items.filter((item) => item.status === 'MATCHED')).toHaveLength(0)
     expect(result.items.every((item) => item.status === 'REVIEW')).toBe(true)
-    expect(result.items.filter((item) => item.sheet).map((item) => item.sheet?.sheetRecordId)).toEqual(['record-s1'])
+    expect(result.items.filter((item) => item.sheet).map((item) => item.sheet?.sheetRecordId)).toEqual(['record-s1', 'record-s1'])
+    const conflict = result.items.find((item) => item.reviewReason === 'ASSIGNMENT_CONFLICT')
+    expect(conflict).toMatchObject({ candidate: { sheetId: 's1' }, assignmentConflictOwnerBankId: expect.any(String) })
+  })
+
+  it('não mantém REVIEW sem candidata quando nenhuma linha passa pelos critérios atuais', () => {
+    const result = reconcile([bank('b1', 'PIX ENVIADO', '2026-03-02', 1200)], [])
+    expect(result.items[0]).toMatchObject({ status: 'MISSING', candidate: null })
+  })
+
+  it('mostra a candidata e o dono atual quando uma confirmação bancária reserva a linha', () => {
+    const result = reconcile([bank('confirmed-owner', 'Café'), bank('conflicting-bank', 'Café')], [sheet('reserved-sheet', 'Café')], { confirmedPairs: new Map([['confirmed-owner', 'reserved-sheet']]) })
+    expect(result.items[0]).toMatchObject({ status: 'MATCHED', sheet: { id: 'reserved-sheet' } })
+    expect(result.items[1]).toMatchObject({ status: 'REVIEW', reviewReason: 'ASSIGNMENT_CONFLICT', sheet: { id: 'reserved-sheet' }, candidate: { sheetId: 'reserved-sheet' }, assignmentConflictOwnerBankId: 'confirmed-owner' })
   })
 
   it('atribui globalmente duas movimentações repetidas a duas linhas sem reutilizar a mesma linha', () => {
@@ -80,8 +93,9 @@ describe('motor de conciliação', () => {
     )
     expect(result.items.map((item) => [item.bank.id, item.sheet?.id, item.status])).toEqual([
       ['strong', 'market', 'MATCHED'],
-      ['weak', undefined, 'MISSING'],
+      ['weak', 'market', 'REVIEW'],
     ])
+    expect(result.items[1]).toMatchObject({ reviewReason: 'ASSIGNMENT_CONFLICT', candidate: { sheetId: 'market' }, assignmentConflictOwnerBankId: 'strong' })
   })
 
   it('ignora duplicidades heurísticas do banco e preserva duplicidades da planilha', () => {
@@ -191,9 +205,9 @@ describe('motor de conciliação', () => {
     expect(result.unmatchedSheet.map((item) => item.id)).toEqual(['s1'])
   })
 
-  it('classifica como ausência saídas sem candidato plausível, inclusive tipos OTHER', () => {
+  it('classifica como ausência saídas sem candidato plausível quando a direção e natureza de despesa são conhecidas', () => {
     const pix = bank('pix', 'PIX ENVIADO', '2026-02-20', 1200)
-    const insurance = bank('insurance', 'SEGURO CARTAO DEB BRADESCO', '2026-02-20', 499, 'DEBIT', 'OTHER')
+    const insurance = bank('insurance', 'SEGURO CARTAO DEB BRADESCO', '2026-02-20', 499, 'DEBIT', 'EXPENSE')
     const result = reconcile([pix, insurance], [])
     expect(result.items.map((item) => item.status)).toEqual(['MISSING', 'MISSING'])
     expect(result.items.every((item) => item.status !== 'REVIEW')).toBe(true)
@@ -209,7 +223,7 @@ describe('motor de conciliação', () => {
     expect(superficial.items[0].reasonCode).toBe('MISSING_NO_CANDIDATE')
   })
 
-  it('retira de REVIEW candidatos fora da janela, de natureza incompatível ou já confirmados', () => {
+  it('retira de REVIEW candidatos fora da janela e de natureza incompatível, mas explica linha já confirmada', () => {
     const far = bank('far', 'Mercado Central', '2026-02-20', 1200)
     const confirmedBank = bank('confirmed', 'PIX ENVIADO', '2026-02-20', 1500)
     const extraBank = bank('extra', 'PIX ENVIADO', '2026-02-20', 1500)
@@ -217,7 +231,8 @@ describe('motor de conciliação', () => {
     const wrongNature = sheet('wrong-nature', 'Transferência', '2026-02-20', 1300); wrongNature.type = 'TRANSFER'
     const confirmedSheet = sheet('confirmed-sheet', 'Uber', '2026-02-20', 1500)
     const result = reconcile([far, confirmedBank, extraBank, bank('nature', 'Conta luz', '2026-02-20', 1300)], [farSheet, wrongNature, confirmedSheet], { confirmedPairs: new Map([['confirmed', 'confirmed-sheet']]) })
-    expect(result.items.map((item) => item.status)).toEqual(['MISSING', 'MATCHED', 'MISSING', 'MISSING'])
+    expect(result.items.map((item) => item.status)).toEqual(['MISSING', 'MATCHED', 'REVIEW', 'MISSING'])
+    expect(result.items[2]).toMatchObject({ reviewReason: 'ASSIGNMENT_CONFLICT', candidate: { sheetId: 'confirmed-sheet' }, assignmentConflictOwnerBankId: 'confirmed' })
   })
 
   it('aceita revisão manual e mantém o vínculo 1:1', () => {
@@ -393,5 +408,18 @@ describe('motor de conciliação', () => {
     expect(amountDifference.items[0].status).not.toBe('MATCHED')
     expect(directionDifference.items[0].status).not.toBe('MATCHED')
     expect(unknown.items[0].status).toBe('REVIEW')
+  })
+
+  it('usa contraparte como evidência auxiliar, sem ignorar valor/direção ou forçar match', () => {
+    const withCounterparty = bank('cp', 'PIX QR CODE ESTATICO', '2026-02-20', 6000)
+    withCounterparty.counterpartyName = 'Equatorial Piaui'
+    const target = sheet('equatorial', 'Conta de luz Equatorial', '2026-02-23', 6000)
+    const assisted = reconcile([withCounterparty], [target]).items[0]
+    const baseline = reconcile([bank('base', 'PIX QR CODE ESTATICO', '2026-02-20', 6000)], [target]).items[0]
+    const wrongAmount = reconcile([withCounterparty], [sheet('wrong-amount', 'Equatorial Piaui', '2026-02-20', 6001)]).items[0]
+    expect(assisted.status).toBe('REVIEW')
+    expect(assisted.candidate?.reasons).toContain('Contraparte compatível')
+    expect(assisted.candidate?.score).toBeGreaterThan(baseline.candidate?.score ?? 0)
+    expect(wrongAmount).toMatchObject({ status: 'MISSING', candidate: null })
   })
 })

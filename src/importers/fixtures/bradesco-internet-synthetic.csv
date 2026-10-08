@@ -1,0 +1,6 @@
+Data;Histórico;Docto.;Crédito (R$);Débito (R$);Saldo (R$);
+01/01/26;Pix Qrcode Est;DOC-100;;-42,00;958,00;
+;Des: Loja Exemplo 01/01;;;;;
+02/01/26;Devolucao Pix;DOC-101;12,50;;970,50;
+;Rem: Loja Exemplo 02/01;;;;;
+02/01/26;Saldo do dia;;;;970,50;

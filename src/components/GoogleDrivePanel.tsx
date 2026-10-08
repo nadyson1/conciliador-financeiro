@@ -6,8 +6,11 @@ export interface DriveStatementFileOutcome {
   fileId: string
   fileName: string
   status: 'PROCESSED' | 'WARNING' | 'ERROR' | 'UNSUPPORTED' | 'IGNORED'
+  format?: string
   periodStart?: string | null
   periodEnd?: string | null
+  actualPeriodStart?: string | null
+  actualPeriodEnd?: string | null
   transactionCount?: number
   ignoredRowCount?: number
   excludedRowCount?: number
@@ -50,7 +53,7 @@ export function GoogleDrivePanel({ folders, connected, configured, loading, prog
   lastSync: string | null
   summary: DriveSyncSummary | null
   error: string
-  loadedStatements?: { id: string; name: string; periodStart?: string | null; periodEnd?: string | null; transactionCount?: number; overlapCount?: number }[]
+  loadedStatements?: { id: string; name: string; periodStart?: string | null; periodEnd?: string | null; actualPeriodStart?: string | null; actualPeriodEnd?: string | null; transactionCount?: number; overlapCount?: number }[]
   onSelectFolder: (kind: DriveFolderKind) => void
   onSync: () => void
   onRemoveStatement?: (fileId: string) => void
@@ -72,7 +75,7 @@ export function GoogleDrivePanel({ folders, connected, configured, loading, prog
     <div className="drive-folder-grid">
       {(['invoices', 'statements'] as const).map((kind) => {
         const folder = folders[kind]
-        const label = kind === 'invoices' ? 'Faturas PDF' : 'Extratos CSV'
+        const label = kind === 'invoices' ? 'Faturas PDF' : 'Extratos bancários'
         return <div className="drive-folder-row" key={kind}><div><strong>{label}</strong><small>{folder ? `✓ ${folder.name}` : 'Nenhuma pasta configurada'}</small></div><button className="button button-outline button-small" disabled={!configured || loading} onClick={() => onSelectFolder(kind)}>{folder ? 'Alterar' : 'Selecionar pasta'}</button></div>
       })}
     </div>
@@ -114,7 +117,12 @@ export function GoogleDrivePanel({ folders, connected, configured, loading, prog
             const view = statementStatusView[file.status]
             return <li key={file.fileId} className={`drive-file-card tone-${view.tone}`}>
               <div className="drive-file-heading"><span className="drive-file-icon" aria-hidden="true">{view.icon}</span><strong title={file.fileName}>{file.fileName}</strong><span className="drive-file-status">{view.label}</span></div>
-              {file.status !== 'UNSUPPORTED' && <small>{formatPeriod(file.periodStart, file.periodEnd)}</small>}
+              {file.status !== 'UNSUPPORTED' && <>
+                {(file.periodStart || file.periodEnd) && <small>Período declarado: {formatPeriod(file.periodStart, file.periodEnd)}</small>}
+                {(file.actualPeriodStart || file.actualPeriodEnd) && <small>Movimentações presentes: {formatPeriod(file.actualPeriodStart, file.actualPeriodEnd)}</small>}
+                {!file.periodStart && !file.periodEnd && !file.actualPeriodStart && !file.actualPeriodEnd && <small>Período não identificado</small>}
+              </>}
+              {file.format && <small>Formato: {file.format}</small>}
               {file.transactionCount != null && <small>{file.transactionCount} {file.transactionCount === 1 ? 'movimentação' : 'movimentações'} processadas</small>}
               {file.ignoredRowCount != null && file.ignoredRowCount > 0 && <small>{file.ignoredRowCount} {file.ignoredRowCount === 1 ? 'linha ignorada' : 'linhas ignoradas'}</small>}
               {file.excludedRowCount != null && file.excludedRowCount > 0 && <small>{file.excludedRowCount} {file.excludedRowCount === 1 ? 'linha excluída' : 'linhas excluídas'} na leitura</small>}
