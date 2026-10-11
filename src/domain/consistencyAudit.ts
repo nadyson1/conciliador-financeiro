@@ -1,21 +1,24 @@
 import type { BankRefundGroup, BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, LedgerTransaction, ReconciliationItem } from './types'
 import type { PersistedDecision } from './localDecisions'
 import { auditPersistedDecisions, type DecisionAudit } from './decisionAudit'
-import { cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity, stableFingerprint } from './identity'
+import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity, stableFingerprint } from './identity'
 import { deriveCardPurchaseStatus, explainCostYearCandidateRejection, findExistingCostYearCandidates, reconcileCardStatement } from '../importers/cardStatement'
 import { canAddMissingToCostYear } from '../features/missingEligibility'
 import { classifySheetRecord, normalizeDescription, transactionType } from '../importers/normalize'
 import { diagnoseMissingCounterDivergence } from './sourceLifecycle'
-import { describeAuditFinding } from './auditFindingPresentation'
-import { findPlausibleLedgerCandidates } from '../matching/reconcile'
+import { AUDIT_CODE_LIFECYCLE, describeAuditFinding } from './auditFindingPresentation'
+import { findPlausibleLedgerCandidates, pairKey, reconcile } from '../matching/reconcile'
 import { conflictingStatementAssignments, resolveStatementMatchAssignments } from './statementMatchAssignments'
+import type { AuditInputSnapshot } from './auditInputSnapshot'
+import { deriveExpectedReconciliationState, type ExpectedStateExplanationStep } from './expectedReconciliationState'
 
-export type AuditCode = 'MISSING_COM_CANDIDATO' | 'MISSING_WITH_STRONG_CANDIDATE' | 'CARD_MISSING_NO_CANDIDATE' | 'DERIVED_STATE_MISMATCH' | 'EXPECTED_OVERRIDE' | 'EXPECTED_GROUP_RESOLUTION' | 'EXPECTED_MANUAL_RESERVATION' | 'PREWRITE_MATCH_MISMATCH' | 'STALE_MISSING_DECISION' | 'ORPHANED_SHEET_REFERENCE' | 'EDITED_SHEET_REFERENCE' | 'MISSING_ADDED_TO_SHEET_ORPHAN' | 'DOUBLE_CLAIM' | 'DOUBLE_CLAIM_AFTER_CONFIRMATION' | 'MULTIPLE_INCOMPATIBLE_ACTIVE_DECISIONS' | 'RESERVED_SHEET_ROW_REUSED' | 'MATCHED_BUT_STILL_REVIEW' | 'VALID_MANUAL_MATCH_NOT_APPLIED' | 'MISSING_ACTION_INCONSISTENCY' | 'CARD_PAYMENT_AS_EXPENSE_MISSING' | 'UNUSED_STRONG_CANDIDATE' | 'LEGACY_FINGERPRINT_MATCH' | 'LOCAL_REMOTE_DECISION_DIVERGENCE' | 'NEWER_TOMBSTONE_EXISTS' | 'WRONG_DECISION_DOMAIN' | 'REVIEW_ONLY_WRONG_CYCLE_CANDIDATES' | 'IGNORED_DECISION_REVIEW' | 'CURRENT_SOURCE_DIVERGENCE' | 'REJECTED_CANDIDATE_FILTERED' | 'DECISION_STATUS' | 'SYNC_PENDING' | 'REVIEW_WITHOUT_CANDIDATES' | 'ASSIGNMENT_CONFLICT' | 'REFUNDED_BUT_MISSING' | 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS' | 'STALE_ACTIVE_SOURCE' | 'MISSING_COUNT_DIVERGENCE' | 'DUPLICATE_PRESENT_BUT_MARKED_MISSING' | 'INVOICE_TOTAL_MISMATCH' | 'CARD_SUBTOTAL_MISMATCH' | 'REFUND_NET_MISMATCH' | 'RESOLVED_SOURCE_OVERLAP' | 'MATCHED_WITHOUT_LINK' | 'ACTIVE_ENTITY_WITHOUT_SOURCE' | 'SOURCE_POINTS_TO_MISSING_ENTITY' | 'SOURCE_CONFLICT'
+export type AuditCode = 'MISSING_COM_CANDIDATO' | 'MISSING_WITH_STRONG_CANDIDATE' | 'EXPECTED_MANUAL_REJECTION' | 'CARD_MISSING_NO_CANDIDATE' | 'DERIVED_STATE_MISMATCH' | 'EXPECTED_OVERRIDE' | 'EXPECTED_GROUP_RESOLUTION' | 'EXPECTED_MANUAL_RESERVATION' | 'PREWRITE_MATCH_MISMATCH' | 'STALE_MISSING_DECISION' | 'ORPHANED_SHEET_REFERENCE' | 'EDITED_SHEET_REFERENCE' | 'MISSING_ADDED_TO_SHEET_ORPHAN' | 'DOUBLE_CLAIM' | 'DOUBLE_CLAIM_AFTER_CONFIRMATION' | 'MULTIPLE_INCOMPATIBLE_ACTIVE_DECISIONS' | 'RESERVED_SHEET_ROW_REUSED' | 'VALID_MANUAL_MATCH_NOT_APPLIED' | 'VALID_BANK_MANUAL_MATCH_NOT_APPLIED' | 'PAIR_CONFIRMED_ASSIGNMENT_CONFLICT' | 'INVALID_DECISION_APPLIED' | 'STALE_DECISION_RESULT' | 'AUDIT_INPUT_REVISION_MISMATCH' | 'AUDITOR_INTERNAL_INCONSISTENCY' | 'MISSING_ACTION_INCONSISTENCY' | 'CARD_PAYMENT_AS_EXPENSE_MISSING' | 'UNUSED_STRONG_CANDIDATE' | 'LEGACY_FINGERPRINT_MATCH' | 'LOCAL_REMOTE_DECISION_DIVERGENCE' | 'NEWER_TOMBSTONE_EXISTS' | 'WRONG_DECISION_DOMAIN' | 'REVIEW_ONLY_WRONG_CYCLE_CANDIDATES' | 'IGNORED_DECISION_REVIEW' | 'CURRENT_SOURCE_DIVERGENCE' | 'REJECTED_CANDIDATE_FILTERED' | 'SYNC_PENDING' | 'REVIEW_WITHOUT_CANDIDATES' | 'ASSIGNMENT_CONFLICT' | 'REFUNDED_BUT_MISSING' | 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS' | 'STALE_ACTIVE_SOURCE' | 'MISSING_COUNT_DIVERGENCE' | 'DUPLICATE_PRESENT_BUT_MARKED_MISSING' | 'INVOICE_TOTAL_MISMATCH' | 'CARD_SUBTOTAL_MISMATCH' | 'REFUND_NET_MISMATCH' | 'RESOLVED_SOURCE_OVERLAP' | 'MATCHED_WITHOUT_LINK' | 'ACTIVE_ENTITY_WITHOUT_SOURCE' | 'SOURCE_POINTS_TO_MISSING_ENTITY' | 'SOURCE_CONFLICT'
 export type AuditSeverity = 'CRITICAL' | 'REVIEW' | 'INFO'
 export type AuditMode = 'RAPIDA' | 'PROFUNDA'
 export type AuditCategory = 'SOURCE' | 'IDENTITY' | 'STATE' | 'DECISION' | 'FINANCIAL'
 export type AuditExplanationSource = 'NONE' | 'MANUAL_DECISION' | 'GROUP_MATCHING' | 'REFUND' | 'SOURCE_LIFECYCLE' | 'IGNORE' | 'TOMBSTONE' | 'SYNC' | 'ASSIGNMENT' | 'OTHER'
 export type DiagnosticConfidence = 'HIGH' | 'MEDIUM' | 'LOW'
+export type ConfidenceEvidence = { identityQuality: 'CANONICAL' | 'HEURISTIC' | 'INCOMPLETE'; sourceCoverage: string; revisionComparable: boolean; evidenceCount: number; validDecision: boolean; targetCanonical: boolean }
 export type DecisionDomain = 'bank-reconciliation' | 'sheet-bank-reconciliation' | 'card-payment-composition' | 'pdf-card-purchase' | 'bank-missing-sheet-record'
 export const DECISION_DOMAIN: Record<PersistedDecision['kind'], DecisionDomain> = {
   PAIR_CONFIRMED: 'bank-reconciliation', PAIR_REJECTED: 'bank-reconciliation', BANK_IGNORED: 'bank-reconciliation',
@@ -32,6 +35,8 @@ export type AuditedCardItem = {
   transaction: CardStatementTransaction
   pure: CardStatementMatch
   current: CardStatementMatch | null
+  expectedState: CardStatementMatch | null
+  explanationChain: ExpectedStateExplanationStep[]
   candidates: LedgerTransaction[]
   fingerprint: string
   aliases: string[]
@@ -48,9 +53,16 @@ export type AuditFinding = {
   diagnosticConfidence: DiagnosticConfidence; safeAutomaticAction: boolean; automaticActionType?: string
   status: 'ACTIVE' | 'EXPECTED' | 'MAINTENANCE' | 'LEGACY'; currentState?: string; expectedState?: string; pureState?: string
   explanationSource: AuditExplanationSource; item?: AuditedCardItem; technical?: Record<string, unknown>
-  relatedFindings?: Pick<AuditFinding, 'code' | 'title' | 'detail' | 'technical'>[]
+  role?: 'PRIMARY' | 'RELATED' | 'EXPECTED' | 'INFO'
+  rootCauseCode?: string
+  rootCauseKey?: string
+  primaryFindingId?: string
+  impact?: string
+  confidenceEvidence?: ConfidenceEvidence
+  explanationChain?: ExpectedStateExplanationStep[]
+  relatedFindings?: { id?: string; code: AuditCode; title: string; detail: string; impact?: string; technical?: Record<string, unknown>; role?: 'RELATED' | 'EXPECTED' | 'INFO'; rootCauseKey?: string }[]
 }
-type RawAuditFinding = Omit<AuditFinding, 'category' | 'invariantId' | 'diagnosis' | 'whyItMatters' | 'recommendedAction' | 'diagnosticConfidence' | 'safeAutomaticAction' | 'status' | 'explanationSource'> & Partial<Pick<AuditFinding, 'category' | 'invariantId' | 'diagnosis' | 'whyItMatters' | 'recommendedAction' | 'diagnosticConfidence' | 'safeAutomaticAction' | 'automaticActionType' | 'status' | 'currentState' | 'expectedState' | 'pureState' | 'explanationSource'>>
+type RawAuditFinding = Omit<AuditFinding, 'category' | 'invariantId' | 'diagnosis' | 'whyItMatters' | 'recommendedAction' | 'diagnosticConfidence' | 'safeAutomaticAction' | 'status' | 'explanationSource' | 'role' | 'rootCauseCode' | 'rootCauseKey' | 'impact' | 'confidenceEvidence'> & Partial<Pick<AuditFinding, 'category' | 'invariantId' | 'diagnosis' | 'whyItMatters' | 'recommendedAction' | 'diagnosticConfidence' | 'safeAutomaticAction' | 'automaticActionType' | 'status' | 'currentState' | 'expectedState' | 'pureState' | 'explanationSource' | 'role' | 'rootCauseCode' | 'rootCauseKey' | 'primaryFindingId' | 'impact' | 'confidenceEvidence'>>
 export type ConsistencyAuditInput = {
   mode?: AuditMode
   banks: BankTransaction[]
@@ -67,6 +79,8 @@ export type ConsistencyAuditInput = {
   appliedDecisions?: AppliedDecision[]
   onlySubjectFingerprints?: string[]
   currentBankItems?: ReconciliationItem[]
+  currentDecisionRevision?: string
+  derivedDecisionRevision?: string
   missingActionVisibility?: Record<string, boolean>
   bankRefundGroups?: BankRefundGroup[]
   missingCounterCollections?: { source: string; items: ReconciliationItem[] }[]
@@ -75,9 +89,19 @@ export type ConsistencyAuditInput = {
   missingDriveSourceIds?: string[]
   duplicateInvoiceSources?: { identity: string; sourceIds: string[] }[]
   sourceProvenance?: { sourceId: string; entityIds: string[] }[]
+  auditInputSnapshot?: AuditInputSnapshot
 }
+export type InvariantExecutionStatus = 'EXECUTED_PASS' | 'EXECUTED_FAIL' | 'NOT_APPLICABLE' | 'UNAVAILABLE' | 'SKIPPED_DUE_TO_REVISION'
+export type InvariantExecution = { invariantId: string; status: InvariantExecutionStatus; subjectsEvaluated: number; sourcesRequired: string[]; sourcesAvailable: string[]; reason?: string; findingIds: string[] }
+export type AuditSelfCheck = { checkId: string; status: 'PASS' | 'FAIL' | 'NOT_APPLICABLE'; findingIds: string[]; detail?: string }
 export type AuditSummary = { critical: number; review: number; maintenance: number; legacy: number; informational: number; attention: number; evaluatedPurchases: number; validatedInvariants: number }
-export type ConsistencyAuditResult = { mode: AuditMode; recomputation: { performed: boolean; readOnly: true; persistedDecisionsApplied: false }; findings: AuditFinding[]; items: AuditedCardItem[]; decisionAudit: AuditDecision[]; auditedAt: string; pureStates: Record<string, string>; currentStates: Record<string, string>; summary: AuditSummary }
+export type ConsistencyAuditResult = { mode: AuditMode; recomputation: { performed: boolean; readOnly: true; persistedDecisionsApplied: false }; findings: AuditFinding[]; items: AuditedCardItem[]; decisionAudit: AuditDecision[]; auditedAt: string; pureStates: Record<string, string>; currentStates: Record<string, string>; expectedStates: Record<string, ReturnType<typeof deriveExpectedReconciliationState>>; summary: AuditSummary; invariantExecutions: InvariantExecution[]; auditSelfChecks: AuditSelfCheck[]; performance: { totalMs: number; expectedStateDerivationMs: number; invariantChecksMs: number }; auditInputSnapshot?: AuditInputSnapshot }
+
+export function calculateDiagnosticConfidence(evidence: ConfidenceEvidence): DiagnosticConfidence {
+  if (!evidence.revisionComparable || evidence.sourceCoverage === 'PARTIAL' || evidence.identityQuality === 'INCOMPLETE') return 'LOW'
+  if (evidence.identityQuality === 'CANONICAL' && evidence.evidenceCount >= 2 && (evidence.validDecision || evidence.targetCanonical || evidence.evidenceCount >= 4)) return 'HIGH'
+  return evidence.evidenceCount > 0 ? 'MEDIUM' : 'LOW'
+}
 
 export function derivedMismatchSeverity(pure: CardStatementMatch['status'], current: CardStatementMatch['status'], canAppend: boolean): AuditSeverity {
   if ((pure === 'CARD_MATCHED' || pure === 'CARD_GROUP_MATCHED') && current === 'CARD_MISSING') return 'CRITICAL'
@@ -128,20 +152,79 @@ export function auditDecisionMerge(input: Pick<ConsistencyAuditInput, 'localDeci
   return { effective, conflicts, pendingLocalUpdate, pendingRemoteUpdate }
 }
 
-export function summarizeAudit(findings: AuditFinding[], items: AuditedCardItem[], evaluatedPurchases = items.length, mode: AuditMode = 'PROFUNDA'): AuditSummary {
-  const uniqueCount = (severities: AuditSeverity[]) => new Set(findings.filter((finding) => severities.includes(finding.severity)).map((finding) => finding.item?.fingerprint ?? (finding.technical?.decision as PersistedDecision | undefined)?.key ?? finding.id)).size
+export function summarizeAudit(findings: AuditFinding[], items: AuditedCardItem[], evaluatedPurchases = items.length, _mode: AuditMode = 'PROFUNDA', invariantExecutions: InvariantExecution[] = []): AuditSummary {
+  const topLevel = findings.filter((finding) => finding.role !== 'RELATED')
+  const rootKey = (finding: AuditFinding) => finding.rootCauseKey ?? finding.id
+  const uniqueCount = (severities: AuditSeverity[]) => new Set(topLevel.filter((finding) => severities.includes(finding.severity)).map(rootKey)).size
   const critical = uniqueCount(['CRITICAL']), review = uniqueCount(['REVIEW'])
-  const uniqueStatus = (status: AuditFinding['status']) => new Set(findings.filter((finding) => finding.status === status).map((finding) => finding.item?.fingerprint ?? (finding.technical?.decision as PersistedDecision | undefined)?.key ?? finding.id)).size
-  const invariantIds = new Set(['INV-01', 'INV-02', 'INV-03', 'INV-04', 'INV-05', 'INV-06', 'INV-07', ...(mode === 'PROFUNDA' ? ['INV-08'] : []), 'INV-09', 'INV-10', 'INV-11', 'INV-12', 'INV-13', 'INV-14'])
-  const failedInvariants = new Set(findings.filter((finding) => finding.severity !== 'INFO').map((finding) => finding.invariantId))
-  return { critical, review, maintenance: uniqueStatus('MAINTENANCE'), legacy: uniqueStatus('LEGACY'), informational: uniqueCount(['INFO']), attention: new Set(findings.filter((finding) => finding.severity === 'CRITICAL' || finding.severity === 'REVIEW').map((finding) => finding.item?.fingerprint ?? (finding.technical?.decision as PersistedDecision | undefined)?.key ?? finding.id)).size, evaluatedPurchases, validatedInvariants: Math.max(0, invariantIds.size - failedInvariants.size) }
+  const uniqueStatus = (status: AuditFinding['status']) => new Set(topLevel.filter((finding) => finding.status === status).map(rootKey)).size
+  return { critical, review, maintenance: uniqueStatus('MAINTENANCE'), legacy: uniqueStatus('LEGACY'), informational: uniqueCount(['INFO']), attention: new Set(topLevel.filter((finding) => finding.severity === 'CRITICAL' || finding.severity === 'REVIEW').map(rootKey)).size, evaluatedPurchases, validatedInvariants: invariantExecutions.filter((execution) => execution.status === 'EXECUTED_PASS').length }
+}
+
+const invariantSources: Record<string, string[]> = {
+  'INV-01': ['bank', 'custosAno', 'cardStatements', 'currentBankResults', 'currentCardResults'], 'INV-02': ['bank', 'custosAno', 'cardStatements', 'currentBankResults', 'currentCardResults'],
+  'INV-03': ['bank', 'custosAno', 'currentBankResults'], 'INV-04': ['cardStatements', 'custosAno', 'currentCardResults'], 'INV-05': ['bank', 'cardStatements', 'currentBankResults'],
+  'INV-06': ['cardStatements', 'currentCardResults'], 'INV-07': ['drive'], 'INV-08': ['decisions', 'bank', 'custosAno', 'cardStatements', 'currentBankResults', 'currentCardResults'],
+  'INV-09': ['bank', 'currentBankResults'], 'INV-10': ['bank', 'drive'], 'INV-11': ['decisions', 'cardStatements', 'bank', 'currentBankResults', 'currentCardResults'],
+  'INV-12': ['cardStatements', 'custosAno', 'currentCardResults'], 'INV-13': ['cardStatements', 'currentCardResults'], 'INV-14': ['drive'],
+}
+const unavailableAliases: Record<string, string[]> = {
+  bank: ['bank', 'bank-source', 'bank-statements'], custosAno: ['custosAno', 'costs-year', 'google-current-ledger'],
+  cardStatements: ['cardStatements', 'statements', 'pdf-statements'], decisions: ['decisions', 'remote-decisions', 'decision-snapshot'], drive: ['drive', 'drive-live-listing'],
+  currentBankResults: ['currentBankResults', 'current-bank-results', 'bank-derived-result'], currentCardResults: ['currentCardResults', 'current-card-results', 'statement-derived-result'],
+}
+const invariantApplicable = (id: string, input: ConsistencyAuditInput, mode: AuditMode) => {
+  if (mode === 'RAPIDA' && ['INV-04', 'INV-05', 'INV-06', 'INV-12', 'INV-13'].includes(id)) return false
+  switch (id) {
+    case 'INV-01': case 'INV-02': return input.banks.length + input.statements.reduce((n, entry) => n + entry.statement.transactions.length, 0) > 0
+    case 'INV-03': case 'INV-09': return input.banks.length > 0
+    case 'INV-04': case 'INV-05': case 'INV-06': case 'INV-12': case 'INV-13': return input.statements.length > 0
+    case 'INV-07': case 'INV-14': return Boolean(input.activeDriveSourceIds?.length || input.currentDriveSourceIds?.length || input.sourceProvenance?.length || input.duplicateInvoiceSources?.length)
+    case 'INV-08': return Boolean(input.localDecisions.length + (input.remoteDecisions?.length ?? 0) + Object.keys(input.localTombstones ?? {}).length > 0 || input.currentBankItems?.length || input.currentCardMatches.length > 0)
+    case 'INV-10': return Boolean(input.bankSourceRows?.length || input.sourceProvenance?.length)
+    case 'INV-11': return Boolean(input.currentCardMatches.length || input.currentBankItems?.length || input.localDecisions.length || input.remoteDecisions?.length)
+    default: return false
+  }
+}
+export function evaluateInvariantExecutions(input: ConsistencyAuditInput, findings: AuditFinding[], mode = input.mode ?? 'PROFUNDA'): InvariantExecution[] {
+  const ids = ['INV-01', 'INV-02', 'INV-03', 'INV-04', 'INV-05', 'INV-06', 'INV-07', ...(mode === 'PROFUNDA' ? ['INV-08'] : []), 'INV-09', 'INV-10', 'INV-11', 'INV-12', 'INV-13', 'INV-14']
+  return ids.map((invariantId) => {
+    const sourcesRequired = invariantSources[invariantId] ?? []
+    const unavailable = input.auditInputSnapshot?.unavailableSources ?? []
+    const cardSubjects = input.statements.reduce((count, entry) => count + entry.statement.transactions.filter((transaction) => transaction.type === 'PURCHASE' && transaction.financialStatus !== 'REFUNDED').length, 0)
+    const observedUnavailable: string[] = []
+    if (input.banks.length > 0 && input.currentBankItems == null) observedUnavailable.push('currentBankResults')
+    if (cardSubjects > 0 && input.currentCardMatches.length < cardSubjects) observedUnavailable.push('currentCardResults')
+    const missingSources = sourcesRequired.filter((source) => observedUnavailable.includes(source) || unavailableAliases[source].some((alias) => unavailable.includes(alias)))
+    const mixed = input.auditInputSnapshot?.mixedRevisionSources ?? []
+    const revisionConflict = mixed.length > 0 && (mixed.some((source) => source.includes('decision') && sourcesRequired.includes('decisions') || source.includes('source') && (sourcesRequired.includes('bank') || sourcesRequired.includes('custosAno') || sourcesRequired.includes('cardStatements'))))
+    const available = sourcesRequired.filter((source) => !missingSources.includes(source))
+    const relatedFindings = findings.filter((finding) => finding.invariantId === invariantId)
+    const subjectsEvaluated = invariantId === 'INV-03' || invariantId === 'INV-09'
+      ? input.banks.length
+      : ['INV-04', 'INV-05', 'INV-06', 'INV-12', 'INV-13'].includes(invariantId)
+        ? input.statements.reduce((n, entry) => n + entry.statement.transactions.length, 0)
+        : invariantId === 'INV-07' || invariantId === 'INV-10' || invariantId === 'INV-14'
+          ? input.sourceProvenance?.length ?? input.activeDriveSourceIds?.length ?? 0
+          : input.currentBankItems?.length ?? input.currentCardMatches.length
+    const applicable = invariantApplicable(invariantId, input, mode)
+    const status: InvariantExecutionStatus = !applicable ? 'NOT_APPLICABLE'
+      : revisionConflict ? 'SKIPPED_DUE_TO_REVISION'
+        : missingSources.length ? 'UNAVAILABLE'
+          : relatedFindings.some((finding) => finding.severity === 'CRITICAL' || finding.severity === 'REVIEW') ? 'EXECUTED_FAIL'
+            : 'EXECUTED_PASS'
+    const reason = status === 'NOT_APPLICABLE' ? 'Não há subjects/fontes para executar esta verificação.'
+      : status === 'SKIPPED_DUE_TO_REVISION' ? `Fontes não comparáveis nesta execução: ${mixed.join(', ')}.`
+        : status === 'UNAVAILABLE' ? `Fonte(s) necessária(s) indisponível(is): ${missingSources.join(', ')}.` : undefined
+    return { invariantId, status, subjectsEvaluated, sourcesRequired, sourcesAvailable: available, ...(reason ? { reason } : {}), findingIds: relatedFindings.map((finding) => finding.id) }
+  })
 }
 
 const invariantByCode: Partial<Record<AuditCode, string>> = {
   DOUBLE_CLAIM: 'INV-01', DOUBLE_CLAIM_AFTER_CONFIRMATION: 'INV-02', ORPHANED_SHEET_REFERENCE: 'INV-02', EDITED_SHEET_REFERENCE: 'INV-02',
   MISSING_COM_CANDIDATO: 'INV-03', MISSING_WITH_STRONG_CANDIDATE: 'INV-03', ASSIGNMENT_CONFLICT: 'INV-03', REVIEW_WITHOUT_CANDIDATES: 'INV-03', EXPECTED_MANUAL_RESERVATION: 'INV-08', MULTIPLE_INCOMPATIBLE_ACTIVE_DECISIONS: 'INV-08', RESERVED_SHEET_ROW_REUSED: 'INV-08',
   MISSING_ACTION_INCONSISTENCY: 'INV-04', CARD_PAYMENT_AS_EXPENSE_MISSING: 'INV-05', REFUNDED_BUT_MISSING: 'INV-06', STALE_ACTIVE_SOURCE: 'INV-07',
-  DERIVED_STATE_MISMATCH: 'INV-08', MATCHED_WITHOUT_LINK: 'INV-08', MATCHED_BUT_STILL_REVIEW: 'INV-11', VALID_MANUAL_MATCH_NOT_APPLIED: 'INV-11', MISSING_COUNT_DIVERGENCE: 'INV-09', DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS: 'INV-10',
+  DERIVED_STATE_MISMATCH: 'INV-08', MATCHED_WITHOUT_LINK: 'INV-08', VALID_MANUAL_MATCH_NOT_APPLIED: 'INV-11', VALID_BANK_MANUAL_MATCH_NOT_APPLIED: 'INV-11', PAIR_CONFIRMED_ASSIGNMENT_CONFLICT: 'INV-08', INVALID_DECISION_APPLIED: 'INV-08', STALE_DECISION_RESULT: 'INV-11', MISSING_COUNT_DIVERGENCE: 'INV-09', DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS: 'INV-10',
   INVOICE_TOTAL_MISMATCH: 'INV-13', CARD_SUBTOTAL_MISMATCH: 'INV-13', REFUND_NET_MISMATCH: 'INV-06', RESOLVED_SOURCE_OVERLAP: 'INV-10',
   CARD_MISSING_NO_CANDIDATE: 'INV-12', DUPLICATE_PRESENT_BUT_MARKED_MISSING: 'INV-14',
   ACTIVE_ENTITY_WITHOUT_SOURCE: 'INV-07', SOURCE_POINTS_TO_MISSING_ENTITY: 'INV-07',
@@ -168,14 +251,43 @@ const explanationFor = (finding: RawAuditFinding): AuditExplanationSource => {
 function enrichFinding(finding: RawAuditFinding): AuditFinding {
   const message = describeAuditFinding(finding as AuditFinding)
   const explanationSource = finding.explanationSource ?? explanationFor(finding)
-  const status: AuditFinding['status'] = finding.status ?? (finding.code === 'LEGACY_FINGERPRINT_MATCH' ? 'LEGACY' : finding.code === 'ORPHANED_SHEET_REFERENCE' && finding.severity === 'INFO' || finding.code === 'EDITED_SHEET_REFERENCE' && finding.severity === 'INFO' ? 'MAINTENANCE' : explanationSource !== 'NONE' && finding.severity === 'INFO' ? 'EXPECTED' : 'ACTIVE')
+  const status: AuditFinding['status'] = finding.status ?? (AUDIT_CODE_LIFECYCLE[finding.code] === 'legacy' || finding.code === 'LEGACY_FINGERPRINT_MATCH' ? 'LEGACY' : finding.code === 'ORPHANED_SHEET_REFERENCE' && finding.severity === 'INFO' || finding.code === 'EDITED_SHEET_REFERENCE' && finding.severity === 'INFO' ? 'MAINTENANCE' : explanationSource !== 'NONE' && finding.severity === 'INFO' ? 'EXPECTED' : 'ACTIVE')
   const category = finding.category ?? categoryForCode(finding.code)
   const invariantId = finding.invariantId ?? invariantByCode[finding.code] ?? (category === 'SOURCE' ? 'INV-07' : category === 'IDENTITY' ? 'INV-14' : category === 'FINANCIAL' ? 'INV-13' : category === 'DECISION' ? 'INV-08' : 'INV-03')
   const technical = finding.technical ?? {}
   const currentState = finding.currentState ?? (finding.item?.current?.status ?? (typeof technical.currentStatus === 'string' ? technical.currentStatus : typeof technical.status === 'string' ? technical.status : undefined))
   const pureState = finding.pureState ?? (finding.item?.pure?.status ?? (typeof technical.pure === 'string' ? technical.pure : undefined))
-  const expectedState = finding.expectedState ?? (typeof technical.expectedState === 'string' ? technical.expectedState : pureState)
-  return { ...finding, category, invariantId, diagnosis: finding.diagnosis ?? finding.detail, whyItMatters: finding.whyItMatters ?? message.impact, recommendedAction: finding.recommendedAction ?? message.recommendedAction, diagnosticConfidence: finding.diagnosticConfidence ?? (/DOUBLE_CLAIM|MATCHED_BUT_STILL_REVIEW|VALID_MANUAL_MATCH_NOT_APPLIED/.test(finding.code) ? 'HIGH' : /LEGACY|DUPLICATE|DIVERGENCE|CANDIDATE/.test(finding.code) ? 'MEDIUM' : 'HIGH'), safeAutomaticAction: finding.safeAutomaticAction ?? (finding.code === 'REVIEW_WITHOUT_CANDIDATES'), ...(finding.automaticActionType ? { automaticActionType: finding.automaticActionType } : finding.code === 'REVIEW_WITHOUT_CANDIDATES' ? { automaticActionType: 'RECALCULATE_ITEM' } : {}), status, ...(currentState ? { currentState } : {}), ...(expectedState ? { expectedState } : {}), ...(pureState ? { pureState } : {}), explanationSource }
+  const expectedState = finding.expectedState ?? finding.item?.expectedState?.status ?? (finding.code.includes('REFUND') && finding.code.includes('MISSING') ? 'REFUNDED' : typeof technical.expectedState === 'string' ? technical.expectedState : typeof technical.expectedStatus === 'string' ? technical.expectedStatus : currentState)
+  const subject = finding.item?.fingerprint ?? String(technical.subjectFingerprint ?? technical.transactionId ?? technical.bankTransactionId ?? technical.decisionKey ?? finding.id)
+  const target = String((technical.row as Record<string, unknown> | undefined)?.sheetIdentity ?? (technical.row as Record<string, unknown> | undefined)?.id ?? (technical.sheet as Record<string, unknown> | undefined)?.sheetRecordId ?? '')
+  const rootCauseCode = finding.rootCauseCode ?? (['ASSIGNMENT_CONFLICT', 'UNUSED_STRONG_CANDIDATE', 'MISSING_COM_CANDIDATO', 'MISSING_WITH_STRONG_CANDIDATE', 'MISSING_ACTION_INCONSISTENCY'].includes(finding.code) ? 'RECONCILIATION_ASSIGNMENT' : ['DOUBLE_CLAIM', 'DOUBLE_CLAIM_AFTER_CONFIRMATION', 'RESERVED_SHEET_ROW_REUSED'].includes(finding.code) ? 'SHEET_ROW_MULTIPLE_OWNERS' : finding.code)
+  const rootCauseKey = finding.rootCauseKey ?? `${rootCauseCode}:${target || subject}`
+  const role = finding.role ?? (status === 'EXPECTED' ? 'EXPECTED' : finding.severity === 'INFO' ? 'INFO' : finding.code === 'ASSIGNMENT_CONFLICT' || finding.code === 'UNUSED_STRONG_CANDIDATE' ? 'RELATED' : 'PRIMARY')
+  const validDecision = technical.validManualConfirmation === true || technical.validity === 'VALID_GLOBALLY' || String(technical.decisionStatus ?? '').startsWith('VALID')
+  const evidenceCount = Object.keys(technical).filter((key) => !['message', 'reason', 'status'].includes(key)).length
+  const revisionComparable = !['STALE', 'MIXED_REVISION'].includes(finding.item?.statement ? String((technical.auditSnapshot as Record<string, unknown> | undefined)?.state ?? '') : '')
+    && !['STALE', 'MIXED_REVISION'].includes(String((technical.auditSnapshot as Record<string, unknown> | undefined)?.state ?? ''))
+  const sourceCoverage = String((technical.auditSnapshot as Record<string, unknown> | undefined)?.state ?? 'SNAPSHOT_NOT_ATTACHED')
+  const confidenceEvidence: AuditFinding['confidenceEvidence'] = finding.confidenceEvidence ?? {
+    identityQuality: finding.item || target || technical.decision ? 'CANONICAL' : Object.keys(technical).length ? 'HEURISTIC' : 'INCOMPLETE',
+    sourceCoverage, revisionComparable, evidenceCount, validDecision,
+    targetCanonical: Boolean(target || (finding.item?.current?.sheet?.sheetRecordId ?? finding.item?.current?.sheet?.id)),
+  }
+  const confidence = calculateDiagnosticConfidence(confidenceEvidence)
+  const impact = finding.impact ?? finding.whyItMatters ?? message.impact
+  const explanationChain = finding.explanationChain ?? finding.item?.explanationChain ?? (() => {
+    if (!expectedState && !pureState) return undefined
+    const chain: ExpectedStateExplanationStep[] = []
+    if (pureState) chain.push({ stage: 'PURE_MATCHING', outcome: pureState })
+    const decision = technical.decision as PersistedDecision | undefined
+    if (decision || technical.validManualConfirmation === true || finding.code === 'EXPECTED_MANUAL_REJECTION') chain.push({ stage: 'DECISION', outcome: finding.code === 'EXPECTED_MANUAL_REJECTION' ? 'rejeição manual válida aplicada' : 'decisão considerada', ...(decision ? { decisionId: stableFingerprint([decision.key]) } : {}) })
+    if (finding.code === 'EXPECTED_MANUAL_RESERVATION' || finding.code === 'ASSIGNMENT_CONFLICT' || finding.code === 'RESERVED_SHEET_ROW_REUSED') chain.push({ stage: 'RESERVATION', outcome: 'linha reservada por outro owner' })
+    if (finding.code === 'EXPECTED_GROUP_RESOLUTION' || technical.pipeline) chain.push({ stage: 'GROUP_MATCHING', outcome: String(expectedState ?? 'resolvido em grupo') })
+    if (finding.code.includes('REFUND')) chain.push({ stage: 'REFUND', outcome: 'crédito/estorno aplicado uma vez' })
+    if (expectedState) chain.push({ stage: 'FINAL_ASSIGNMENT', outcome: expectedState })
+    return chain
+  })()
+  return { ...finding, category, invariantId, diagnosis: finding.diagnosis ?? finding.detail, whyItMatters: impact, impact, recommendedAction: finding.recommendedAction ?? message.recommendedAction, diagnosticConfidence: confidence, confidenceEvidence, role, rootCauseCode, rootCauseKey, ...(explanationChain ? { explanationChain } : {}), safeAutomaticAction: finding.safeAutomaticAction ?? (finding.code === 'REVIEW_WITHOUT_CANDIDATES'), ...(finding.automaticActionType ? { automaticActionType: finding.automaticActionType } : finding.code === 'REVIEW_WITHOUT_CANDIDATES' ? { automaticActionType: 'RECALCULATE_ITEM' } : {}), status, ...(currentState ? { currentState } : {}), ...(expectedState ? { expectedState } : {}), ...(pureState ? { pureState } : {}), explanationSource }
 }
 
 const cardStateCodes = new Set<AuditCode>(['MISSING_COM_CANDIDATO', 'CARD_MISSING_NO_CANDIDATE', 'DERIVED_STATE_MISMATCH', 'PREWRITE_MATCH_MISMATCH', 'STALE_MISSING_DECISION', 'ORPHANED_SHEET_REFERENCE', 'EDITED_SHEET_REFERENCE', 'CURRENT_SOURCE_DIVERGENCE', 'REJECTED_CANDIDATE_FILTERED'])
@@ -188,12 +300,76 @@ export function deduplicateAuditFindings(findings: RawAuditFinding[]): RawAuditF
     const priority: Record<AuditSeverity, number> = { CRITICAL: 5, REVIEW: 4, INFO: 1 }
     const primary = priority[finding.severity] > priority[previous.severity] ? finding : previous
     const related = [
-      ...(previous.relatedFindings ?? []), { code: previous.code, title: previous.title, detail: previous.detail, ...(previous.technical ? { technical: previous.technical } : {}) },
-      ...(finding.relatedFindings ?? []), { code: finding.code, title: finding.title, detail: finding.detail, ...(finding.technical ? { technical: finding.technical } : {}) },
+      ...(previous.relatedFindings ?? []), { code: previous.code, title: previous.title, detail: previous.detail, impact: previous.impact ?? previous.whyItMatters, ...(previous.technical ? { technical: previous.technical } : {}) },
+      ...(finding.relatedFindings ?? []), { code: finding.code, title: finding.title, detail: finding.detail, impact: finding.impact ?? finding.whyItMatters, ...(finding.technical ? { technical: finding.technical } : {}) },
     ].filter((entry, index, all) => all.findIndex((candidate) => candidate.code === entry.code && candidate.detail === entry.detail) === index)
     output.set(key, { ...primary, relatedFindings: related })
   }
   return [...output.values()]
+}
+
+function groupPrimaryFindings(findings: AuditFinding[]): AuditFinding[] {
+  const grouped = new Map<string, AuditFinding>()
+  const passthrough: AuditFinding[] = []
+  const relatedItems: AuditFinding[] = []
+  for (const finding of findings) {
+    if (finding.role === 'RELATED') { relatedItems.push(finding); continue }
+    if (finding.role !== 'PRIMARY') { passthrough.push(finding); continue }
+    const rootKey = finding.rootCauseKey ?? `${finding.code}:${finding.id}`
+    const previous = grouped.get(rootKey)
+    if (!previous) { grouped.set(rootKey, finding); continue }
+    const priority: Record<AuditSeverity, number> = { CRITICAL: 3, REVIEW: 2, INFO: 1 }
+    const primary = priority[finding.severity] > priority[previous.severity] ? finding : previous
+    const sibling = primary.id === finding.id ? previous : finding
+    const related = [...(primary.relatedFindings ?? []), ...(sibling.relatedFindings ?? []), { id: sibling.id, code: sibling.code, title: sibling.title, detail: sibling.detail, impact: sibling.impact ?? sibling.whyItMatters, technical: sibling.technical, role: 'RELATED' as const, rootCauseKey: sibling.rootCauseKey }]
+      .filter((entry, index, all) => all.findIndex((candidate) => candidate.id === entry.id || candidate.code === entry.code && candidate.detail === entry.detail) === index)
+    grouped.set(rootKey, { ...primary, relatedFindings: related })
+  }
+  for (const relatedFinding of relatedItems) {
+    const primary = grouped.get(relatedFinding.rootCauseKey ?? '')
+    if (!primary) { passthrough.push(relatedFinding); continue }
+    const related = [...(primary.relatedFindings ?? []), { id: relatedFinding.id, code: relatedFinding.code, title: relatedFinding.title, detail: relatedFinding.detail, impact: relatedFinding.impact ?? relatedFinding.whyItMatters, technical: relatedFinding.technical, role: 'RELATED' as const, rootCauseKey: relatedFinding.rootCauseKey }]
+      .filter((entry, index, all) => all.findIndex((candidate) => candidate.id === entry.id) === index)
+    grouped.set(relatedFinding.rootCauseKey!, { ...primary, relatedFindings: related })
+  }
+  return [...grouped.values(), ...passthrough]
+}
+
+export function runAuditSelfChecks(input: { items: AuditedCardItem[]; expectedStates?: Record<string, ReturnType<typeof deriveExpectedReconciliationState>>; findings: AuditFinding[]; decisions: PersistedDecision[]; snapshot?: AuditInputSnapshot }): AuditSelfCheck[] {
+  const checks: AuditSelfCheck[] = []
+  const candidateMismatches = input.findings.filter((finding) => {
+    const technical = finding.technical ?? {}
+    const evaluations = Array.isArray(technical.candidateEvaluations) ? technical.candidateEvaluations : null
+    const relevant = typeof technical.candidateCountRelevant === 'number' ? technical.candidateCountRelevant : null
+    return evaluations && relevant != null && evaluations.length < relevant && !evaluations.some((entry) => (entry as Record<string, unknown>).disposition === 'SOURCE_ROW_CHANGED' || (entry as Record<string, unknown>).disposition === 'NOT_IN_CURRENT_MATCHING_PIPELINE')
+  })
+  checks.push({ checkId: 'CANDIDATE_COUNT_TRACE', status: candidateMismatches.length ? 'FAIL' : 'PASS', findingIds: candidateMismatches.map((finding) => finding.id), ...(candidateMismatches.length ? { detail: 'candidateCountRelevant excede as avaliações e não há motivo de divergência registrado.' } : {}) })
+  const hasSubstantiveEvidence = (technical: Record<string, unknown> | undefined) => Object.entries(technical ?? {}).some(([key, value]) => !['message', 'reason', 'status'].includes(key) && value != null && value !== '' && (!Array.isArray(value) || value.length > 0) && (typeof value !== 'object' || Array.isArray(value) || Object.keys(value as object).length > 0))
+  const weakCritical = input.findings.filter((finding) => finding.severity === 'CRITICAL' && !finding.item && !hasSubstantiveEvidence(finding.technical))
+  checks.push({ checkId: 'CRITICAL_EVIDENCE', status: weakCritical.length ? 'FAIL' : 'PASS', findingIds: weakCritical.map((finding) => finding.id), ...(weakCritical.length ? { detail: 'Finding crítico sem item ou evidência técnica.' } : {}) })
+  const knownDecisionRefs = new Set(input.decisions.flatMap((decision) => [decision.key, stableFingerprint([decision.key])]))
+  const snapshotKeys = input.snapshot?.sourceIdentities.decisions ?? []
+  snapshotKeys.forEach((key) => { knownDecisionRefs.add(key); if (!key.endsWith(':DELETED')) knownDecisionRefs.add(stableFingerprint([key])) })
+  const collectDecisionRefs = (value: unknown, path: string[] = []): string[] => {
+    if (Array.isArray(value)) return value.flatMap((nested) => collectDecisionRefs(nested, path))
+    if (!value || typeof value !== 'object') return []
+    const record = value as Record<string, unknown>
+    const refs = [record.decisionKey, record.decisionId, record.kind && record.key || path.includes('decision') && record.key ? record.key : null].filter((item): item is string => typeof item === 'string')
+    return [...refs, ...Object.entries(record).filter(([key]) => key !== 'decisionKey' && key !== 'decisionId').flatMap(([key, nested]) => collectDecisionRefs(nested, [...path, key.toLocaleLowerCase('en-US')]))]
+  }
+  const unknownDecisionRefs = input.findings.filter((finding) => collectDecisionRefs(finding.technical).some((key) => !knownDecisionRefs.has(key)))
+  checks.push({ checkId: 'DECISION_REFERENCE_IN_SNAPSHOT', status: unknownDecisionRefs.length ? 'FAIL' : 'PASS', findingIds: unknownDecisionRefs.map((finding) => finding.id), ...(unknownDecisionRefs.length ? { detail: 'Finding referencia decisão ausente do snapshot congelado.' } : {}) })
+  const chainMismatches = [
+    ...input.items.filter((item) => item.explanationChain.length > 0 && item.explanationChain[item.explanationChain.length - 1].outcome !== item.expectedState?.status).map((item) => item.fingerprint),
+    ...Object.values(input.expectedStates ?? {}).filter((subject) => subject.explanationChain.length > 0 && subject.explanationChain[subject.explanationChain.length - 1].outcome !== subject.expectedState).map((subject) => subject.subjectId),
+  ]
+  checks.push({ checkId: 'EXPECTED_STATE_EXPLANATION', status: chainMismatches.length ? 'FAIL' : 'PASS', findingIds: chainMismatches, ...(chainMismatches.length ? { detail: 'O último passo da explanationChain não deriva o estado esperado do subject.' } : {}) })
+  const primaryKeys = input.findings.filter((finding) => finding.role === 'PRIMARY').map((finding) => finding.rootCauseKey ?? `${finding.code}:${finding.id}`)
+  const duplicateRoots = primaryKeys.filter((key, index) => primaryKeys.indexOf(key) !== index)
+  checks.push({ checkId: 'UNIQUE_PRIMARY_ROOT_CAUSE', status: duplicateRoots.length ? 'FAIL' : 'PASS', findingIds: input.findings.filter((finding) => duplicateRoots.includes(finding.rootCauseKey ?? `${finding.code}:${finding.id}`)).map((finding) => finding.id), ...(duplicateRoots.length ? { detail: 'A mesma causa raiz foi apresentada em mais de um finding primário.' } : {}) })
+  const orphanRelated = input.findings.filter((finding) => finding.role === 'RELATED' && !finding.primaryFindingId && !input.findings.some((primary) => primary.role === 'PRIMARY' && primary.rootCauseKey === finding.rootCauseKey))
+  checks.push({ checkId: 'RELATED_FINDING_HAS_PRIMARY', status: orphanRelated.length ? 'FAIL' : 'PASS', findingIds: orphanRelated.map((finding) => finding.id), ...(orphanRelated.length ? { detail: 'Finding relacionado não possui finding primário para sua causa raiz.' } : {}) })
+  return checks
 }
 
 export type AuditFilter = 'ALL' | 'CRITICAL' | 'REVIEW' | 'LEGACY' | 'HIDDEN'
@@ -253,6 +429,8 @@ export function recomputeWithoutPersistedDecisions(input: Pick<ConsistencyAuditI
 }
 
 export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAuditResult {
+  const auditStartedAt = performance.now()
+  let expectedStateDerivationMs = 0
   const mode = input.mode ?? 'PROFUNDA'
   const pure = mode === 'PROFUNDA' ? recomputeWithoutPersistedDecisions(input) : new Map<string, CardStatementMatch>()
   const decisionContext = { banks: input.banks, sheets: input.sheets, statements: input.statements }
@@ -260,6 +438,9 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
   const effectiveDecisions = mergeAudit.effective.filter((item) => item.state === 'ACTIVE')
   const allDecisions = effectiveDecisions.map((item) => item.decision)
   const validated = auditPersistedDecisions(allDecisions, decisionContext)
+  const validRejectedDecisions = new Map(validated
+    .filter((item) => item.decision.kind === 'PAIR_REJECTED' && item.status === 'VALID' && !mergeAudit.conflicts.some((conflict) => conflict.key === item.decision.key))
+    .map((item) => [item.decision.key, item.decision]))
   const statementAssignments = resolveStatementMatchAssignments(allDecisions, input.statements, input.sheets)
   const manualAssignmentConflicts = conflictingStatementAssignments(statementAssignments)
   const validManualReservations = statementAssignments.filter((assignment) =>
@@ -269,6 +450,11 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
   const currentMap = new Map(input.currentCardMatches.map(({ statementIdentity, transactionId, match }) => [`${statementIdentity}\u001f${transactionId}`, match]))
   const items: AuditedCardItem[] = []
   const findings: RawAuditFinding[] = []
+  if (input.currentDecisionRevision != null && input.derivedDecisionRevision != null && input.currentDecisionRevision !== input.derivedDecisionRevision) findings.push({
+    id: `STALE_DECISION_RESULT:${input.derivedDecisionRevision}`, code: 'STALE_DECISION_RESULT', severity: 'CRITICAL', category: 'STATE', invariantId: 'INV-11',
+    title: 'O estado derivado está atrasado em relação às decisões', detail: 'Os resultados exibidos foram calculados com uma revisão diferente do conjunto efetivo de decisões.',
+    technical: { currentDecisionRevision: input.currentDecisionRevision, derivedDecisionRevision: input.derivedDecisionRevision },
+  })
   for (const [rowKey, assignments] of manualAssignmentConflicts) {
     const row = assignments[0].row
     findings.push({
@@ -342,14 +528,175 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
       break
     }
   }
+  const validBankAssignments = allDecisions.filter((decision) => decision.kind === 'PAIR_CONFIRMED'
+    && validated.find((item) => item.decision.key === decision.key)?.status === 'VALID'
+    && !mergeAudit.conflicts.some((conflict) => conflict.key === decision.key))
+    .flatMap((decision) => {
+      const bank = input.banks.find((item) => bankIdentity(item) === decision.identities[0])
+      const row = input.sheets.find((item) => sheetIdentity(item) === decision.selected[0])
+      return bank && row ? [{ decision, bank, row }] : []
+    })
+  const bankAssignmentsByRow = new Map<string, typeof validBankAssignments>()
+  for (const assignment of validBankAssignments) {
+    const key = sheetIdentity(assignment.row), records = bankAssignmentsByRow.get(key) ?? []
+    records.push(assignment); bankAssignmentsByRow.set(key, records)
+  }
+  const conflictingBankRows = new Set<string>()
+  for (const [rowKey, assignments] of bankAssignmentsByRow) {
+    const owners = [...new Set(assignments.map(({ bank }) => bank.id))]
+    if (owners.length < 2) continue
+    conflictingBankRows.add(rowKey)
+    findings.push({
+      id: `PAIR_CONFIRMED_ASSIGNMENT_CONFLICT:${rowKey}`, code: 'PAIR_CONFIRMED_ASSIGNMENT_CONFLICT', severity: 'CRITICAL', category: 'DECISION', invariantId: 'INV-08',
+      title: 'Confirmações bancárias incompatíveis usam a mesma linha',
+      detail: `${assignments[0].row.originalDescription} (${assignments[0].row.date}) foi confirmada para ${owners.length} movimentações bancárias diferentes. Nenhuma foi escolhida pela ordem de leitura.`,
+      diagnosis: 'Mais de uma confirmação bancária ativa reivindica a mesma linha da CUSTOS ANO.',
+      whyItMatters: 'Uma linha não pode ter dois owners bancários incompatíveis.', recommendedAction: 'Revise as confirmações e mantenha somente o vínculo correto.',
+      diagnosticConfidence: 'HIGH', safeAutomaticAction: false, status: 'ACTIVE', explanationSource: 'ASSIGNMENT',
+      technical: { sheetRecordId: assignments[0].row.sheetRecordId, rowIdentity: rowKey, row: { id: assignments[0].row.sheetRecordId || assignments[0].row.id, description: assignments[0].row.originalDescription, date: assignments[0].row.date, amount: assignments[0].row.amount, paymentMethod: assignments[0].row.paymentMethod }, assignments: assignments.map(({ decision, bank }) => ({ decisionId: stableFingerprint([decision.key]), decisionKey: decision.key, bankId: bank.id, bankIdentity: bankIdentity(bank), bankTransactionId: bank.bankTransactionId, counterpartyName: bank.counterpartyName, description: bank.originalDescription, date: bank.date, amount: bank.amount, updatedAt: decision.updatedAt, selected: decision.selected })) },
+    })
+  }
+  const validPairRejections = allDecisions.filter((decision) => decision.kind === 'PAIR_REJECTED' && validated.find((item) => item.decision.key === decision.key)?.status === 'VALID' && !mergeAudit.conflicts.some((conflict) => conflict.key === decision.key))
+  const rejectedPairKeys = new Set<string>(), rejectedPairDecisionKeys = new Map<string, string>()
+  for (const decision of validPairRejections) {
+    const bank = input.banks.find((item) => bankIdentity(item) === decision.identities[0] || item.id === decision.identities[0])
+    const row = input.sheets.find((item) => sheetIdentity(item) === decision.identities[1] || item.id === decision.identities[1] || item.sheetRecordId === decision.identities[1])
+    if (bank && row) { const key = pairKey(bank.id, row.id); rejectedPairKeys.add(key); rejectedPairDecisionKeys.set(key, decision.key) }
+  }
+  const ignoredBankIds = new Set(allDecisions.filter((decision) => decision.kind === 'BANK_IGNORED' && validated.find((item) => item.decision.key === decision.key)?.status === 'VALID').flatMap((decision) => {
+    const bank = input.banks.find((item) => bankIdentity(item) === decision.identities[0] || item.id === decision.identities[0])
+    return bank ? [bank.id] : []
+  }))
+  const confirmedPairs = new Map(validBankAssignments.filter((assignment) => !conflictingBankRows.has(sheetIdentity(assignment.row))).map(({ bank, row }) => [bank.id, row.id]))
+  for (const decision of allDecisions.filter((item) => item.kind === 'MISSING_ADDED_TO_SHEET' && validated.find((audit) => audit.decision.key === item.key)?.status === 'VALID')) {
+    const bank = input.banks.find((item) => bankIdentity(item) === decision.identities[0])
+    const row = input.sheets.find((item) => sheetIdentity(item) === decision.selected[0])
+    if (bank && row) confirmedPairs.set(bank.id, row.id)
+  }
+  const confirmedCompositions = new Map(allDecisions.filter((decision) => decision.kind === 'COMPOSITION_CONFIRMED' && validated.find((item) => item.decision.key === decision.key)?.status === 'VALID').flatMap((decision) => {
+    const bank = input.banks.find((item) => bankIdentity(item) === decision.identities[0])
+    const rows = decision.selected.map((identity) => input.sheets.find((item) => sheetIdentity(item) === identity)).filter((row): row is LedgerTransaction => Boolean(row))
+    return bank && rows.length === decision.selected.length ? [[bank.id, rows.map((row) => row.id)] as const] : []
+  }))
+  const identifiedCardPaymentIds = new Set(input.banks.filter((bank) => bank.type === 'CARD_PAYMENT' || input.currentBankItems?.some((item) => item.bank.id === bank.id && item.status === 'CARD_PAYMENT_IDENTIFIED')).map((bank) => bank.id))
+  const pureBankStates = new Map(reconcile(input.banks, input.sheets).items.map((item) => [item.bank.id, item]))
+  const canonicalBankResult = reconcile(input.banks, input.sheets, {
+    rejectedPairKeys, rejectedPairDecisionKeys, ignoredBankIds,
+    confirmedPairs, confirmedCompositions, identifiedCardPaymentIds,
+    conflictingConfirmedSheetIds: new Set([...conflictingBankRows].flatMap((rowKey) => input.sheets.filter((row) => sheetIdentity(row) === rowKey).map((row) => row.id))),
+  })
+  const expectedBankStartedAt = performance.now()
+  const expectedBankStates = Object.fromEntries(input.banks.map((bank) => {
+    const pureItem = pureBankStates.get(bank.id), expectedItem = canonicalBankResult.items.find((item) => item.bank.id === bank.id)
+    const currentItem = input.currentBankItems?.find((item) => item.bank.id === bank.id)
+    const manual = validBankAssignments.find((assignment) => assignment.bank.id === bank.id && !conflictingBankRows.has(sheetIdentity(assignment.row)))
+    const rejected = validPairRejections.find((decision) => decision.identities[0] === bankIdentity(bank) || decision.identities[0] === bank.id)
+    const reservation = expectedItem?.status === 'REVIEW' && expectedItem.reviewReason === 'ASSIGNMENT_CONFLICT' && expectedItem.assignmentConflictOwnerBankId
+      ? { subjectId: expectedItem.assignmentConflictOwnerBankId, targetId: expectedItem.sheet?.sheetRecordId || expectedItem.sheet?.id || '', decisionId: stableFingerprint([expectedItem.assignmentConflictOwnerBankId]) }
+      : undefined
+    return [bankIdentity(bank), deriveExpectedReconciliationState({
+      subjectId: bankIdentity(bank), pureState: pureItem?.status ?? 'UNAVAILABLE', currentState: currentItem?.status ?? 'UNAVAILABLE',
+      canonicalExpectedState: expectedItem?.status ?? 'UNAVAILABLE',
+      canonicalEvidence: expectedItem?.sheet ? [expectedItem.sheet.sheetRecordId || expectedItem.sheet.id] : expectedItem?.candidateSheets?.map((row) => row.sheetRecordId || row.id),
+      ...(manual ? { validManualAssignment: { decisionId: stableFingerprint([manual.decision.key]), targetId: manual.row.sheetRecordId || manual.row.id, outcome: 'MATCHED' } } : {}),
+      ...(rejected && expectedItem ? { validRejection: { decisionId: stableFingerprint([rejected.key]), outcome: expectedItem.status } } : {}),
+      ...(reservation ? { reservationOwner: reservation } : {}),
+    })]
+  }))
+  expectedStateDerivationMs += performance.now() - expectedBankStartedAt
+  for (const { decision, bank, row } of validBankAssignments) {
+    const rowKey = sheetIdentity(row)
+    if (conflictingBankRows.has(rowKey)) continue
+    const current = input.currentBankItems?.find((item) => item.bank.id === bank.id)
+    const applied = current?.status === 'MATCHED' && current.sheet != null && sheetIdentity(current.sheet) === rowKey
+    if (!applied) findings.push({
+      id: `VALID_BANK_MANUAL_MATCH_NOT_APPLIED:${decision.key}`, code: 'VALID_BANK_MANUAL_MATCH_NOT_APPLIED', severity: 'CRITICAL',
+      title: 'Confirmação bancária válida não foi aplicada', detail: 'Existe um PAIR_CONFIRMED válido, mas o resultado atual não mostra o vínculo confirmado.',
+      technical: { decision, bank, selected: decision.selected[0], sheetRecordId: row.sheetRecordId, currentStatus: current?.status ?? 'UNAVAILABLE', currentSheetRecordId: current?.sheet ? sheetIdentity(current.sheet) : null },
+    })
+  }
+  for (const application of input.appliedDecisions ?? []) {
+    const audit = validated.find((item) => item.decision.key === application.decisionKey)
+    if (!audit || audit.status === 'VALID') continue
+    findings.push({ id: `INVALID_DECISION_APPLIED:${application.decisionKey}`, code: 'INVALID_DECISION_APPLIED', severity: 'CRITICAL', title: 'Decisão inválida influenciou o resultado', detail: `Uma decisão classificada como ${audit.status} foi aplicada ao domínio ${application.appliedDomain}.`, technical: { decision: audit.decision, decisionStatus: audit.status, appliedDomain: application.appliedDomain } })
+  }
   for (const item of input.currentBankItems ?? []) {
     if (item.status === 'MATCHED' && !item.sheet && !item.candidate && !item.composition?.length) findings.push({ id: `MATCHED_WITHOUT_LINK:${item.bank.id}`, code: 'MATCHED_WITHOUT_LINK', severity: 'CRITICAL', title: 'Movimentação conciliada sem vínculo visível', detail: 'O estado está como MATCHED, mas não há lançamento, candidata ou composição associados.', technical: { bank: item.bank, status: item.status } })
-    if (item.status === 'REVIEW' && !item.candidate) findings.push({ id: `REVIEW_WITHOUT_CANDIDATES:${item.bank.id}`, code: 'REVIEW_WITHOUT_CANDIDATES', severity: 'REVIEW', title: 'Movimentação em revisão sem candidato da planilha', detail: 'O resultado atual não apresenta um candidato de CUSTOS ANO para esta movimentação. O motivo técnico explica se existe outro conflito que justifique a revisão.', technical: { bank: item.bank, status: item.status, candidateCount: 0, reviewReason: item.reviewReason ?? null } })
+    if (item.status === 'REVIEW' && !item.candidate && !item.candidateSheets?.length) findings.push({ id: `REVIEW_WITHOUT_CANDIDATES:${item.bank.id}`, code: 'REVIEW_WITHOUT_CANDIDATES', severity: 'REVIEW', title: 'Movimentação em revisão sem candidato da planilha', detail: 'O resultado atual não apresenta um candidato de CUSTOS ANO para esta movimentação. O motivo técnico explica se existe outro conflito que justifique a revisão.', technical: { bank: item.bank, status: item.status, candidateCount: 0, reviewReason: item.reviewReason ?? null } })
     if (item.status === 'REVIEW' && item.reviewReason === 'ASSIGNMENT_CONFLICT' && item.candidate) findings.push({ id: `ASSIGNMENT_CONFLICT:${item.bank.id}`, code: 'ASSIGNMENT_CONFLICT', severity: 'REVIEW', title: 'Candidata reservada por outra movimentação', detail: `Há uma candidata concreta da CUSTOS ANO${item.sheet ? ` (${item.sheet.originalDescription}, ${item.sheet.date}, ${item.sheet.amount} centavos)` : ''}${item.assignmentConflictOwnerBankId ? `, atribuída na solução global à movimentação ${item.assignmentConflictOwnerBankId}` : ''}.`, technical: { bank: item.bank, status: item.status, candidateCount: 1, candidate: item.candidate, sheet: item.sheet, assignmentOwnerBankId: item.assignmentConflictOwnerBankId ?? null, reviewReason: item.reviewReason } })
     const semanticType = transactionType(item.bank.originalDescription, item.bank.paymentMethod)
     if (item.status === 'MISSING' && item.bank.direction === 'DEBIT' && item.bank.type === 'EXPENSE') {
       const candidates = findPlausibleLedgerCandidates(item.bank, input.sheets)
-      if (candidates.length) findings.push({ id: `MISSING_WITH_STRONG_CANDIDATE:${item.bank.id}`, code: 'MISSING_WITH_STRONG_CANDIDATE', severity: 'CRITICAL', title: 'Movimentação ausente possui candidato plausível', detail: `O estado atual é MISSING, mas ${candidates.length} linha(s) da CUSTOS ANO passam pelos critérios mínimos de matching.`, technical: { bank: item.bank, candidateRows: candidates.map((row) => ({ id: row.id, sheetRecordId: row.sheetRecordId, date: row.date, description: row.originalDescription, amount: row.amount })) } })
+      if (candidates.length) {
+        const pipeline = item.candidatePipeline ?? []
+        const evaluatedCandidates = candidates.map((row) => {
+          const evaluation = pipeline.find((entry) => sheetIdentity(entry.sheet) === sheetIdentity(row))
+          const sourceRowChanged = evaluation && (evaluation.sheet.date !== row.date || evaluation.sheet.amount !== row.amount
+            || evaluation.sheet.originalDescription !== row.originalDescription || evaluation.sheet.paymentMethod !== row.paymentMethod)
+          const rejection = evaluation?.decisionKey ? validRejectedDecisions.get(evaluation.decisionKey) : undefined
+          const pairHasConflictingConfirmation = rejection && allDecisions.some((decision) => decision.kind === 'PAIR_CONFIRMED'
+            && decision.identities[0] === rejection.identities[0]
+            && (decision.selected[0] === rejection.identities[1] || decision.selected[0] === row.id || decision.selected[0] === row.sheetRecordId))
+          return evaluation ? {
+            row: { id: row.id, sheetRecordId: row.sheetRecordId, date: row.date, description: row.originalDescription, amount: row.amount },
+            disposition: sourceRowChanged ? 'SOURCE_ROW_CHANGED' : evaluation.disposition,
+            reason: sourceRowChanged ? 'A linha mudou entre a fonte usada pelo conciliador e a releitura da auditoria; o resultado atual foi calculado com outra versão desta linha.' : evaluation.reason,
+            decisionKey: evaluation.decisionKey ?? null,
+            ownerBankId: evaluation.ownerBankId ?? null,
+            decisionValidity: rejection && !pairHasConflictingConfirmation ? 'VALID' : evaluation.disposition === 'REJECTED_BY_DECISION' ? 'INVALID_OR_UNVERIFIED' : null,
+            decision: rejection && !pairHasConflictingConfirmation ? rejection : null,
+          } : {
+            row: { id: row.id, sheetRecordId: row.sheetRecordId, date: row.date, description: row.originalDescription, amount: row.amount },
+            disposition: 'NOT_IN_CURRENT_MATCHING_PIPELINE',
+            reason: input.currentSheets?.some((currentRow) => sheetIdentity(currentRow) === sheetIdentity(row))
+              ? 'A linha existe nas fontes atual e auditada, mas não há avaliação anexada ao resultado atual; a trilha de matching está indisponível.'
+              : 'A candidata existe na fonte lida pela auditoria, mas não na cópia de CUSTOS ANO usada para calcular o resultado atual.',
+            decisionKey: null,
+            ownerBankId: null,
+            decisionValidity: null,
+            decision: null,
+          }
+        })
+        const rejected = evaluatedCandidates.filter((entry) => entry.disposition === 'REJECTED_BY_DECISION')
+        const expectedManualRejection = candidates.length > 0 && rejected.length === candidates.length
+          && evaluatedCandidates.every((entry) => entry.decisionValidity === 'VALID')
+        const reserved = evaluatedCandidates.filter((entry) => entry.disposition === 'RESERVED')
+        const sourceDivergence = evaluatedCandidates.filter((entry) => entry.disposition === 'NOT_IN_CURRENT_MATCHING_PIPELINE' || entry.disposition === 'SOURCE_ROW_CHANGED')
+        const pipelineStage = rejected.length === candidates.length ? 'DECISION_FILTERING / PAIR_REJECTED' : reserved.length ? 'RESERVATION / GLOBAL_ASSIGNMENT' : sourceDivergence.length ? 'SOURCE_OR_TRACE_DIVERGENCE' : 'FINAL_CANDIDATE_SET'
+        const technical = {
+            bank: item.bank,
+            candidateRows: candidates.map((row) => ({ id: row.id, sheetRecordId: row.sheetRecordId, date: row.date, description: row.originalDescription, amount: row.amount })),
+            candidateCountRelevant: candidates.length,
+            candidateCountEvaluated: evaluatedCandidates.filter((entry) => entry.disposition !== 'NOT_IN_CURRENT_MATCHING_PIPELINE' && entry.disposition !== 'SOURCE_ROW_CHANGED').length,
+            candidateEvaluations: evaluatedCandidates,
+            pipelineStage,
+            decisions: rejected.map((entry) => ({ kind: 'PAIR_REJECTED', key: entry.decisionKey, decision: entry.decision, validity: entry.decisionValidity })),
+          }
+        if (expectedManualRejection) {
+          findings.push({
+            id: `EXPECTED_MANUAL_REJECTION:${item.bank.id}`, code: 'EXPECTED_MANUAL_REJECTION', severity: 'INFO', category: 'STATE', invariantId: 'INV-03',
+            title: 'Candidatas rejeitadas anteriormente pelo usuário',
+            detail: `As ${candidates.length} candidata(s) plausíveis foram rejeitadas por decisões ativas, válidas e sem conflito. A movimentação permanece ausente conforme a escolha anterior.`,
+            diagnosis: `As candidatas plausíveis foram rejeitadas anteriormente pelo usuário; por isso a movimentação permanece ausente.${candidates.length > 1 ? ` ${candidates.length} candidatas foram rejeitadas.` : ''}`,
+            whyItMatters: 'O estado Ausente respeita as rejeições salvas e pode ser revisto se uma rejeição tiver sido feita por engano.',
+            recommendedAction: 'Nenhuma ação necessária, a menos que queira reconsiderar uma correspondência rejeitada.',
+            diagnosticConfidence: 'HIGH', safeAutomaticAction: false, status: 'EXPECTED', explanationSource: 'MANUAL_DECISION', currentState: 'MISSING', expectedState: 'MISSING', pureState: 'CANDIDATE_REJECTED', technical,
+          })
+        } else {
+          const detail = rejected.length === candidates.length
+            ? 'A movimentação está ausente e suas candidatas têm registros de rejeição, mas ao menos uma decisão não pôde ser validada com segurança nas fontes atuais.'
+            : reserved.length
+              ? 'O estado atual é MISSING, mas há candidata(s) reservada(s) na atribuição global. O resultado deveria mantê-las em REVIEW; a trilha identifica o owner.'
+              : sourceDivergence.length
+                ? `O estado atual é MISSING e a auditoria encontrou ${candidates.length} candidata(s), mas a fonte/trilha atual difere da usada no matching. A diferença está detalhada por linha.`
+                : `O estado atual é MISSING, mas ${candidates.length} linha(s) da CUSTOS ANO passam pelos critérios mínimos de matching. A trilha abaixo identifica a etapa alcançada por cada uma.`
+          findings.push({
+            id: `MISSING_WITH_STRONG_CANDIDATE:${item.bank.id}`, code: 'MISSING_WITH_STRONG_CANDIDATE', severity: 'CRITICAL', title: 'Movimentação ausente possui candidato plausível', detail,
+            explanationSource: rejected.length === candidates.length ? 'MANUAL_DECISION' : reserved.length ? 'ASSIGNMENT' : sourceDivergence.length ? 'SOURCE_LIFECYCLE' : 'NONE',
+            technical,
+          })
+        }
+      }
     }
     if (item.status === 'MISSING' && (item.bank.type === 'CARD_PAYMENT' || semanticType === 'CARD_PAYMENT')) findings.push({ id: `CARD_PAYMENT_AS_EXPENSE_MISSING:${item.bank.id}`, code: 'CARD_PAYMENT_AS_EXPENSE_MISSING', severity: 'CRITICAL', title: 'Pagamento da fatura classificado como despesa ausente', detail: 'Esta movimentação representa o pagamento agregado de uma fatura e não deve aparecer como despesa individual em Ausentes.', technical: { bank: item.bank, storedType: item.bank.type, semanticType, status: item.status } })
     if (item.status === 'MISSING' && item.bank.direction === 'DEBIT' && (item.bank.type === 'EXPENSE' || semanticType === 'EXPENSE')
@@ -523,6 +870,27 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
     })
     const staleDecision = audits.find((audit) => ['STALE', 'ORPHANED', 'LEGACY_BUT_RESOLVABLE'].includes(audit.status))
     const rejectedCandidateDecision = relatedLocal.find((decision) => decision.kind === 'CARD_REVIEW_REJECTED_CANDIDATES' && candidates.some((row) => decision.selected.includes(cardReviewCandidateIdentity(row))))
+    const manualAssignment = validManualReservations.find((assignment) => assignment.subjectId === identity)
+    const validCardRejection = audits.find((audit) => audit.decision.kind === 'CARD_REVIEW_REJECTED_CANDIDATES' && audit.status === 'VALID')
+    const expectedStartedAt = performance.now()
+    const expected = deriveExpectedReconciliationState({
+      subjectId: identity,
+      pureState: pureMatch.status,
+      currentState: current?.status ?? 'UNAVAILABLE',
+      currentTargetId: current?.sheet?.sheetRecordId || current?.sheet?.id,
+      ...(manualAssignment ? { validManualAssignment: { decisionId: stableFingerprint([manualAssignment.decision.key]), targetId: manualAssignment.row.sheetRecordId || manualAssignment.row.id } } : {}),
+      ...(validCardRejection ? { validRejection: { decisionId: stableFingerprint([validCardRejection.decision.key]), outcome: 'CARD_MISSING' } } : {}),
+      ...(manualReservations[0] ? { reservationOwner: {
+        subjectId: manualReservations[0].assignment.subjectId,
+        targetId: manualReservations[0].row.sheetRecordId || manualReservations[0].row.id,
+        decisionId: stableFingerprint([manualReservations[0].assignment.decision.key]),
+      } } : {}),
+      ...(current?.status === 'CARD_GROUP_MATCHED' ? { groupResolution: { outcome: current.status, evidence: current.candidates.map((row) => row.sheetRecordId || row.id) } } : {}),
+    })
+    expectedStateDerivationMs += performance.now() - expectedStartedAt
+    const expectedMatch: CardStatementMatch | null = current
+      ? { ...current, status: expected.expectedState as CardStatementMatch['status'], ...(manualAssignment ? { sheet: manualAssignment.row, candidates: [] } : {}) }
+      : null
     const diagnosis = manualReservations.length
       ? `O matcher puro encontrou ${pureMatch.status}, mas ${manualReservations.map(({ assignment }) => {
         const ownerTransaction = assignment.statement.transactions.find((item) => item.id === assignment.transactionId)!
@@ -539,7 +907,7 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
         : current?.status === 'CARD_MISSING' && candidates.length > 0 ? 'O estado MISSING atual contradiz a busca compartilhada de candidatos; confira a etapa de aplicação global/multiplicidade e os IDs consumidos.'
           : pureMatch.status === 'CARD_MATCHED' ? 'A busca de candidatos e o matching global selecionam uma linha atual; o caminho puro não produz MISSING.'
             : `O matcher puro retornou ${pureMatch.status}; os candidatos e evidências mostram o estágio alcançado.`
-    const item: AuditedCardItem = { statement: entry.statement, transaction, pure: pureMatch, current, candidates, fingerprint: identity, aliases, decisions: audits, discarded: rejectedReasons(entry.statement, transaction, input.sheets), evaluatedCandidates, claimedBy, diagnosis }
+    const item: AuditedCardItem = { statement: entry.statement, transaction, pure: pureMatch, current, expectedState: expectedMatch, explanationChain: expected.explanationChain, candidates, fingerprint: identity, aliases, decisions: audits, discarded: rejectedReasons(entry.statement, transaction, input.sheets), evaluatedCandidates, claimedBy, diagnosis }
     items.push(item)
     const add = (code: AuditCode, severity: AuditSeverity, title: string, detail: string, technical?: Record<string, unknown>) => findings.push({ id: `${code}:${identity}`, code, severity, title, detail, item,
       ...(technical ? { technical } : {}),
@@ -575,8 +943,8 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
       else if (stage) add('EXPECTED_GROUP_RESOLUTION', 'INFO', 'Correspondência explicada pela análise em grupo', 'A etapa de group matching resolveu a ambiguidade encontrada na análise individual.', { pure: pureMatch.status, current: current.status, expectedState: current.status, pipeline: stage })
       else add('DERIVED_STATE_MISMATCH', severity, 'Estado exibido difere do recálculo puro', `Estado base sem decisões: ${pureMatch.status}. Estado final da interface: ${current.status}.${severity === 'CRITICAL' ? ' Esta diferença pode ocultar despesa ou liberar inclusão duplicada.' : ' A divergência requer revisão, mas não foi classificada como risco crítico.'}`, { pure: pureMatch.status, current: current.status, canAppend })
     }
-    if (current?.status === 'CARD_MISSING' && candidates.length && localCandidates.length === 0 && !contestedCandidate) add('CURRENT_SOURCE_DIVERGENCE', 'CRITICAL', 'Fonte da tela desatualizada', `A cópia de CUSTOS ANO usada pela tela não contém o candidato. A leitura feita pela auditoria encontrou ${candidates.length} candidato(s).`, { currentCandidateIds: [], refreshedCandidateIds: candidates.map((row) => row.id) })
-    if (current?.status === 'CARD_MISSING' && candidates.length === 0 && localCandidates.length > 0) add('CURRENT_SOURCE_DIVERGENCE', 'REVIEW', 'Linha do cache não apareceu na fonte atual', 'Uma linha que passava pelo matching na cópia desta sessão não veio na leitura atual de CUSTOS ANO. A fonte atual foi preservada como referência.', { cachedCandidateIds: localCandidates.map((row) => row.id), refreshedCandidateIds: [] })
+    if (current?.status === 'CARD_MISSING' && candidates.length && localCandidates.length === 0 && !contestedCandidate) add('CURRENT_SOURCE_DIVERGENCE', input.auditInputSnapshot?.mixedRevisionSources.length ? 'REVIEW' : 'CRITICAL', 'Fonte da tela desatualizada', `A cópia de CUSTOS ANO usada pela tela não contém o candidato. A leitura feita pela auditoria encontrou ${candidates.length} candidato(s).`, { currentCandidateIds: [], refreshedCandidateIds: candidates.map((row) => row.id), classification: input.auditInputSnapshot?.mixedRevisionSources.length ? 'DERIVED_RESULT_FROM_DIFFERENT_REVISION' : 'CURRENT_SOURCE_DIVERGENCE' })
+    if (current?.status === 'CARD_MISSING' && candidates.length === 0 && localCandidates.length > 0) add('CURRENT_SOURCE_DIVERGENCE', 'REVIEW', 'Linha do cache não apareceu na fonte atual', 'Uma linha que passava pelo matching na cópia desta sessão não veio na leitura atual de CUSTOS ANO. A fonte atual foi preservada como referência.', { cachedCandidateIds: localCandidates.map((row) => row.id), refreshedCandidateIds: [], classification: 'SESSION_SNAPSHOT_DIFFERS_FROM_AUDIT_SOURCE' })
     if (pureMatch.status === 'CARD_MISSING' && candidates.length) add('PREWRITE_MATCH_MISMATCH', 'CRITICAL', 'Pré-check e matching divergem', `O matching puro retornou MISSING, mas findExistingCostYearCandidates — também usado antes de escrever — encontrou ${candidates.length} linha(s).`, { candidateIds: candidates.map((row) => row.id) })
     const missingDecision = audits.find((decision) => decision.decision.kind === 'CARD_MISSING_CONFIRMED')
     if (missingDecision && candidates.length) add('STALE_MISSING_DECISION', 'REVIEW', 'Decisão antiga de ausência com candidato atual', `${missingDecision.source}: CARD_MISSING_CONFIRMED foi associada à compra, mas existe candidato atual.`)
@@ -702,7 +1070,7 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
       id: `DOUBLE_CLAIM:${rowKey}`, code: 'DOUBLE_CLAIM', severity,
       title: severity === 'CRITICAL' ? 'Uma linha da CUSTOS ANO está atribuída a mais de uma compra' : 'Compartilhamento explicado por group matching',
       detail: `CUSTOS ANO ${row.sheetRecordId || row.id} · ${row.originalDescription} · ${row.date} · ${row.amount} centavos · ${row.paymentMethod}. Há ${renderedSubjects.length} subject(s) relacionado(s); origem: ${origins.join(', ')}.`,
-      ...(decisionSubjects.length > 0 && resolvedSubjects.length > 1 ? { relatedFindings: [{ code: 'DOUBLE_CLAIM_AFTER_CONFIRMATION' as const, title: 'A escolha manual deixou outro vínculo ativo', detail: 'Mais de uma compra continua reivindicando a linha depois de existir uma confirmação manual ativa. A linha deve ter somente um vínculo.', technical: { decisionKeys: decisionSubjects.flatMap((subject) => subject.decisions.map((decision) => decision.key)), sheetIdentity: rowKey } }] } : {}),
+      ...((decisionSubjects.length > 0 || effectiveDecisions.some((entry) => entry.state === 'ACTIVE' && entry.decision.kind === 'STATEMENT_MATCH_CONFIRMED' && entry.decision.selected.some((ref) => ref === rowKey || ref === row.id || ref === row.sheetRecordId))) && renderedSubjects.length > 1 ? { relatedFindings: [{ code: 'DOUBLE_CLAIM_AFTER_CONFIRMATION' as const, title: 'A escolha manual deixou outro vínculo ativo', detail: 'Mais de uma compra continua reivindicando a linha depois de existir uma confirmação manual ativa. A linha deve ter somente um vínculo.', technical: { decisionKeys: decisionSubjects.flatMap((subject) => subject.decisions.map((decision) => decision.key)), sheetIdentity: rowKey }, role: 'RELATED' as const, rootCauseKey: `SHEET_ROW_MULTIPLE_OWNERS:${rowKey}` }] } : {}),
       technical: {
         row: { id: row.sheetRecordId || row.id, sheetIdentity: rowKey, description: row.originalDescription, date: row.date, amount: row.amount, paymentMethod: row.paymentMethod },
         subjects: renderedSubjects.map((subject) => ({ origin: subject.origin, type: subject.type, description: subject.description, date: subject.date, amount: subject.amount, sources: [...subject.sources], decisions: [...subject.decisionTypes], fingerprint: subject.id })),
@@ -722,10 +1090,61 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
   const pendingCount = mergeAudit.pendingLocalUpdate.length + mergeAudit.pendingRemoteUpdate.length
   if (pendingCount) findings.push({ id: 'SYNC_PENDING:decisions', code: 'SYNC_PENDING', severity: 'INFO', title: `${pendingCount} decisão(ões) aguardam sincronização`, detail: 'A diferença local/remota é resolvível pelas regras normais: versão mais nova vence e o remoto vence empates. Nenhuma revisão financeira é necessária.', technical: { localUpdates: mergeAudit.pendingLocalUpdate, remoteUpdates: mergeAudit.pendingRemoteUpdate, count: pendingCount } })
   for (const audit of validated) if (audit.decision.kind === 'MISSING_ADDED_TO_SHEET' && audit.status === 'ORPHANED') findings.push({ id: `MISSING_ADDED_TO_SHEET_ORPHAN:${audit.decision.key}`, code: 'MISSING_ADDED_TO_SHEET_ORPHAN', severity: 'INFO', status: 'MAINTENANCE', title: 'Linha adicionada não existe mais', detail: 'A decisão de adição está salva, mas o ID referenciado não aparece na CUSTOS ANO atual.', technical: { decision: audit.decision } })
-  const deduplicated = deduplicateAuditFindings(findings).map(enrichFinding)
+  const expectedStates = Object.fromEntries([
+    ...Object.entries(expectedBankStates),
+    ...items.map((item) => [item.fingerprint, { subjectId: item.fingerprint, pureState: item.pure.status, expectedState: item.expectedState?.status ?? 'UNAVAILABLE', currentState: item.current?.status ?? 'UNAVAILABLE', explanationChain: item.explanationChain, ...(item.expectedState?.sheet ? { expectedTargetId: item.expectedState.sheet.sheetRecordId || item.expectedState.sheet.id } : {}) }]),
+  ])
+  let deduplicated = groupPrimaryFindings(deduplicateAuditFindings(findings.filter((finding) => finding.code !== 'DOUBLE_CLAIM_AFTER_CONFIRMATION')).map(enrichFinding))
+  const auditSelfChecks = runAuditSelfChecks({ items, expectedStates, findings: deduplicated, decisions: allDecisions, snapshot: input.auditInputSnapshot })
+  const failedSelfChecks = auditSelfChecks.filter((check) => check.status === 'FAIL')
+  if (failedSelfChecks.length) {
+    const internal = enrichFinding({
+      id: 'AUDITOR_INTERNAL_INCONSISTENCY:result', code: 'AUDITOR_INTERNAL_INCONSISTENCY', severity: 'REVIEW', category: 'STATE', invariantId: 'INV-14',
+      title: 'O relatório precisa de revisão técnica', detail: `${failedSelfChecks.length} autocheck(s) do Auditor não passaram: ${failedSelfChecks.map((check) => check.checkId).join(', ')}.`,
+      technical: { selfChecks: failedSelfChecks }, role: 'PRIMARY', rootCauseCode: 'AUDITOR_INTERNAL_INCONSISTENCY', rootCauseKey: 'AUDITOR_INTERNAL_INCONSISTENCY:result',
+    })
+    deduplicated = [...deduplicated, internal]
+  }
+  const invariantStartedAt = performance.now()
+  const invariantExecutions = evaluateInvariantExecutions(input, deduplicated, mode)
+  const invariantChecksMs = performance.now() - invariantStartedAt
+  const finalSelfChecks = failedSelfChecks.length ? auditSelfChecks : runAuditSelfChecks({ items, expectedStates, findings: deduplicated, decisions: allDecisions, snapshot: input.auditInputSnapshot })
   const evaluatedPurchases = input.statements.reduce((count, entry) => count + entry.statement.transactions.filter((tx) => tx.type === 'PURCHASE' && tx.financialStatus !== 'REFUNDED').length, 0)
   return { mode, recomputation: { performed: mode === 'PROFUNDA', readOnly: true, persistedDecisionsApplied: false }, findings: deduplicated, items, decisionAudit: validated.map((audit) => {
     const validity = globalDecisionValidity.get(audit.decision.key) ?? (audit.status === 'VALID' ? 'VALID_GLOBALLY' : audit.status === 'ORPHANED' || audit.status === 'STALE' ? 'INVALID_TARGET' : 'NEEDS_REVIEW')
     return { decision: audit.decision, status: globalDecisionValidity.has(audit.decision.key) ? 'CONFLICTING' as const : audit.status, source: 'LOCAL' as const, explanation: globalDecisionValidity.has(audit.decision.key) ? 'A decisão participa de um conflito global de atribuição da linha CUSTOS ANO.' : audit.status, structurallyValid: audit.status === 'VALID', validity }
-  }), auditedAt: new Date().toISOString(), pureStates, currentStates, summary: summarizeAudit(deduplicated, items, evaluatedPurchases, mode) }
+  }), auditedAt: new Date().toISOString(), pureStates, currentStates, expectedStates, invariantExecutions, auditSelfChecks: finalSelfChecks, performance: { totalMs: performance.now() - auditStartedAt, expectedStateDerivationMs, invariantChecksMs }, summary: summarizeAudit(deduplicated, items, evaluatedPurchases, mode, invariantExecutions), auditInputSnapshot: input.auditInputSnapshot }
+}
+
+/** Adds the end-of-run revision comparison without changing the frozen audit inputs. */
+export function finalizeAuditInputSnapshot(result: ConsistencyAuditResult, snapshot: AuditInputSnapshot): ConsistencyAuditResult {
+  const uncertain = snapshot.state === 'STALE' || snapshot.state === 'MIXED_REVISION'
+  const dependentCodes = new Set<AuditCode>(['CURRENT_SOURCE_DIVERGENCE', 'STALE_DECISION_RESULT', 'VALID_BANK_MANUAL_MATCH_NOT_APPLIED', 'VALID_MANUAL_MATCH_NOT_APPLIED', 'REJECTED_CANDIDATE_FILTERED', 'MISSING_COM_CANDIDATO', 'MISSING_WITH_STRONG_CANDIDATE', 'DERIVED_STATE_MISMATCH', 'MISSING_ACTION_INCONSISTENCY', 'CARD_PAYMENT_AS_EXPENSE_MISSING', 'REVIEW_WITHOUT_CANDIDATES', 'ASSIGNMENT_CONFLICT', 'UNUSED_STRONG_CANDIDATE'])
+  const findings: AuditFinding[] = result.findings.map((finding) => {
+    const confidenceEvidence = { ...(finding.confidenceEvidence ?? { identityQuality: 'INCOMPLETE' as const, sourceCoverage: snapshot.state, revisionComparable: true, evidenceCount: 0, validDecision: false, targetCanonical: false }), sourceCoverage: snapshot.state, revisionComparable: !uncertain }
+    const confidence: DiagnosticConfidence = uncertain ? 'LOW' : snapshot.state === 'PARTIAL' ? 'MEDIUM' : finding.diagnosticConfidence
+    return uncertain && dependentCodes.has(finding.code)
+      ? { ...finding, severity: 'REVIEW' as const, diagnosticConfidence: confidence, confidenceEvidence, technical: { ...finding.technical, auditSnapshotUncertain: true, snapshotState: snapshot.state } }
+      : { ...finding, diagnosticConfidence: confidence, confidenceEvidence }
+  })
+  if (uncertain) {
+    const stateText = snapshot.state === 'STALE'
+      ? `As fontes mudaram após a captura (${snapshot.staleSources.join(', ')}). Esta execução usou integralmente as entradas capturadas no início; execute novamente para avaliar o estado atual.`
+      : `O resultado derivado foi calculado com revisão diferente da usada pela auditoria (${snapshot.mixedRevisionSources.join(', ')}). Sintomas dependentes dessa comparação foram rebaixados para revisão.`
+    findings.push(enrichFinding({
+      id: `AUDIT_INPUT_REVISION_MISMATCH:${snapshot.capturedAt}:${snapshot.state}`, code: 'AUDIT_INPUT_REVISION_MISMATCH', severity: 'REVIEW', category: 'SOURCE', invariantId: 'INV-12',
+      title: snapshot.state === 'PARTIAL' ? 'Auditoria parcial' : 'Revisões das entradas da auditoria não são comparáveis', detail: stateText,
+      technical: { snapshotState: snapshot.state, revisions: snapshot.revisions, staleSources: snapshot.staleSources, mixedRevisionSources: snapshot.mixedRevisionSources, unavailableSources: snapshot.unavailableSources },
+    }))
+  }
+  const deduplicated = groupPrimaryFindings(deduplicateAuditFindings(findings).map(enrichFinding)).map((finding) => {
+    const evidence = { ...(finding.confidenceEvidence ?? { identityQuality: 'INCOMPLETE' as const, sourceCoverage: snapshot.state, revisionComparable: !uncertain, evidenceCount: 0, validDecision: false, targetCanonical: false }), sourceCoverage: snapshot.state, revisionComparable: !uncertain }
+    return { ...finding, confidenceEvidence: evidence, diagnosticConfidence: uncertain ? 'LOW' as const : snapshot.state === 'PARTIAL' ? 'MEDIUM' as const : finding.diagnosticConfidence }
+  })
+  const invariantExecutions = result.invariantExecutions.map((execution) => {
+    const findingsForInvariant = deduplicated.filter((finding) => finding.invariantId === execution.invariantId)
+    const staleSkipped = (snapshot.state === 'STALE' && execution.sourcesRequired.length > 0) || snapshot.state === 'MIXED_REVISION' && execution.sourcesRequired.some((source) => source === 'decisions' ? snapshot.mixedRevisionSources.some((item) => item.includes('decision')) : snapshot.mixedRevisionSources.some((item) => item.includes('source')))
+    return { ...execution, status: staleSkipped ? 'SKIPPED_DUE_TO_REVISION' as const : findingsForInvariant.some((finding) => finding.severity === 'CRITICAL' || finding.severity === 'REVIEW') ? 'EXECUTED_FAIL' as const : execution.status === 'EXECUTED_PASS' ? 'EXECUTED_PASS' as const : execution.status, findingIds: findingsForInvariant.map((finding) => finding.id) }
+  })
+  return { ...result, findings: deduplicated, invariantExecutions, auditInputSnapshot: snapshot, summary: summarizeAudit(deduplicated, result.items, result.summary.evaluatedPurchases, result.mode, invariantExecutions) }
 }

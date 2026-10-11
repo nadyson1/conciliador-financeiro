@@ -139,9 +139,24 @@ export interface MatchCandidate {
   matchMethod?: 'SCORED' | 'STRUCTURAL' | 'MANUAL'
 }
 
+export interface CandidatePipelineEvaluation {
+  sheet: LedgerTransaction
+  candidate: MatchCandidate
+  disposition: 'REJECTED_BY_DECISION' | 'EXCLUDED_BY_REFUND' | 'ASSIGNED' | 'RESERVED' | 'PLANNED_FOR_REVIEW' | 'AVAILABLE' | 'SOURCE_ROW_CHANGED' | 'NOT_IN_CURRENT_MATCHING_PIPELINE'
+  reason: string
+  decisionKey?: string
+  ownerBankId?: string
+}
+
 export interface ReconciliationItem {
   bank: BankTransaction
   sheet: LedgerTransaction | null
+  /** All matching candidates to let a reviewer distinguish ambiguity from a missing expense. */
+  candidateSheets?: LedgerTransaction[]
+  /** Current match owner for each candidate row, when the global assignment already reserved it. */
+  candidateOwners?: Record<string, { bankId: string; description: string }>
+  /** Per-edge trace from candidate generation through decision filtering and assignment. */
+  candidatePipeline?: CandidatePipelineEvaluation[]
   status: MatchStatus
   candidate: MatchCandidate | null
   composition: LedgerTransaction[]
@@ -263,6 +278,10 @@ export interface DuplicateGroup {
 }
 
 export interface ReconciliationResult {
+  /** Fingerprint of the effective decision set used to derive these results. */
+  decisionRevisionUsed?: string
+  /** Fingerprint of the bank, ledger and statement inputs used to derive these results. */
+  sourceRevisionUsed?: string
   items: ReconciliationItem[]
   bankRefundGroups: BankRefundGroup[]
   unmatchedSheet: LedgerTransaction[]

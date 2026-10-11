@@ -1,6 +1,8 @@
 import type { DecisionKind, PersistedDecision } from '../domain/localDecisions'
-import { putPersistedDecision, deletePersistedDecision } from '../domain/localDecisions'
+import { isDecisionStructurallyValid } from '../domain/decisionAudit'
+import { nextDecisionTimestamp, putPersistedDecision, deletePersistedDecision } from '../domain/localDecisions'
 import { stableFingerprint } from '../domain/identity'
+import { serializeDecisionMutation } from '../domain/decisionMutationQueue'
 
 export const GOOGLE_DECISIONS_TAB = '_CONCILIADOR'
 export const GOOGLE_DECISIONS_HEADERS = ['decisionId', 'decisionType', 'subjectFingerprint', 'status', 'relatedIds', 'metadata', 'createdAt', 'updatedAt', 'schemaVersion'] as const
@@ -20,13 +22,23 @@ export function listDecisionTombstones(storage: Storage = localStorage) { return
 
 export function addDecisionTombstone(decision: PersistedDecision, storage: Storage = localStorage) {
   const tombstones = readTombstones(storage)
-  tombstones[decision.key] = { updatedAt: new Date().toISOString(), decision }
+  const current = tombstones[decision.key]
+  tombstones[decision.key] = { updatedAt: nextDecisionTimestamp(decision.updatedAt, current?.updatedAt ?? ''), decision }
   storage.setItem(TOMBSTONE_STORAGE_KEY, JSON.stringify(tombstones))
 }
 
 export function removeDecisionTombstone(key: string, storage: Storage = localStorage) {
   const tombstones = readTombstones(storage)
   delete tombstones[key]
+  if (Object.keys(tombstones).length) storage.setItem(TOMBSTONE_STORAGE_KEY, JSON.stringify(tombstones))
+  else storage.removeItem(TOMBSTONE_STORAGE_KEY)
+}
+
+/** Restores the exact pre-mutation tombstone when a local composed write aborts. */
+export function restoreDecisionTombstone(key: string, previous: DecisionTombstone | undefined, storage: Storage = localStorage) {
+  const tombstones = readTombstones(storage)
+  if (previous) tombstones[key] = previous
+  else delete tombstones[key]
   if (Object.keys(tombstones).length) storage.setItem(TOMBSTONE_STORAGE_KEY, JSON.stringify(tombstones))
   else storage.removeItem(TOMBSTONE_STORAGE_KEY)
 }
@@ -116,7 +128,10 @@ export async function readGoogleSheetDecisionsReadOnly(id: string, token: string
 async function upsertRows(id: string, token: string, decisions: { decision: PersistedDecision; status: 'ACTIVE' | 'DELETED' }[], existingRows: unknown[][], fetcher: typeof fetch) {
   const rowsById = new Map<string, number>()
   existingRows.slice(1).forEach((row, index) => { if (typeof row[0] === 'string') rowsById.set(row[0], index + 2) })
-  for (const item of decisions) {
+  // Apply tombstones before activations so a partial remote write can temporarily
+  // omit a decision, but cannot expose both sides of a logical replacement.
+  const ordered = [...decisions].sort((left, right) => Number(right.status === 'DELETED') - Number(left.status === 'DELETED'))
+  for (const item of ordered) {
     const rowNumber = rowsById.get(stableFingerprint([item.decision.key]))
     if (rowNumber) {
       const oldRow = existingRows[rowNumber - 1]
@@ -128,11 +143,17 @@ async function upsertRows(id: string, token: string, decisions: { decision: Pers
 }
 
 export async function saveGoogleSheetDecision(id: string, token: string, decision: PersistedDecision, fetcher: typeof fetch = fetch) {
-  const rows = await ensureDecisionTab(id, token, fetcher)
-  await upsertRows(id, token, [{ decision, status: 'ACTIVE' }], rows, fetcher)
+  return serializeDecisionMutation(`google-sheet:${id}`, async () => {
+    const rows = await ensureDecisionTab(id, token, fetcher)
+    await upsertRows(id, token, [{ decision, status: 'ACTIVE' }], rows, fetcher)
+  })
 }
 
-export async function syncGoogleSheetDecisions(id: string, token: string, localDecisions: PersistedDecision[], tombstones: Record<string, DecisionTombstone> = {}, fetcher: typeof fetch = fetch): Promise<PersistedDecision[]> {
+async function syncGoogleSheetDecisionsNow(id: string, token: string, localDecisions: PersistedDecision[], tombstones: Record<string, DecisionTombstone>, fetcher: typeof fetch): Promise<PersistedDecision[]> {
+  // Keep malformed/legacy records available in local storage for diagnostics, but never
+  // let them overwrite a valid remote row or participate in the effective decision set.
+  const applicableLocal = localDecisions.filter(isDecisionStructurallyValid)
+  const applicableTombstones = Object.fromEntries(Object.entries(tombstones).filter(([, tombstone]) => isDecisionStructurallyValid(tombstone?.decision) && !Number.isNaN(Date.parse(tombstone?.updatedAt ?? ''))))
   const rows = await ensureDecisionTab(id, token, fetcher)
   const dataRows = rows.slice(1).filter((row) => row.some((value) => value !== '' && value != null))
   const parsedRows = dataRows.map((row) => fromRow(row))
@@ -140,11 +161,11 @@ export async function syncGoogleSheetDecisions(id: string, token: string, localD
   const remote = parsedRows.filter((item): item is DecisionRow => item !== null)
   const merged = new Map<string, DecisionRow>()
   remote.forEach((item) => merged.set(item.decision.key, item))
-  localDecisions.forEach((decision) => {
+  applicableLocal.forEach((decision) => {
     const current = merged.get(decision.key)
     if (!current || Date.parse(decision.updatedAt) > Date.parse(current.decision.updatedAt)) merged.set(decision.key, { decision, status: 'ACTIVE', createdAt: current?.createdAt ?? decision.updatedAt })
   })
-  Object.entries(tombstones).forEach(([key, tombstone]) => {
+  Object.entries(applicableTombstones).forEach(([key, tombstone]) => {
     const { updatedAt, decision } = tombstone
     const current = merged.get(key)
     if (!current || Date.parse(updatedAt) >= Date.parse(current.decision.updatedAt)) {
@@ -157,12 +178,16 @@ export async function syncGoogleSheetDecisions(id: string, token: string, localD
   })
   await upsertRows(id, token, changed, rows, fetcher)
   const active = [...merged.values()].filter((item) => item.status === 'ACTIVE').map((item) => item.decision)
-  const localKeys = new Set(localDecisions.map((item) => item.key))
+  const localKeys = new Set(applicableLocal.map((item) => item.key))
   for (const item of merged.values()) {
     if (item.status === 'DELETED') await deletePersistedDecision(item.decision.key)
-    else if (!localKeys.has(item.decision.key) || localDecisions.find((local) => local.key === item.decision.key)?.updatedAt !== item.decision.updatedAt) await putPersistedDecision(item.decision)
+    else if (!localKeys.has(item.decision.key) || applicableLocal.find((local) => local.key === item.decision.key)?.updatedAt !== item.decision.updatedAt) await putPersistedDecision(item.decision)
   }
   return active
+}
+
+export function syncGoogleSheetDecisions(id: string, token: string, localDecisions: PersistedDecision[], tombstones: Record<string, DecisionTombstone> = {}, fetcher: typeof fetch = fetch): Promise<PersistedDecision[]> {
+  return serializeDecisionMutation(`google-sheet:${id}`, () => syncGoogleSheetDecisionsNow(id, token, localDecisions, tombstones, fetcher))
 }
 
 export async function syncOneGoogleSheetDecision(id: string, token: string, decision: PersistedDecision, fetcher: typeof fetch = fetch) {
@@ -170,6 +195,8 @@ export async function syncOneGoogleSheetDecision(id: string, token: string, deci
 }
 
 export async function syncOneGoogleSheetDeletion(id: string, token: string, decision: PersistedDecision, deletedAt: string, fetcher: typeof fetch = fetch) {
-  const rows = await ensureDecisionTab(id, token, fetcher)
-  await upsertRows(id, token, [{ decision: { ...decision, updatedAt: deletedAt }, status: 'DELETED' }], rows, fetcher)
+  return serializeDecisionMutation(`google-sheet:${id}`, async () => {
+    const rows = await ensureDecisionTab(id, token, fetcher)
+    await upsertRows(id, token, [{ decision: { ...decision, updatedAt: deletedAt }, status: 'DELETED' }], rows, fetcher)
+  })
 }

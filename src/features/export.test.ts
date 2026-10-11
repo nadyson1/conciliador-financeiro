@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuditFinding } from '../domain/consistencyAudit'
-import { exportAuditDiagnosticJson, exportAuditFindings, exportCsv, toAuditCsvRow } from './export'
+import { createAuditDiagnosticPayload, exportAuditDiagnosticJson, exportAuditFindings, exportCsv, toAuditCsvRow } from './export'
+import { createAuditInputSnapshot } from '../domain/auditInputSnapshot'
 
 describe('exportação local', () => {
   afterEach(() => vi.restoreAllMocks())
@@ -46,32 +47,21 @@ describe('exportação local', () => {
     const auditFindings = [finding, pdfFinding, ...additionalFindings]
     const auditBefore = structuredClone(auditFindings)
 
-    exportAuditFindings(auditFindings, hiddenIds, '2026-10-07T18:30:00.000Z', 'RAPIDA')
+    const snapshot = createAuditInputSnapshot({ banks: [], sheets: [], statements: [], decisions: [], capturedAt: '2026-10-07T18:30:00.000Z' })
+    exportAuditFindings(auditFindings, hiddenIds, '2026-10-07T18:30:00.000Z', 'RAPIDA', snapshot)
     const csv = await blob!.text()
     const [header, ...rows] = csv.replace(/^\uFEFF/, '').split('\r\n')
     expect(anchor.download).toMatch(/^auditoria_rapida_2026-10-07_\d{4}\.csv$/)
-    expect(header).toContain('"Finding ID";"Modo da auditoria";"Data/hora da auditoria";"Severidade";"Categoria";"Código";"Invariante"')
-    expect(header).toContain('"Transaction ID";"Invoice ID";"Cartão"')
-    expect(header).toContain('"CandidateCountRelevant";"CandidateCountEvaluated"')
-    expect(header.endsWith('"Resumo técnico";"Oculto"')).toBe(true)
+    expect(header).toBe('"Finding ID";"Root Cause";"Role";"Severity";"Confidence";"Subject";"Expected";"Current";"Related Count";"Explanation Summary";"Hidden";"Coverage"')
     expect(rows).toHaveLength(5)
-    expect(rows[0]).toContain('"Precisa de revisão"')
-    expect(rows[0]).toContain('"STATE"')
+    expect(rows[0]).toContain('"REVIEW"')
     expect(rows[0]).toContain('"MISSING_COM_CANDIDATO"')
-    expect(rows[0]).toContain('"Há um lançamento compatível que merece conferência"')
+    expect(rows[0]).toContain('"COMPLETE"')
     expect(rows[0]).toContain('"Diagnóstico estruturado."')
-    expect(rows[0]).toContain('"Loja São João"')
-    expect(rows[0]).toContain('"bank-tx-1"')
-    expect(rows[0]).toContain('"sheet-row-1"')
-    expect(rows[0]).toContain('extrato.csv')
     expect(rows[0]).toContain('"true"')
-    expect(rows[1]).toContain('"invoice-1"')
-    expect(rows[1]).toContain('"XXXX 1234"')
-    expect(rows[1]).toContain('"pdf-tx-1"')
-    expect(rows[1]).toContain('"Assinatura Exemplo"')
     expect(rows.some((row) => row.includes('"MAINTENANCE"'))).toBe(true)
     expect(rows.some((row) => row.includes('"LEGACY"'))).toBe(true)
-    expect(rows.some((row) => row.includes('"Informativo"') && row.endsWith('"true"'))).toBe(true)
+    expect(rows.some((row) => row.includes('"INFO"') && row.includes('"true"') && row.includes('"COMPLETE"'))).toBe(true)
     expect(csv).not.toContain('conteúdo bruto privado')
     expect(hiddenIds).toEqual(new Set(['bank-sheet-finding', 'informational']))
     expect(auditFindings).toEqual(auditBefore)
@@ -98,11 +88,9 @@ describe('exportação local', () => {
     expect([...bytes.slice(0, 3)]).toEqual([0xef, 0xbb, 0xbf])
     expect(anchor.download).toMatch(/^auditoria_profunda_2026-10-07_\d{4}\.csv$/)
     const [header, row] = csv.replace(/^\uFEFF/, '').split('\r\n')
-    expect(header).toContain('"Modo da auditoria"')
-    expect(row).toContain('"PROFUNDA"')
+    expect(header).toContain('"Expected";"Current"')
     expect(row).toContain('"CARD_MATCHED"')
-    expect(row).toContain('"CARD_REVIEW"')
-    expect(row).toContain('"Confirmação manual válida"')
+    expect(row).toContain('"Confirmação manual válida explica a diferença."')
     expect(row).toContain('"true"')
   })
 
@@ -137,14 +125,27 @@ describe('exportação local', () => {
     const lines = csv.replace(/^\uFEFF/, '').split('\r\n')
     expect(lines).toHaveLength(11)
     expect(lines[1]).toContain('"finding-0"')
-    expect(lines[1]).toContain('"sheet-0"')
-    expect(lines[1]).toContain('direct-0-2')
-    expect(lines[1]).toContain('subject-a-0')
-    expect(lines[1]).toContain('subject-b-0')
-    expect(lines[1]).not.toContain('"trace-0-99"')
+    expect(lines[1]).toContain('"finding-0"')
+    expect(lines[1]).not.toContain('trace-0-99')
     expect(toAuditCsvRow(findings[0], run.mode, run.auditedAt, false).candidateCountRelevant).toBe(3)
     expect(toAuditCsvRow(findings[0], run.mode, run.auditedAt, false).candidateCountEvaluated).toBe(100)
     expect(findings).toEqual(auditBefore)
+  })
+
+  it('exporta a etapa e a decisão que filtraram uma candidata bancária', () => {
+    const finding = {
+      id: 'missing-with-rejected-candidate', code: 'MISSING_WITH_STRONG_CANDIDATE', severity: 'CRITICAL', category: 'STATE', invariantId: 'INV-03', title: 'Ausente com candidata', detail: 'A candidata foi rejeitada.', diagnosis: 'Etapa identificada.', whyItMatters: 'Contexto.', recommendedAction: 'Revisar.', diagnosticConfidence: 'HIGH', safeAutomaticAction: false, status: 'ACTIVE', explanationSource: 'MANUAL_DECISION',
+      technical: {
+        candidateRows: [{ id: 'row-1', sheetRecordId: 'sheet-1', date: '2026-03-12', description: 'Feirinha', amount: 1200 }],
+        candidateCountRelevant: 1, candidateCountEvaluated: 1, pipelineStage: 'DECISION_FILTERING / PAIR_REJECTED',
+        decisions: [{ kind: 'PAIR_REJECTED', key: 'decision-exact-1' }],
+        candidateEvaluations: [{ row: { id: 'row-1', sheetRecordId: 'sheet-1' }, disposition: 'REJECTED_BY_DECISION', reason: 'Par rejeitado explicitamente.', decisionKey: 'decision-exact-1' }],
+      },
+    } as unknown as AuditFinding
+    const row = toAuditCsvRow(finding, 'PROFUNDA', '2026-10-09T10:32:00.000Z', false)
+    expect(row).toMatchObject({ candidateCountRelevant: 1, candidateCountEvaluated: 1, explanationStage: 'DECISION_FILTERING / PAIR_REJECTED', decisions: 'PAIR_REJECTED (decision-exact-1)' })
+    expect(row.technicalSummary).toContain('REJECTED_BY_DECISION')
+    expect(row.technicalSummary).toContain('decision-exact-1')
   })
 
   it('exporta diagnóstico JSON completo com IDs iguais aos do CSV e findings ocultos', async () => {
@@ -155,12 +156,46 @@ describe('exportação local', () => {
     vi.spyOn(URL, 'createObjectURL').mockImplementation((value) => { blob = value as Blob; return 'blob:json' })
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
     const finding = { id: 'shared-finding-id', code: 'DOUBLE_CLAIM', severity: 'REVIEW', category: 'DECISION', invariantId: 'INV-01', title: 'Conflito', detail: 'Detalhe', diagnosis: 'Diagnóstico', whyItMatters: 'Impacto', recommendedAction: 'Revisar', diagnosticConfidence: 'HIGH', safeAutomaticAction: false, status: 'ACTIVE', explanationSource: 'NONE', technical: { evaluatedCandidates: [{ row: { id: 'candidate-full', raw: 'private raw omitted' } }] } } as unknown as AuditFinding
-    const run = { mode: 'RAPIDA', auditedAt: '2026-10-07T19:51:00.000Z', findings: [finding], recomputation: { performed: true, readOnly: true, persistedDecisionsApplied: false }, summary: {}, items: [], decisionAudit: [], pureStates: {}, currentStates: {} } as unknown as import('../domain/consistencyAudit').ConsistencyAuditResult
+    const auditInputSnapshot = createAuditInputSnapshot({ banks: [], sheets: [], statements: [], decisions: [], capturedAt: '2026-10-07T19:51:00.000Z' })
+    const run = { mode: 'RAPIDA', auditedAt: '2026-10-07T19:51:00.000Z', auditInputSnapshot, findings: [finding], recomputation: { performed: true, readOnly: true, persistedDecisionsApplied: false }, summary: {}, items: [], decisionAudit: [], pureStates: {}, currentStates: {}, invariantExecutions: [{ invariantId: 'INV-01', status: 'EXECUTED_PASS', subjectsEvaluated: 1, sourcesRequired: ['bank'], sourcesAvailable: ['bank'], findingIds: [] }], auditSelfChecks: [{ checkId: 'UNIQUE_PRIMARY_ROOT_CAUSE', status: 'PASS', findingIds: [] }] } as unknown as import('../domain/consistencyAudit').ConsistencyAuditResult
     exportAuditDiagnosticJson(run, new Set(['shared-finding-id']))
     const json = JSON.parse(await blob!.text())
     expect(anchor.download).toMatch(/^auditoria_diagnostico_rapida_2026-10-07_\d{4}\.json$/)
     expect(json.findings[0]).toMatchObject({ findingId: 'shared-finding-id', hidden: true, finding: { id: 'shared-finding-id' } })
     expect(json.findings[0].finding.technical.evaluatedCandidates[0].row.id).toBe('candidate-full')
+    expect(json.exportFormat).toBe('conciliador-auditoria-diagnostico')
+    expect(json.schemaVersion).toBe(2)
+    expect(json.snapshot.revisions.custosAnoRevision).toBe(auditInputSnapshot.revisions.custosAnoRevision)
+    expect(json.invariantExecutions[0]).toMatchObject({ invariantId: 'INV-01', status: 'EXECUTED_PASS' })
+    expect(json.selfChecks[0]).toMatchObject({ checkId: 'UNIQUE_PRIMARY_ROOT_CAUSE', status: 'PASS' })
     expect(JSON.stringify(json)).not.toContain('private raw omitted')
+  })
+
+  it('mantém uma linha por finding de topo e deduplica entidades repetidas no JSON v2', async () => {
+    const click = vi.fn()
+    const anchor = { href: '', download: '', click } as unknown as HTMLAnchorElement
+    const blobs: Blob[] = []
+    vi.spyOn(document, 'createElement').mockReturnValue(anchor)
+    vi.spyOn(URL, 'createObjectURL').mockImplementation((value) => { blobs.push(value as Blob); return `blob:${blobs.length}` })
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const transactionList = Array.from({ length: 40 }, (_, index) => ({ id: `tx-${index}`, amount: 1000 + index, originalDescription: `Loja ${index}`, purchaseDate: '2026-06-01' }))
+    const item = { fingerprint: 'purchase-a', statement: { statementIdentity: 'invoice-a', fileName: 'fatura.pdf', transactions: transactionList }, transaction: transactionList[0], candidates: [{ id: 'row-a', sheetRecordId: 'row-a', amount: 1000, description: 'Loja' }], evaluatedCandidates: [], decisions: [], explanationChain: [], aliases: [], discarded: [], claimedBy: [], diagnosis: 'MATCHED', pure: { status: 'CARD_MATCHED' }, current: null, expectedState: null } as unknown as import('../domain/consistencyAudit').AuditedCardItem
+    const finding = { id: 'primary', code: 'DOUBLE_CLAIM', role: 'PRIMARY', severity: 'REVIEW', invariantId: 'INV-01', category: 'DECISION', title: 'Conflito', detail: 'Conflito', diagnosis: 'Linha reivindicada.', whyItMatters: 'Impacto.', recommendedAction: 'Revisar.', diagnosticConfidence: 'HIGH', safeAutomaticAction: false, status: 'ACTIVE', explanationSource: 'NONE', item, technical: { row: { id: 'row-a', sheetRecordId: 'row-a', amount: 1000, description: 'Loja' } }, relatedFindings: [{ id: 'related', code: 'ASSIGNMENT_CONFLICT', role: 'RELATED', title: 'Reserva', detail: 'Evidência.' }] } as unknown as AuditFinding
+    const related = { ...finding, id: 'related-top', role: 'RELATED' } as AuditFinding
+    const audit = { mode: 'PROFUNDA', auditedAt: '2026-10-07T19:51:00.000Z', findings: [finding, related], items: [item], decisionAudit: [], invariantExecutions: [], auditSelfChecks: [], summary: {}, recomputation: { performed: true, readOnly: true, persistedDecisionsApplied: false }, pureStates: {}, currentStates: {}, expectedStates: {} } as unknown as import('../domain/consistencyAudit').ConsistencyAuditResult
+    exportAuditFindings(audit.findings, new Set(), audit.auditedAt, audit.mode)
+    const csv = await blobs[0].text()
+    expect(csv.replace(/^\uFEFF/, '').split('\r\n')).toHaveLength(2)
+    const duplicateRows = new Blob([JSON.stringify([item, finding])]).size
+    const payload = createAuditDiagnosticPayload(audit, new Set())
+    const compactJson = JSON.stringify(payload)
+    console.info(`Fixture de compactação JSON: ${duplicateRows} → ${compactJson.length} bytes (${((1 - compactJson.length / duplicateRows) * 100).toFixed(1)}% neste caso sintético)`)
+    expect(duplicateRows).toBeGreaterThan(compactJson.length)
+    expect(payload.exportFormat).toBe('conciliador-auditoria-diagnostico')
+    expect(payload.schemaVersion).toBe(2)
+    expect(payload.entities.statements['statement:invoice-a']).toBeDefined()
+    expect(payload.entities.ledgerRows['sheet:row-a']).toBeDefined()
+    expect(payload.findings[0].itemRef).toBe('purchase-a')
+    expect('item' in payload.findings[0].finding).toBe(false)
   })
 })

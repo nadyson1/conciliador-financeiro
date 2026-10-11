@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { BankTransaction, CardStatement, LedgerTransaction } from './types'
 import type { PersistedDecision } from './localDecisions'
-import { auditPersistedDecision } from './decisionAudit'
+import { auditPersistedDecision, isDecisionStructurallyValid } from './decisionAudit'
 import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, sheetIdentity } from './identity'
 import { reconcileCardStatement } from '../importers/cardStatement'
 
@@ -14,6 +14,12 @@ function cardStatement(): CardStatement {
 function decision(kind: PersistedDecision['kind'], identities: string[], selected: string[]): PersistedDecision { return { key: `${kind}:${JSON.stringify(identities)}`, kind, identities, selected, schemaVersion: 1, updatedAt: '2026-06-01T00:00:00.000Z' } }
 
 describe('auditoria resiliente das decisões vinculadas à CUSTOS ANO', () => {
+  it('rejeita estrutura malformada antes de resolver subject ou target', () => {
+    const malformed = { ...decision('PAIR_CONFIRMED', ['bank:key'], ['sheet:key']), key: 'PAIR_CONFIRMED:[different]' }
+    expect(isDecisionStructurallyValid(malformed)).toBe(false)
+    expect(auditPersistedDecision(malformed, { banks: [], sheets: [], statements: [] })).toMatchObject({ status: 'INVALID', resolved: true })
+  })
+
   it('mantém vínculo por ID quando a linha é reordenada ou outra coluna não relacionada muda', () => {
     const row = sheet({ category: 'Bem-estar' })
     const stmt = cardStatement()

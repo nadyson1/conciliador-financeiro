@@ -7,6 +7,8 @@ export type DismissedAuditFinding = {
   fingerprint: string
   code: AuditFinding['code']
   severityAtDismissal: AuditSeverity
+  materialSignature?: string
+  formatVersion?: 2
   dismissedAt: string
 }
 export type AuditFindingVisibility = Record<string, DismissedAuditFinding>
@@ -34,16 +36,67 @@ function semanticAnchors(value: unknown): unknown[] {
   ])
 }
 
-/** Stable identity for the user preference, independent of a finding's runtime ID and presentation. */
+function targetAnchors(finding: AuditFinding): unknown[] {
+  const technical = finding.technical ?? {}
+  const keys = new Set(['sheetIdentity', 'sheetRecordId', 'targetId', 'targetIdentity', 'selected', 'decisionKey'])
+  const walk = (value: unknown): unknown[] => {
+    if (!value || typeof value !== 'object') return []
+    if (Array.isArray(value)) return value.flatMap(walk)
+    return Object.entries(value as Record<string, unknown>).flatMap(([key, child]) => [
+      ...(keys.has(key) ? [[key, stableValue(child)]] : []), ...walk(child),
+    ])
+  }
+  return [...walk(technical), ...(finding.item?.current?.sheet ? [['currentSheet', finding.item.current.sheet.sheetRecordId ?? finding.item.current.sheet.id]] : [])]
+}
+
+/** V2 base identity: semantic issue, invariant, subject and target; material severity/cause live separately. */
 export function auditHideKey(finding: AuditFinding): string {
+  const subjectFingerprint = finding.item?.fingerprint ?? stableFingerprint([JSON.stringify(semanticAnchors(finding.technical ?? {}))])
+  const targets = targetAnchors(finding).filter((entry) => Array.isArray(entry) && entry[1] != null && entry[1] !== '')
+  const targetFingerprint = targets.length ? stableFingerprint([JSON.stringify(stableValue(targets))]) : null
+  return `audit:${stableFingerprint([JSON.stringify({ code: finding.code, invariantId: finding.invariantId, subjectFingerprint, targetFingerprint })])}`
+}
+
+/** V1 hide key, read-only migration path for existing user preferences. */
+function legacyV1AuditHideKey(finding: AuditFinding): string {
   const subjectFingerprint = finding.item?.fingerprint ?? stableFingerprint([JSON.stringify(semanticAnchors(finding.technical ?? {}))])
   const targetRow = finding.technical?.row as Record<string, unknown> | undefined
   const targetFingerprint = finding.code === 'DOUBLE_CLAIM'
     ? stableFingerprint([String(targetRow?.sheetIdentity ?? targetRow?.sheetRecordId ?? targetRow?.id ?? 'unknown-row')])
     : finding.code === 'DERIVED_STATE_MISMATCH'
       ? stableFingerprint([JSON.stringify(stableValue({ pure: finding.technical?.pure, current: finding.technical?.current, pipeline: finding.technical?.pipeline }))])
-    : null
+      : null
   return `audit:${stableFingerprint([JSON.stringify({ code: finding.code, invariantId: finding.invariantId, subjectFingerprint, targetFingerprint })])}`
+}
+
+const severityRank: Record<AuditSeverity, number> = { INFO: 0, REVIEW: 1, CRITICAL: 2 }
+function materialSignature(finding: AuditFinding): string {
+  const evidence = finding.technical ?? {}
+  const pipeline = evidence.pipeline && typeof evidence.pipeline === 'object' ? evidence.pipeline as Record<string, unknown> : {}
+  const rootCause = finding.rootCauseCode ?? finding.rootCauseKey ?? String(evidence.rootCauseCode ?? evidence.rootCauseKey ?? evidence.causeCode ?? `${finding.code}:${String(pipeline.base ?? '')}:${String(pipeline.final ?? '')}`)
+  const evidenceClass = [
+    finding.confidenceEvidence?.identityQuality ?? 'UNKNOWN',
+    Boolean(evidence.decision || evidence.validManualConfirmation || evidence.decisionId),
+    Boolean(evidence.row || evidence.sheet || finding.item?.current?.sheet),
+    Array.isArray(evidence.candidateEvaluations) ? (evidence.candidateEvaluations.length ? 'CANDIDATES' : 'NO_CANDIDATES') : 'CANDIDATE_EVIDENCE_UNKNOWN',
+    finding.confidenceEvidence?.revisionComparable === false ? 'REVISION_UNCERTAIN' : 'REVISION_COMPARABLE',
+  ]
+  const impactRank: Record<string, number> = { NONE: 0, LOW: 1, MEDIUM: 2, HIGH: 3, CRITICAL: 4 }
+  const declaredImpact = String(evidence.impactLevel ?? evidence.impactClass ?? '').toUpperCase()
+  const impactBand = declaredImpact in impactRank ? impactRank[declaredImpact] : finding.currentState && finding.expectedState && finding.currentState !== finding.expectedState ? 2 : 1
+  return JSON.stringify({ rootCause, severityRank: severityRank[finding.severity], impactBand, evidenceClass })
+}
+
+function isMateriallyWorse(finding: AuditFinding, saved: DismissedAuditFinding): boolean {
+  if (severityRank[finding.severity] > severityRank[saved.severityAtDismissal]) return true
+  if (!saved.materialSignature) return false // legacy preferences retain their historical hide behavior
+  try {
+    const previous = JSON.parse(saved.materialSignature) as { rootCause?: string; severityRank?: number; impactBand?: number; evidenceClass?: string[] }
+    const current = JSON.parse(materialSignature(finding)) as { rootCause?: string; severityRank?: number; impactBand?: number; evidenceClass?: string[] }
+    if (previous.rootCause !== current.rootCause || (current.severityRank ?? 0) > (previous.severityRank ?? 0) || (current.impactBand ?? 0) > (previous.impactBand ?? 0)) return true
+    const before = new Set(previous.evidenceClass ?? []), after = new Set(current.evidenceClass ?? [])
+    return [...after].some((item) => !before.has(item))
+  } catch { return true }
 }
 
 /** Previous key format retained only to migrate existing user hide preferences on first encounter. */
@@ -93,25 +146,27 @@ export function saveAuditFindingVisibility(visibility: AuditFindingVisibility, s
 export function dismissAuditFinding(finding: AuditFinding, current: AuditFindingVisibility, dismissedAt = new Date().toISOString()): AuditFindingVisibility {
   const fingerprint = auditHideKey(finding)
   const next = { ...current }
+  delete next[legacyV1AuditHideKey(finding)]
   delete next[legacyAuditFindingFingerprint(finding)]
-  return { ...next, [fingerprint]: { fingerprint, code: finding.code, severityAtDismissal: finding.severity, dismissedAt } }
+  return { ...next, [fingerprint]: { fingerprint, code: finding.code, severityAtDismissal: finding.severity, materialSignature: materialSignature(finding), formatVersion: 2, dismissedAt } }
 }
 
 export function restoreAuditFinding(finding: AuditFinding, current: AuditFindingVisibility): AuditFindingVisibility {
   const next = { ...current }
   delete next[auditHideKey(finding)]
+  delete next[legacyV1AuditHideKey(finding)]
   delete next[legacyAuditFindingFingerprint(finding)]
   return next
 }
 
-/** A finding stays hidden while its semantic key is persisted; severity is presentation, not identity. */
+/** A hidden finding reappears only when its material cause/evidence worsens. */
 export function isAuditFindingDismissed(finding: AuditFinding, visibility: AuditFindingVisibility): boolean {
-  const saved = visibility[auditHideKey(finding)] ?? visibility[legacyAuditFindingFingerprint(finding)]
-  return Boolean(saved)
+  const saved = visibility[auditHideKey(finding)] ?? visibility[legacyV1AuditHideKey(finding)] ?? visibility[legacyAuditFindingFingerprint(finding)]
+  return Boolean(saved && !isMateriallyWorse(finding, saved))
 }
 
 export function auditFindingDismissal(finding: AuditFinding, visibility: AuditFindingVisibility): DismissedAuditFinding | undefined {
-  const saved = visibility[auditHideKey(finding)] ?? visibility[legacyAuditFindingFingerprint(finding)]
+  const saved = visibility[auditHideKey(finding)] ?? visibility[legacyV1AuditHideKey(finding)] ?? visibility[legacyAuditFindingFingerprint(finding)]
   return saved && isAuditFindingDismissed(finding, visibility) ? saved : undefined
 }
 

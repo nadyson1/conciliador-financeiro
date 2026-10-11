@@ -49,7 +49,49 @@ describe('motor de conciliação', () => {
   it('mostra a candidata e o dono atual quando uma confirmação bancária reserva a linha', () => {
     const result = reconcile([bank('confirmed-owner', 'Café'), bank('conflicting-bank', 'Café')], [sheet('reserved-sheet', 'Café')], { confirmedPairs: new Map([['confirmed-owner', 'reserved-sheet']]) })
     expect(result.items[0]).toMatchObject({ status: 'MATCHED', sheet: { id: 'reserved-sheet' } })
-    expect(result.items[1]).toMatchObject({ status: 'REVIEW', reviewReason: 'ASSIGNMENT_CONFLICT', sheet: { id: 'reserved-sheet' }, candidate: { sheetId: 'reserved-sheet' }, assignmentConflictOwnerBankId: 'confirmed-owner' })
+    expect(result.items[1]).toMatchObject({ status: 'REVIEW', reviewReason: 'ASSIGNMENT_CONFLICT', sheet: { id: 'reserved-sheet' }, candidate: { sheetId: 'reserved-sheet' }, assignmentConflictOwnerBankId: 'confirmed-owner', candidateOwners: { 'reserved-sheet': { bankId: 'confirmed-owner', description: 'Café' } } })
+    expect(result.items[1].candidatePipeline).toEqual(expect.arrayContaining([expect.objectContaining({ sheet: expect.objectContaining({ id: 'reserved-sheet' }), disposition: 'RESERVED', ownerBankId: 'confirmed-owner' })]))
+  })
+
+  it('registra decisão e etapa exata ao filtrar uma candidata bancária rejeitada', () => {
+    const rejectedKey = 'b1::s1'
+    const result = reconcile([bank('b1', 'PIX ENVIADO')], [sheet('s1', 'Feirinha')], {
+      rejectedPairKeys: new Set([rejectedKey]),
+      rejectedPairDecisionKeys: new Map([[rejectedKey, 'PAIR_REJECTED:[bank,sheet]']]),
+    })
+    expect(result.items[0]).toMatchObject({ status: 'MISSING', reasonCode: 'MISSING_NO_CANDIDATE', candidate: null })
+    expect(result.items[0].candidatePipeline).toEqual(expect.arrayContaining([expect.objectContaining({
+      disposition: 'REJECTED_BY_DECISION',
+      reason: expect.stringContaining('rejeitado'),
+      decisionKey: 'PAIR_REJECTED:[bank,sheet]',
+      candidate: expect.objectContaining({ bankId: 'b1', sheetId: 's1' }),
+    })]))
+  })
+
+  it('recalcula após desfazer uma reserva com o mesmo resultado de uma conciliação limpa', () => {
+    const banks = [bank('A', 'Café Central'), bank('B', 'Café Central')]
+    const sheets = [sheet('X', 'Café Central')]
+    const withManualOwner = reconcile(banks, sheets, { confirmedPairs: new Map([['A', 'X']]) })
+    expect(withManualOwner.items).toMatchObject([
+      { status: 'MATCHED', bank: { id: 'A' }, sheet: { id: 'X' } },
+      { status: 'REVIEW', bank: { id: 'B' }, reviewReason: 'ASSIGNMENT_CONFLICT', candidate: { sheetId: 'X' }, assignmentConflictOwnerBankId: 'A' },
+    ])
+
+    // Removing A's decision means recomputing from the unchanged sources and remaining decisions.
+    const afterUndo = reconcile(banks, sheets, { confirmedPairs: new Map() })
+    const cleanSession = reconcile(banks, sheets)
+    expect(afterUndo).toEqual(cleanSession)
+    expect(afterUndo.items.map((item) => item.status)).toEqual(['REVIEW', 'REVIEW'])
+    expect(afterUndo.items.some((item) => item.status === 'MISSING')).toBe(false)
+  })
+
+  it('mantém candidatos ambíguos em REVIEW e só classifica como MISSING sem candidato restante', () => {
+    const ambiguous = reconcile([bank('bank', 'Mercado Central')], [sheet('x', 'Mercado Central'), sheet('y', 'Mercado Central')])
+    expect(ambiguous.items[0]).toMatchObject({ status: 'REVIEW', candidate: expect.any(Object), candidateSheets: [{ id: 'x' }, { id: 'y' }] })
+    expect(ambiguous.items[0].status).not.toBe('MISSING')
+
+    const missing = reconcile([bank('without-candidate', 'PIX ENVIADO', '2026-03-02', 1200)], [])
+    expect(missing.items[0]).toMatchObject({ status: 'MISSING', candidate: null })
   })
 
   it('atribui globalmente duas movimentações repetidas a duas linhas sem reutilizar a mesma linha', () => {

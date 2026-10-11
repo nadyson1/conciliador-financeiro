@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { auditConsistency, auditDecisionMerge, DECISION_DOMAIN, derivedMismatchSeverity, filterAuditFindings, recomputeWithoutPersistedDecisions, type AuditFinding } from './consistencyAudit'
+import { auditConsistency, auditDecisionMerge, calculateDiagnosticConfidence, DECISION_DOMAIN, derivedMismatchSeverity, evaluateInvariantExecutions, filterAuditFindings, finalizeAuditInputSnapshot, recomputeWithoutPersistedDecisions, runAuditSelfChecks, summarizeAudit, type AuditFinding } from './consistencyAudit'
+import { deriveExpectedReconciliationState } from './expectedReconciliationState'
+import { createAuditInputSnapshot } from './auditInputSnapshot'
 import type { BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, LedgerTransaction, ReconciliationItem } from './types'
-import type { PersistedDecision } from './localDecisions'
-import { cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity, stableFingerprint } from './identity'
+import { decisionKey, type PersistedDecision } from './localDecisions'
+import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity, stableFingerprint } from './identity'
+import { reconcile } from '../matching/reconcile'
 
 const statement: CardStatement = {
   fileName: 'fatura-sintetica.pdf', pageCount: 1, statementIdentity: 'statement-current', transactions: [{
@@ -16,6 +19,89 @@ const missingMatch = (): CardStatementMatch => ({ transaction: statement.transac
 const oldMissing: PersistedDecision = { key: 'CARD_MISSING_CONFIRMED:["old-identity"]', schemaVersion: 1, kind: 'CARD_MISSING_CONFIRMED', identities: ['old-identity'], selected: [], updatedAt: '2026-02-03T00:00:00.000Z' }
 
 describe('consistency audit', () => {
+  it('deriva expectedState e explanationChain das regras efetivas sem confundir pure com current', () => {
+    const rejected = deriveExpectedReconciliationState({ subjectId: 'bank-a', pureState: 'MATCHED', currentState: 'MISSING', validRejection: { decisionId: 'decision-reject-a', outcome: 'MISSING' } })
+    expect(rejected).toMatchObject({ pureState: 'MATCHED', expectedState: 'MISSING', currentState: 'MISSING' })
+    expect(rejected.explanationChain.map((step) => step.stage)).toEqual(['PURE_MATCHING', 'DECISION', 'FINAL_ASSIGNMENT'])
+    const confirmed = deriveExpectedReconciliationState({ subjectId: 'purchase-a', pureState: 'CARD_REVIEW', currentState: 'CARD_MISSING', validManualAssignment: { decisionId: 'decision-confirm-a', targetId: 'row-a' } })
+    expect(confirmed).toMatchObject({ pureState: 'CARD_REVIEW', expectedState: 'CARD_MATCHED', currentState: 'CARD_MISSING', expectedTargetId: 'row-a' })
+    expect(confirmed.explanationChain.at(-1)?.outcome).toBe('CARD_MATCHED')
+    const reservation = deriveExpectedReconciliationState({ subjectId: 'purchase-b', pureState: 'CARD_MATCHED', currentState: 'CARD_REVIEW', reservationOwner: { subjectId: 'purchase-a', targetId: 'row-a', decisionId: 'decision-a' } })
+    expect(reservation).toMatchObject({ expectedState: 'CARD_REVIEW', currentState: 'CARD_REVIEW' })
+  })
+
+  it('conta apenas invariantes executadas e informa fontes indisponíveis/revisões mistas', () => {
+    const base = { banks: [], sheets: [], statements: [], currentCardMatches: [], localDecisions: [] }
+    const partial = evaluateInvariantExecutions({ ...base, statements: [{ statement, legacyStatementIdentity: undefined }], auditInputSnapshot: createAuditInputSnapshot({ banks: [], sheets: [], statements: [statement], decisions: [], unavailableSources: ['google-current-ledger'] }) }, [])
+    expect(partial.find((entry) => entry.invariantId === 'INV-04')).toMatchObject({ status: 'UNAVAILABLE', sourcesRequired: expect.arrayContaining(['cardStatements', 'custosAno', 'currentCardResults']) })
+    expect(partial.find((entry) => entry.invariantId === 'INV-07')?.status).toBe('NOT_APPLICABLE')
+    const mixed = evaluateInvariantExecutions({ ...base, statements: [{ statement }], auditInputSnapshot: createAuditInputSnapshot({ banks: [], sheets: [], statements: [statement], decisions: [], mixedRevisionSources: ['derived-source-result'] }) }, [])
+    expect(mixed.find((entry) => entry.invariantId === 'INV-04')?.status).toBe('SKIPPED_DUE_TO_REVISION')
+    expect(mixed.filter((entry) => entry.status === 'EXECUTED_PASS').length).toBeLessThan(mixed.length)
+  })
+
+  it('contadores consideram apenas findings de topo, sem inflar por evidências relacionadas', () => {
+    const primary = { id: 'root', code: 'DOUBLE_CLAIM', severity: 'CRITICAL', role: 'PRIMARY', status: 'ACTIVE', technical: {} } as AuditFinding
+    const related = { id: 'child', code: 'ASSIGNMENT_CONFLICT', severity: 'CRITICAL', role: 'RELATED', status: 'ACTIVE', technical: {} } as AuditFinding
+    expect(summarizeAudit([primary, related], []).attention).toBe(1)
+    expect(summarizeAudit([primary, related], []).critical).toBe(1)
+  })
+
+  it('mantém resultados determinísticos para o mesmo snapshot e executa self-checks sem inconsistências', () => {
+    const input = { banks: [], sheets: [kindle], statements: [{ statement }], currentCardMatches: [{ statementIdentity: statement.statementIdentity, transactionId: statement.transactions[0].id, match: missingMatch() }], localDecisions: [] }
+    const first = auditConsistency(input), second = auditConsistency(input)
+    const stable = (report: typeof first) => report.findings.map(({ code, id, severity, rootCauseKey, expectedState, explanationChain }) => ({ code, id, severity, rootCauseKey, expectedState, explanationChain }))
+    expect(stable(first)).toEqual(stable(second))
+    expect(first.auditSelfChecks.every((check) => check.status !== 'FAIL')).toBe(true)
+    expect(first.invariantExecutions).toEqual(expect.arrayContaining([expect.objectContaining({ invariantId: 'INV-04', status: 'EXECUTED_PASS' })]))
+  })
+
+  it('detecta violação interna de contrato de contagem de candidatos', () => {
+    const check = runAuditSelfChecks({ items: [], decisions: [], findings: [{ id: 'bad-trace', code: 'MISSING_WITH_STRONG_CANDIDATE', severity: 'CRITICAL', category: 'STATE', invariantId: 'INV-03', title: 'Falha', detail: 'Falha', diagnosis: 'Falha', whyItMatters: 'Falha', recommendedAction: 'Revisar', diagnosticConfidence: 'HIGH', safeAutomaticAction: false, status: 'ACTIVE', explanationSource: 'NONE', technical: { candidateCountRelevant: 2, candidateEvaluations: [] }, role: 'PRIMARY', rootCauseCode: 'RECONCILIATION_ASSIGNMENT', rootCauseKey: 'RECONCILIATION_ASSIGNMENT:subject' }] })
+    expect(check.find((entry) => entry.checkId === 'CANDIDATE_COUNT_TRACE')).toMatchObject({ status: 'FAIL', findingIds: ['bad-trace'] })
+  })
+
+  it('autocheca evidência crítica, referências ao snapshot, chains e duplicação de primary', () => {
+    const make = (id: string, overrides: Partial<AuditFinding> = {}): AuditFinding => ({ id, code: 'MISSING_WITH_STRONG_CANDIDATE', severity: 'CRITICAL', category: 'STATE', invariantId: 'INV-03', title: id, detail: id, diagnosis: id, whyItMatters: id, recommendedAction: 'Revisar', diagnosticConfidence: 'HIGH', safeAutomaticAction: false, status: 'ACTIVE', explanationSource: 'NONE', role: 'PRIMARY', rootCauseCode: 'ASSIGNMENT', rootCauseKey: 'ASSIGNMENT:subject', technical: { proof: true }, ...overrides })
+    const evidence = make('evidence')
+    const duplicate = make('duplicate')
+    const related = make('related', { role: 'RELATED', rootCauseKey: 'ORPHAN:subject', technical: {} })
+    const noEvidence = make('no-evidence', { rootCauseKey: 'NO_EVIDENCE:subject', technical: {} })
+    const reference = make('reference', { rootCauseKey: 'DECISION:subject', technical: { decision: { key: 'absent-decision' } } })
+    const subject = { ...auditConsistency({ banks: [], sheets: [], statements: [{ statement }], currentCardMatches: [{ statementIdentity: statement.statementIdentity, transactionId: statement.transactions[0].id, match: missingMatch() }], localDecisions: [] }).items[0], expectedState: missingMatch(), explanationChain: [{ stage: 'PURE_MATCHING' as const, outcome: 'CARD_MATCHED' }] }
+    const checks = runAuditSelfChecks({ items: [subject], findings: [evidence, duplicate, related, noEvidence, reference], decisions: [], snapshot: createAuditInputSnapshot({ banks: [], sheets: [], statements: [], decisions: [] }) })
+    expect(checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ checkId: 'UNIQUE_PRIMARY_ROOT_CAUSE', status: 'FAIL' }),
+      expect.objectContaining({ checkId: 'RELATED_FINDING_HAS_PRIMARY', status: 'FAIL' }),
+      expect.objectContaining({ checkId: 'CRITICAL_EVIDENCE', status: 'FAIL' }),
+      expect.objectContaining({ checkId: 'DECISION_REFERENCE_IN_SNAPSHOT', status: 'FAIL' }),
+      expect.objectContaining({ checkId: 'EXPECTED_STATE_EXPLANATION', status: 'FAIL' }),
+    ]))
+  })
+
+  it('separa severidade de confiança e reduz confiança quando a evidência é incompleta', () => {
+    expect(calculateDiagnosticConfidence({ identityQuality: 'CANONICAL', sourceCoverage: 'COMPLETE', revisionComparable: true, evidenceCount: 3, validDecision: false, targetCanonical: true })).toBe('HIGH')
+    expect(calculateDiagnosticConfidence({ identityQuality: 'CANONICAL', sourceCoverage: 'PARTIAL', revisionComparable: true, evidenceCount: 3, validDecision: true, targetCanonical: true })).toBe('LOW')
+    expect(calculateDiagnosticConfidence({ identityQuality: 'HEURISTIC', sourceCoverage: 'COMPLETE', revisionComparable: true, evidenceCount: 1, validDecision: false, targetCanonical: false })).toBe('MEDIUM')
+    expect(derivedMismatchSeverity('CARD_MATCHED', 'CARD_MISSING', true)).toBe('CRITICAL')
+  })
+
+  it('detecta resultado derivado calculado com decisionRevision antiga', () => {
+    const report = auditConsistency({ banks: [], sheets: [], statements: [], currentCardMatches: [], localDecisions: [], currentDecisionRevision: 'revision-11', derivedDecisionRevision: 'revision-10' })
+    expect(report.findings.find((finding) => finding.code === 'STALE_DECISION_RESULT')?.technical).toEqual({ currentDecisionRevision: 'revision-11', derivedDecisionRevision: 'revision-10' })
+  })
+
+  it('detecta conflito global bancário e confirmações válidas que não foram aplicadas', () => {
+    const makeBank = (id: string): BankTransaction => ({ id, source: 'BANK', sheetRecordId: null, bankTransactionId: id, date: kindle.date, description: kindle.description, originalDescription: kindle.originalDescription, amount: kindle.amount, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: 'Pix', category: '', month: '', year: kindle.year, isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {} })
+    const first = makeBank('bank-owner-a'), second = makeBank('bank-owner-b')
+    const pair = (bank: BankTransaction): PersistedDecision => ({ key: decisionKey('PAIR_CONFIRMED', [bankIdentity(bank)]), kind: 'PAIR_CONFIRMED', identities: [bankIdentity(bank)], selected: [sheetIdentity(kindle)], schemaVersion: 1, updatedAt: '2026-10-10T10:00:00.000Z' })
+    const conflict = auditConsistency({ banks: [first, second], sheets: [kindle], statements: [], currentCardMatches: [], localDecisions: [pair(first), pair(second)] })
+    expect(conflict.findings.find((finding) => finding.code === 'PAIR_CONFIRMED_ASSIGNMENT_CONFLICT')?.technical?.assignments).toHaveLength(2)
+    const notApplied = auditConsistency({ banks: [first], sheets: [kindle], statements: [], currentCardMatches: [], localDecisions: [pair(first)] })
+    expect(notApplied.findings.map((finding) => finding.code)).toContain('VALID_BANK_MANUAL_MATCH_NOT_APPLIED')
+    expect(notApplied.expectedStates[bankIdentity(first)]).toMatchObject({ expectedState: 'MATCHED', currentState: 'UNAVAILABLE', expectedTargetId: sheetIdentity(kindle) })
+  })
+
   it('diagnostica REVIEW sem candidato, estorno ainda ausente e duplicata entre extratos', () => {
     const makeBank = (id: string, sourceId?: string): BankTransaction => ({ id, source: 'BANK', sheetRecordId: null, bankTransactionId: id, date: '2026-09-18', description: 'PIX QR CODE ESTATICO', originalDescription: 'PIX QR CODE ESTATICO', amount: 67770, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: '', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {}, ...(sourceId ? { statementSourceId: sourceId, statementFileName: `${sourceId}.csv` } : {}) })
     const bank = makeBank('original', 'statement-a')
@@ -46,6 +132,84 @@ describe('consistency audit', () => {
     const item = { bank, status: 'MISSING', sheet: null, candidate: null, composition: [], compositionOptions: [], compositionStatus: null } as unknown as ReconciliationItem
     const report = auditConsistency({ banks: [bank], sheets: [kindle], statements: [], currentCardMatches: [], localDecisions: [], currentBankItems: [item] })
     expect(report.findings).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'MISSING_WITH_STRONG_CANDIDATE', severity: 'CRITICAL' })]))
+  })
+
+  it('explica no finding a decisão PAIR_REJECTED que removeu a candidata antes da atribuição', () => {
+    const bank: BankTransaction = { id: 'bank-rejected', source: 'BANK', sheetRecordId: null, bankTransactionId: 'bank-rejected', date: '2026-03-12', description: 'PIX ENVIADO', originalDescription: 'PIX ENVIADO', amount: 299, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: 'Pix', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const pairKey = 'bank-rejected::row-new'
+    const decisionKey = 'PAIR_REJECTED:[bank-rejected,kindle-row-1]'
+    const result = reconcile([bank], [kindle], { rejectedPairKeys: new Set([pairKey]), rejectedPairDecisionKeys: new Map([[pairKey, decisionKey]]) })
+    const report = auditConsistency({ banks: [bank], sheets: [kindle], currentSheets: [kindle], statements: [], currentCardMatches: [], localDecisions: [], currentBankItems: result.items })
+    const finding = report.findings.find((item) => item.code === 'MISSING_WITH_STRONG_CANDIDATE')
+    expect(result.items[0].status).toBe('MISSING')
+    expect(finding).toMatchObject({
+      severity: 'CRITICAL', explanationSource: 'MANUAL_DECISION',
+      technical: {
+        candidateCountRelevant: 1, candidateCountEvaluated: 1,
+        pipelineStage: 'DECISION_FILTERING / PAIR_REJECTED',
+        decisions: [{ kind: 'PAIR_REJECTED', key: decisionKey }],
+        candidateEvaluations: [{ disposition: 'REJECTED_BY_DECISION', decisionKey, reason: expect.stringContaining('decisão persistida') }],
+      },
+    })
+    expect(finding?.detail).toContain('não pôde ser validada com segurança')
+  })
+
+  it('classifica MISSING como esperado quando a única candidata foi rejeitada por decisão ativa válida', () => {
+    const bank: BankTransaction = { id: 'bank-rejected', source: 'BANK', sheetRecordId: null, bankTransactionId: 'bank-rejected', date: '2026-03-12', description: 'PIX ENVIADO', originalDescription: 'PIX ENVIADO', amount: 299, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: 'Pix', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const rejection: PersistedDecision = { key: decisionKey('PAIR_REJECTED', [bankIdentity(bank), sheetIdentity(kindle)]), schemaVersion: 1, kind: 'PAIR_REJECTED', identities: [bankIdentity(bank), sheetIdentity(kindle)], selected: [], updatedAt: '2026-10-09T12:00:00.000Z' }
+    const rejectedKey = 'bank-rejected::row-new'
+    const result = reconcile([bank], [kindle], { rejectedPairKeys: new Set([rejectedKey]), rejectedPairDecisionKeys: new Map([[rejectedKey, rejection.key]]) })
+    const report = auditConsistency({ banks: [bank], sheets: [kindle], statements: [], currentCardMatches: [], localDecisions: [rejection], currentBankItems: result.items })
+
+    expect(result.items[0].status).toBe('MISSING')
+    expect(report.findings.find((finding) => finding.code === 'EXPECTED_MANUAL_REJECTION')).toMatchObject({ severity: 'INFO', status: 'EXPECTED', explanationSource: 'MANUAL_DECISION', currentState: 'MISSING', expectedState: 'MISSING' })
+    expect(report.expectedStates[bankIdentity(bank)]).toMatchObject({ expectedState: 'MISSING', currentState: 'MISSING' })
+    expect(report.expectedStates[bankIdentity(bank)].explanationChain.map((step) => step.stage)).toContain('DECISION')
+    expect(report.findings.some((finding) => finding.code === 'MISSING_WITH_STRONG_CANDIDATE')).toBe(false)
+    expect(report.summary).toMatchObject({ critical: 0, attention: 0, informational: 1 })
+  })
+
+  it('classifica duas rejeições válidas como esperadas e preserva a trilha das duas decisões', () => {
+    const bank: BankTransaction = { id: 'bank-two-rejections', source: 'BANK', sheetRecordId: null, bankTransactionId: 'bank-two-rejections', date: '2026-03-12', description: 'PIX ENVIADO', originalDescription: 'PIX ENVIADO', amount: 299, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: 'Pix', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const rows = [kindle, { ...kindle, id: 'second-row-id', sheetRecordId: 'second-row', originalDescription: 'Compra Mercado', description: 'Compra Mercado' }]
+    const decisions = rows.map((row): PersistedDecision => ({ key: decisionKey('PAIR_REJECTED', [bankIdentity(bank), sheetIdentity(row)]), schemaVersion: 1, kind: 'PAIR_REJECTED', identities: [bankIdentity(bank), sheetIdentity(row)], selected: [], updatedAt: '2026-10-09T12:00:00.000Z' }))
+    const keys = rows.map((row) => `${bank.id}::${row.id}`)
+    const result = reconcile([bank], rows, { rejectedPairKeys: new Set(keys), rejectedPairDecisionKeys: new Map(keys.map((key, index) => [key, decisions[index].key])) })
+    const report = auditConsistency({ banks: [bank], sheets: rows, statements: [], currentCardMatches: [], localDecisions: decisions, currentBankItems: result.items })
+    const finding = report.findings.find((entry) => entry.code === 'EXPECTED_MANUAL_REJECTION')
+
+    expect(result.items[0].status).toBe('MISSING')
+    expect(finding?.detail).toContain('2 candidata(s)')
+    expect(finding?.technical?.decisions).toHaveLength(2)
+    expect(report.findings.some((entry) => entry.code === 'MISSING_WITH_STRONG_CANDIDATE')).toBe(false)
+  })
+
+  it('mantém o finding crítico se a rejeição foi tombstonada ou não pode ser validada', () => {
+    const bank: BankTransaction = { id: 'bank-rejection-invalid', source: 'BANK', sheetRecordId: null, bankTransactionId: 'bank-rejection-invalid', date: '2026-03-12', description: 'PIX ENVIADO', originalDescription: 'PIX ENVIADO', amount: 299, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: 'Pix', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const validKey = decisionKey('PAIR_REJECTED', [bankIdentity(bank), sheetIdentity(kindle)])
+    const rejection: PersistedDecision = { key: validKey, schemaVersion: 1, kind: 'PAIR_REJECTED', identities: [bankIdentity(bank), sheetIdentity(kindle)], selected: [], updatedAt: '2026-10-09T12:00:00.000Z' }
+    const rejectedKey = 'bank-rejection-invalid::row-new'
+    const result = reconcile([bank], [kindle], { rejectedPairKeys: new Set([rejectedKey]), rejectedPairDecisionKeys: new Map([[rejectedKey, validKey]]) })
+    const tombstoned = auditConsistency({ banks: [bank], sheets: [kindle], statements: [], currentCardMatches: [], localDecisions: [], localTombstones: { [validKey]: { updatedAt: '2026-10-09T12:01:00.000Z', decision: rejection } }, currentBankItems: result.items })
+    const invalid = { ...rejection, key: 'PAIR_REJECTED:legacy-or-malformed' }
+    const unvalidated = auditConsistency({ banks: [bank], sheets: [kindle], statements: [], currentCardMatches: [], localDecisions: [invalid], currentBankItems: result.items })
+    const confirmation: PersistedDecision = { key: decisionKey('PAIR_CONFIRMED', [bankIdentity(bank)]), schemaVersion: 1, kind: 'PAIR_CONFIRMED', identities: [bankIdentity(bank)], selected: [sheetIdentity(kindle)], updatedAt: '2026-10-09T12:02:00.000Z' }
+    const conflicting = auditConsistency({ banks: [bank], sheets: [kindle], statements: [], currentCardMatches: [], localDecisions: [rejection, confirmation], currentBankItems: result.items })
+
+    expect(tombstoned.findings.find((entry) => entry.code === 'MISSING_WITH_STRONG_CANDIDATE')).toMatchObject({ severity: 'CRITICAL', explanationSource: 'MANUAL_DECISION' })
+    expect(tombstoned.findings.some((entry) => entry.code === 'EXPECTED_MANUAL_REJECTION')).toBe(false)
+    expect(unvalidated.findings.find((entry) => entry.code === 'MISSING_WITH_STRONG_CANDIDATE')).toMatchObject({ severity: 'CRITICAL' })
+    expect(conflicting.findings.find((entry) => entry.code === 'MISSING_WITH_STRONG_CANDIDATE')).toMatchObject({ severity: 'CRITICAL' })
+  })
+
+  it('aponta divergência de fonte quando a candidata da auditoria não aparece na trilha do resultado atual', () => {
+    const bank: BankTransaction = { id: 'bank-source-diff', source: 'BANK', sheetRecordId: null, bankTransactionId: 'bank-source-diff', date: '2026-03-12', description: 'PIX ENVIADO', originalDescription: 'PIX ENVIADO', amount: 299, direction: 'DEBIT', directionKnown: true, type: 'EXPENSE', paymentMethod: 'Pix', category: '', month: '', year: '2026', isFixed: null, isEssential: null, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const item = { bank, status: 'MISSING', sheet: null, candidate: null, candidatePipeline: [], composition: [], compositionOptions: [], compositionStatus: null } as unknown as ReconciliationItem
+    const report = auditConsistency({ banks: [bank], sheets: [kindle], currentSheets: [], statements: [], currentCardMatches: [], localDecisions: [], currentBankItems: [item] })
+    const finding = report.findings.find((entry) => entry.code === 'MISSING_WITH_STRONG_CANDIDATE')
+    expect(finding).toMatchObject({
+      technical: { candidateCountRelevant: 1, candidateCountEvaluated: 0, pipelineStage: 'SOURCE_OR_TRACE_DIVERGENCE', candidateEvaluations: [{ disposition: 'NOT_IN_CURRENT_MATCHING_PIPELINE', reason: expect.stringContaining('não na cópia') }] },
+    })
   })
 
   it('detecta confirmação manual que ainda deriva para REVIEW', () => {
@@ -120,8 +284,9 @@ describe('consistency audit', () => {
       { statementIdentity: statement.statementIdentity, transactionId: 'kindle-purchase', match: { ...missingMatch(), status: 'CARD_MATCHED', sheet: kindle } },
       { statementIdentity: otherStatement.statementIdentity, transactionId: 'other-purchase', match: { ...missingMatch(), transaction: otherTransaction, status: 'CARD_MATCHED', sheet: kindle } },
     ], localDecisions: [confirmed] })
-    const doubleClaim = report.findings.find((finding) => finding.code === 'DOUBLE_CLAIM')
-    expect(doubleClaim?.relatedFindings?.map((item) => item.code)).toContain('DOUBLE_CLAIM_AFTER_CONFIRMATION')
+    const root = report.findings.find((finding) => finding.rootCauseCode === 'SHEET_ROW_MULTIPLE_OWNERS')
+    expect(root?.code).toBe('RESERVED_SHEET_ROW_REUSED')
+    expect(report.findings.flatMap((finding) => finding.relatedFindings ?? []).map((item) => item.code)).toContain('DOUBLE_CLAIM_AFTER_CONFIRMATION')
   })
 
   it('detecta owners manuais incompatíveis na auditoria rápida e invalida a validade global das duas decisões', () => {
@@ -341,6 +506,16 @@ describe('consistency audit', () => {
     expect(report.findings.some((finding) => finding.code === 'CURRENT_SOURCE_DIVERGENCE')).toBe(true)
   })
 
+  it('reclassifies source divergence when displayed and audited source revisions differ', () => {
+    const snapshot = createAuditInputSnapshot({ banks: [], sheets: [kindle], statements: [statement], decisions: [], mixedRevisionSources: ['derived-source-result'] })
+    const base = auditConsistency({ banks: [], sheets: [], statements: [], currentCardMatches: [], localDecisions: [] })
+    const sourceFinding = { id: 'source-diff', code: 'CURRENT_SOURCE_DIVERGENCE', severity: 'CRITICAL', category: 'SOURCE', invariantId: 'INV-08', title: 'Source diff', detail: 'Diff', diagnosis: 'Diff', whyItMatters: 'Diff', recommendedAction: 'Review', diagnosticConfidence: 'HIGH', safeAutomaticAction: false, status: 'ACTIVE', explanationSource: 'SOURCE_LIFECYCLE' } as unknown as AuditFinding
+    const report = { ...base, findings: [sourceFinding] }
+    const finalized = finalizeAuditInputSnapshot(report, snapshot)
+    expect(finalized.findings.find((finding) => finding.code === 'CURRENT_SOURCE_DIVERGENCE')?.severity).toBe('REVIEW')
+    expect(finalized.findings.map((finding) => finding.code)).toContain('AUDIT_INPUT_REVISION_MISMATCH')
+  })
+
   it('identifies the persisted rejected-candidate filter as the exact MISSING stage', () => {
     const fingerprint = cardTransactionIdentityVariants(statement, statement.transactions[0])[0]
     const rejected: PersistedDecision = { ...oldMissing, kind: 'CARD_REVIEW_REJECTED_CANDIDATES', key: `CARD_REVIEW_REJECTED_CANDIDATES:${JSON.stringify([fingerprint])}`, identities: [fingerprint], selected: [cardReviewCandidateIdentity(kindle)] }
@@ -478,7 +653,7 @@ describe('consistency audit', () => {
   })
 
   it('filters every severity group and excludes maintenance/information from attention counts', () => {
-    const findings = (['CRITICAL', 'REVIEW', 'INFO', 'INFO', 'INFO'] as const).map((severity, index) => ({ id: `finding-${index}`, code: 'DECISION_STATUS', severity, status: index === 2 ? 'MAINTENANCE' : index === 3 ? 'LEGACY' : 'ACTIVE', title: severity, detail: severity })) as AuditFinding[]
+    const findings = (['CRITICAL', 'REVIEW', 'INFO', 'INFO', 'INFO'] as const).map((severity, index) => ({ id: `finding-${index}`, code: 'AUDITOR_INTERNAL_INCONSISTENCY', severity, status: index === 2 ? 'MAINTENANCE' : index === 3 ? 'LEGACY' : 'ACTIVE', title: severity, detail: severity })) as AuditFinding[]
     expect(filterAuditFindings(findings, 'ALL')).toHaveLength(5)
     expect(filterAuditFindings(findings, 'CRITICAL').map((item) => item.severity)).toEqual(['CRITICAL'])
     expect(filterAuditFindings(findings, 'REVIEW').map((item) => item.severity)).toEqual(['REVIEW'])

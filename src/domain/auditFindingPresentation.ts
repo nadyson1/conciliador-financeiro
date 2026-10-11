@@ -8,6 +8,7 @@ const severityLabels: Record<AuditSeverity, string> = {
 const descriptions: Record<AuditFinding['code'], { title: string; explanation: string }> = {
   MISSING_COM_CANDIDATO: { title: 'Há um lançamento compatível que merece conferência', explanation: 'A conciliação marcou uma movimentação como ausente, mas encontrou um lançamento da planilha que pode corresponder a ela.' },
   MISSING_WITH_STRONG_CANDIDATE: { title: 'Movimentação ausente com candidato plausível', explanation: 'A busca atual encontrou uma linha da CUSTOS ANO que passa pelos critérios mínimos de compatibilidade.' },
+  EXPECTED_MANUAL_REJECTION: { title: 'Candidatas rejeitadas anteriormente pelo usuário', explanation: 'As candidatas plausíveis foram rejeitadas por decisões ativas e válidas. A movimentação permanece ausente conforme essa escolha.' },
   CARD_MISSING_NO_CANDIDATE: { title: 'Uma compra pode estar sendo considerada ausente incorretamente', explanation: 'Uma linha da planilha foi descartada pela classificação atual, embora seus dados possam ser relevantes para esta compra.' },
   DERIVED_STATE_MISMATCH: { title: 'O resultado da compra mudou durante a conciliação', explanation: 'As etapas da conciliação chegaram a resultados diferentes para esta compra. Confira os dados antes de tomar uma decisão.' },
   EXPECTED_OVERRIDE: { title: 'Uma confirmação manual explica o resultado', explanation: 'O matcher puro não aplica escolhas salvas. Uma confirmação manual válida explica o estado atual.' },
@@ -30,8 +31,13 @@ const descriptions: Record<AuditFinding['code'], { title: string; explanation: s
   DOUBLE_CLAIM_AFTER_CONFIRMATION: { title: 'Uma escolha manual ainda deixa outro vínculo ativo', explanation: 'Mais de uma compra continua reivindicando a mesma linha depois de uma confirmação manual.' },
   MULTIPLE_INCOMPATIBLE_ACTIVE_DECISIONS: { title: 'Duas confirmações manuais usam a mesma linha', explanation: 'Confirmações ativas de compras diferentes apontam para uma única linha da CUSTOS ANO.' },
   RESERVED_SHEET_ROW_REUSED: { title: 'Uma linha reservada foi reutilizada', explanation: 'O matching atual associou a outro subject uma linha já reservada por confirmação manual.' },
-  MATCHED_BUT_STILL_REVIEW: { title: 'Uma compra confirmada ainda aparece para revisar', explanation: 'Há uma confirmação manual ativa, mas o resultado atual da compra continua em revisão ou ausente.' },
   VALID_MANUAL_MATCH_NOT_APPLIED: { title: 'Confirmação manual válida não foi aplicada', explanation: 'Existe uma confirmação manual globalmente válida, mas o resultado final não mostra o lançamento selecionado.' },
+  VALID_BANK_MANUAL_MATCH_NOT_APPLIED: { title: 'Confirmação bancária válida não foi aplicada', explanation: 'Existe uma confirmação bancária válida, mas o resultado final não mostra a linha escolhida.' },
+  PAIR_CONFIRMED_ASSIGNMENT_CONFLICT: { title: 'Confirmações bancárias incompatíveis', explanation: 'Mais de uma movimentação bancária reivindica a mesma linha da CUSTOS ANO.' },
+  INVALID_DECISION_APPLIED: { title: 'Uma decisão inválida influenciou o resultado', explanation: 'Uma decisão que não passou pela validação estrutural foi aplicada à conciliação.' },
+  STALE_DECISION_RESULT: { title: 'O resultado usa uma revisão antiga', explanation: 'As decisões efetivas mudaram depois do cálculo deste resultado.' },
+  AUDIT_INPUT_REVISION_MISMATCH: { title: 'As fontes da auditoria não são totalmente comparáveis', explanation: 'A auditoria registra as revisões capturadas e informa se alguma fonte mudou, faltou ou divergiu do resultado exibido.' },
+  AUDITOR_INTERNAL_INCONSISTENCY: { title: 'A auditoria encontrou uma inconsistência interna', explanation: 'Uma verificação de autoconsistência do próprio relatório não passou. Os resultados relacionados precisam de revisão técnica antes de orientar uma ação financeira.' },
   MISSING_ACTION_INCONSISTENCY: { title: 'Uma despesa ausente não mostra a ação de adicionar', explanation: 'A movimentação atende aos critérios de inclusão, mas o botão para adicioná-la à CUSTOS ANO não foi exibido.' },
   CARD_PAYMENT_AS_EXPENSE_MISSING: { title: 'O pagamento da fatura aparece como despesa ausente', explanation: 'O pagamento agregado deve ser ligado ao total da fatura, sem entrar nas despesas individuais.' },
   UNUSED_STRONG_CANDIDATE: { title: 'Uma linha compatível não foi usada', explanation: 'Existe uma linha que passou pela busca de compatibilidade, mas ela não foi atribuída a esta compra.' },
@@ -43,7 +49,6 @@ const descriptions: Record<AuditFinding['code'], { title: string; explanation: s
   IGNORED_DECISION_REVIEW: { title: 'Uma decisão de ignorar precisa ser conferida', explanation: 'Uma movimentação ignorada ainda apresenta evidências que podem justificar uma nova análise.' },
   CURRENT_SOURCE_DIVERGENCE: { title: 'A planilha carregada difere da leitura atual', explanation: 'Os dados disponíveis na sessão e a leitura mais recente da CUSTOS ANO não apresentam os mesmos lançamentos.' },
   REJECTED_CANDIDATE_FILTERED: { title: 'Uma rejeição salva removeu uma linha compatível', explanation: 'Uma decisão anterior está excluindo uma linha que a busca atual considera candidata.' },
-  DECISION_STATUS: { title: 'Uma decisão salva precisa de conferência', explanation: 'O estado atual de uma decisão não pode ser aplicado com segurança ao resultado analisado.' },
   SYNC_PENDING: { title: 'Há alterações aguardando sincronização', explanation: 'Algumas decisões ainda não foram atualizadas entre este dispositivo e a cópia sincronizada.' },
   REVIEW_WITHOUT_CANDIDATES: { title: 'Movimentação enviada para revisão sem candidato', explanation: 'A conciliação marcou uma movimentação para revisão, mas não encontrou uma correspondência plausível.' },
   ASSIGNMENT_CONFLICT: { title: 'Candidata reservada por outra movimentação', explanation: 'A linha da CUSTOS ANO é uma candidata plausível, mas a atribuição global a reservou para outra movimentação.' },
@@ -53,6 +58,40 @@ const descriptions: Record<AuditFinding['code'], { title: string; explanation: s
   MISSING_COUNT_DIVERGENCE: { title: 'Os números de Ausentes não conferem', explanation: 'Os contadores da tela receberam listas diferentes de lançamentos ausentes.' },
   DUPLICATE_PRESENT_BUT_MARKED_MISSING: { title: 'Um PDF duplicado presente foi marcado como ausente', explanation: 'Uma fatura continua presente por mais de um arquivo, mas um dos arquivos foi contado como removido.' },
 }
+
+export type AuditCodeLifecycle = 'emitted' | 'legacy' | 'related-only'
+export type AuditCodeCatalogEntry = {
+  lifecycle: AuditCodeLifecycle
+  presentation: { title: string; explanation: string }
+  severityPolicy: 'EVIDENCE_AND_IMPACT'
+  confidencePolicy: 'EVIDENCE_BASED'
+  invariantId: string
+  role: 'PRIMARY' | 'RELATED' | 'EXPECTED_OR_INFO' | 'LEGACY'
+  rootCauseBehavior: 'SEMANTIC_SUBJECT_AND_TARGET'
+  exportMapping: 'COMPACT_CSV_AND_TECHNICAL_JSON'
+}
+const catalogInvariant: Partial<Record<AuditFinding['code'], string>> = {
+  DOUBLE_CLAIM: 'INV-01', DOUBLE_CLAIM_AFTER_CONFIRMATION: 'INV-02', ORPHANED_SHEET_REFERENCE: 'INV-02', EDITED_SHEET_REFERENCE: 'INV-02',
+  MISSING_COM_CANDIDATO: 'INV-03', MISSING_WITH_STRONG_CANDIDATE: 'INV-03', ASSIGNMENT_CONFLICT: 'INV-03', REVIEW_WITHOUT_CANDIDATES: 'INV-03', EXPECTED_MANUAL_RESERVATION: 'INV-08', MULTIPLE_INCOMPATIBLE_ACTIVE_DECISIONS: 'INV-08', RESERVED_SHEET_ROW_REUSED: 'INV-08',
+  MISSING_ACTION_INCONSISTENCY: 'INV-04', CARD_PAYMENT_AS_EXPENSE_MISSING: 'INV-05', REFUNDED_BUT_MISSING: 'INV-06', STALE_ACTIVE_SOURCE: 'INV-07', DERIVED_STATE_MISMATCH: 'INV-08', MATCHED_WITHOUT_LINK: 'INV-08', VALID_MANUAL_MATCH_NOT_APPLIED: 'INV-11', VALID_BANK_MANUAL_MATCH_NOT_APPLIED: 'INV-11', PAIR_CONFIRMED_ASSIGNMENT_CONFLICT: 'INV-08', INVALID_DECISION_APPLIED: 'INV-08', STALE_DECISION_RESULT: 'INV-11', MISSING_COUNT_DIVERGENCE: 'INV-09', DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS: 'INV-10', INVOICE_TOTAL_MISMATCH: 'INV-13', CARD_SUBTOTAL_MISMATCH: 'INV-13', REFUND_NET_MISMATCH: 'INV-06', RESOLVED_SOURCE_OVERLAP: 'INV-10', CARD_MISSING_NO_CANDIDATE: 'INV-12', DUPLICATE_PRESENT_BUT_MARKED_MISSING: 'INV-14', ACTIVE_ENTITY_WITHOUT_SOURCE: 'INV-07', SOURCE_POINTS_TO_MISSING_ENTITY: 'INV-07', SOURCE_CONFLICT: 'INV-07',
+}
+const invariantForCode = (code: AuditFinding['code']) => catalogInvariant[code] ?? (/SOURCE|DRIVE|INVOICE_SOURCE/.test(code) ? 'INV-07' : /DUPLICATE|FITID|OVERLAP|DEDUP/.test(code) ? 'INV-14' : /REFUND|INVOICE|SUBTOTAL|BALANCE|PAYMENT|COUNT/.test(code) ? 'INV-13' : /DECISION|TOMBSTONE|FINGERPRINT|SYNC|DOUBLE_CLAIM|WRONG_DECISION_DOMAIN|RESERVED_SHEET_ROW_REUSED|EXPECTED_MANUAL_RESERVATION/.test(code) ? 'INV-08' : 'INV-03')
+const lifecycleEntries = Object.fromEntries(
+  (Object.keys(descriptions) as AuditFinding['code'][]).map((code) => [code,
+    code === 'DOUBLE_CLAIM_AFTER_CONFIRMATION' ? 'related-only'
+      : code === 'NEWER_TOMBSTONE_EXISTS' ? 'legacy'
+          : 'emitted',
+  ]),
+)
+export const AUDIT_CODE_LIFECYCLE = lifecycleEntries as Record<AuditFinding['code'], AuditCodeLifecycle>
+export const AUDIT_CODE_CATALOG: Record<AuditFinding['code'], AuditCodeCatalogEntry> = Object.fromEntries(
+  (Object.keys(descriptions) as AuditFinding['code'][]).map((code) => [code, {
+    lifecycle: AUDIT_CODE_LIFECYCLE[code], presentation: descriptions[code], severityPolicy: 'EVIDENCE_AND_IMPACT',
+    confidencePolicy: 'EVIDENCE_BASED', invariantId: invariantForCode(code),
+    role: AUDIT_CODE_LIFECYCLE[code] === 'related-only' ? 'RELATED' : AUDIT_CODE_LIFECYCLE[code] === 'legacy' ? 'LEGACY' : ['EXPECTED_MANUAL_REJECTION', 'EXPECTED_MANUAL_RESERVATION', 'EXPECTED_OVERRIDE', 'EXPECTED_GROUP_RESOLUTION', 'RESOLVED_SOURCE_OVERLAP', 'SYNC_PENDING'].includes(code) ? 'EXPECTED_OR_INFO' : 'PRIMARY',
+    rootCauseBehavior: 'SEMANTIC_SUBJECT_AND_TARGET', exportMapping: 'COMPACT_CSV_AND_TECHNICAL_JSON',
+  }]),
+) as Record<AuditFinding['code'], AuditCodeCatalogEntry>
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' ? value as Record<string, unknown> : {}
 const money = (cents: unknown) => typeof cents === 'number' ? new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(cents / 100) : ''
@@ -103,6 +142,10 @@ export function describeAuditFinding(finding: AuditFinding): AuditFindingDescrip
   if (finding.code === 'LEGACY_FINGERPRINT_MATCH') {
     impact = 'O resultado financeiro atual foi reconhecido; o aviso informa apenas que a confirmação é antiga.'
     recommendedAction = 'Nenhuma correção é necessária. Você pode manter ou ocultar este aviso.'
+  }
+  if (finding.code === 'EXPECTED_MANUAL_REJECTION') {
+    impact = 'A movimentação permanece ausente porque as correspondências candidatas foram rejeitadas anteriormente.'
+    recommendedAction = 'Nenhuma ação necessária. Use “Reconsiderar correspondência” se quiser rever uma rejeição.'
   }
   if (finding.code === 'CARD_MISSING_NO_CANDIDATE' && finding.severity === 'CRITICAL') {
     impact = 'Adicionar esta compra sem revisar pode criar uma despesa duplicada.'

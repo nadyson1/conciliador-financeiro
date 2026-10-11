@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build --configLoader native",
     "preview": "vite preview --configLoader native",
     "test": "vitest run --configLoader native",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:benchmark": "vitest run --configLoader native src/domain/consistencyAudit.benchmark.test.ts"
   },
   "dependencies": {
     "papaparse": "^5.5.3",

@@ -1,6 +1,7 @@
 import type { BankTransaction, LedgerTransaction, ReconciliationItem, ReconciliationResult } from '../domain/types'
 import type { AuditFinding } from '../domain/consistencyAudit'
 import type { ConsistencyAuditResult } from '../domain/consistencyAudit'
+import type { AuditInputSnapshot } from '../domain/auditInputSnapshot'
 import { describeAuditFinding } from '../domain/auditFindingPresentation'
 
 function csvCell(value: unknown) {
@@ -22,15 +23,14 @@ function safeTechnicalValue(value: unknown): unknown {
 }
 
 const auditHeaders = [
-  'Finding ID', 'Modo da auditoria', 'Data/hora da auditoria', 'Severidade', 'Categoria', 'Código', 'Invariante', 'Título', 'Diagnóstico', 'Ação recomendada', 'Confiança', 'Status', 'Fingerprint',
-  'Tipo do sujeito', 'Transaction ID', 'Invoice ID', 'Cartão', 'Data banco/compra', 'Valor banco/compra', 'Descrição banco/compra', 'Contraparte', 'ID CUSTOS ANO principal', 'Data CUSTOS ANO principal', 'Descrição CUSTOS ANO principal', 'Valor CUSTOS ANO principal',
-  'SheetRows relacionadas', 'CandidateCountRelevant', 'CandidateCountEvaluated', 'Evidências diretas relacionadas', 'Decisões relacionadas', 'Sources', 'Estado puro', 'Estado atual', 'Estado esperado', 'Etapa explicativa', 'Resumo técnico', 'Oculto',
+  'Finding ID', 'Root Cause', 'Role', 'Severity', 'Confidence', 'Subject', 'Expected', 'Current', 'Related Count', 'Explanation Summary', 'Hidden', 'Coverage',
 ]
 
 export interface AuditCsvRow {
   findingId: string; mode: string; auditedAt: string; severity: string; category: string; code: string; invariantId: string; title: string; diagnosis: string; recommendedAction: string; confidence: string; status: string; fingerprint: string; subjectType: string;
   transactionId: string; invoiceId: string; card: string; transactionDate: string; transactionAmount: string; transactionDescription: string; counterparty: string; mainSheetId: string; mainSheetDate: string; mainSheetDescription: string; mainSheetAmount: string;
-  relatedSheetRows: string; candidateCountRelevant: number; candidateCountEvaluated: number; directEvidence: string; decisions: string; sources: string; pureState: string; currentState: string; expectedState: string; explanationStage: string; technicalSummary: string; hidden: boolean
+  relatedSheetRows: string; candidateCountRelevant: number; candidateCountEvaluated: number; directEvidence: string; decisions: string; sources: string; pureState: string; currentState: string; expectedState: string; explanationStage: string; technicalSummary: string; hidden: boolean; primaryFindingId: string; rootCauseCode: string; relatedFindingsCount: number; explanationSummary: string
+  role: string
 }
 const sheetLabel = (row: Record<string, unknown>) => [text(row.sheetRecordId ?? row.id ?? row.sheetIdentity), dateLabel(row.date), text(row.originalDescription ?? row.description), moneyLabel(row.amount)].filter(Boolean).join(' · ')
 function finiteCount(value: unknown): number | undefined { return typeof value === 'number' && Number.isFinite(value) ? value : undefined }
@@ -75,6 +75,7 @@ export function toAuditCsvRow(finding: AuditFinding, mode: 'RAPIDA' | 'PROFUNDA'
   const decisions = unique([
     ...decisionRows.map(({ decision, status }) => `${decision.kind} (${decision.key}) · ${status}`),
     ...(Object.keys(record(technical.decision)).length ? [`${text(record(technical.decision).kind)} (${text(record(technical.decision).key)})`] : []),
+    ...(Array.isArray(technical.decisions) ? technical.decisions.map((value) => { const decision = record(value); return `${text(decision.kind)} (${text(decision.key)})` }) : []),
   ]).join(' | ')
   const subjectEvidence = Array.isArray(technical.subjects) ? technical.subjects.map((value) => {
     const subject = record(value)
@@ -93,15 +94,19 @@ export function toAuditCsvRow(finding: AuditFinding, mode: 'RAPIDA' | 'PROFUNDA'
     text(technical.sourceId) ? `Fonte · ID: ${text(technical.sourceId)}` : '',
     text(transaction.statementFileName ?? transaction.fileName ?? transaction.sourceName) ? `${text(transaction.statementFormats ?? transaction.sourceLayout ?? transaction.sourceType) || 'Arquivo'} · ${text(transaction.statementFileName ?? transaction.fileName ?? transaction.sourceName)}${text(transaction.statementSourceId ?? transaction.sourceId ?? transaction.driveFileId) ? ` · ID: ${text(transaction.statementSourceId ?? transaction.sourceId ?? transaction.driveFileId)}` : ''}` : '',
   ]).join(' | ')
-  const summaryKeys = ['reason', 'status', 'currentStatus', 'expectedStatus', 'candidateCount', 'candidateCountRelevant', 'candidateCountEvaluated', 'score', 'threshold', 'difference', 'validManualConfirmation', 'appliedDecision', 'decisionDomain', 'source', 'message']
+  const summaryKeys = ['reason', 'status', 'currentStatus', 'expectedStatus', 'candidateCount', 'candidateCountRelevant', 'candidateCountEvaluated', 'pipelineStage', 'score', 'threshold', 'difference', 'validManualConfirmation', 'appliedDecision', 'decisionDomain', 'source', 'message']
   const technicalSummary = Object.fromEntries(summaryKeys.filter((key) => technical[key] !== undefined && (typeof technical[key] !== 'object' || technical[key] === null)).map((key) => [key, technical[key]]))
+  if (Array.isArray(technical.candidateEvaluations)) technicalSummary.candidateEvaluations = technical.candidateEvaluations.map((value) => {
+    const evaluation = record(value), row = record(evaluation.row)
+    return { sheetRecordId: text(row.sheetRecordId), id: text(row.id), disposition: text(evaluation.disposition), reason: text(evaluation.reason), decisionKey: text(evaluation.decisionKey), ownerBankId: text(evaluation.ownerBankId) }
+  })
   const subjectType = item ? 'Compra de cartão (PDF)' : transaction.bankTransactionId || transaction.direction ? 'Movimentação bancária' : Object.keys(primarySheet).length ? 'Lançamento CUSTOS ANO' : ''
   const transactionId = text(transaction.bankTransactionId ?? transaction.id ?? technical.transactionId)
   const date = dateLabel(transaction.purchaseDate ?? transaction.date)
   const description = text(transaction.originalDescription ?? transaction.description)
-  const explanationStage = finding.explanationSource === 'MANUAL_DECISION' ? 'Confirmação manual válida' : finding.explanationSource === 'GROUP_MATCHING' ? 'Group matching' : finding.explanationSource ?? ''
+  const explanationStage = text(technical.pipelineStage) || (finding.explanationSource === 'MANUAL_DECISION' ? 'Confirmação manual válida' : finding.explanationSource === 'GROUP_MATCHING' ? 'Group matching' : finding.explanationSource ?? '')
   return {
-    findingId: finding.id, mode, auditedAt, severity: message.severityLabel, category: finding.category, code: finding.code, invariantId: finding.invariantId, title: message.title,
+    findingId: finding.id, mode, auditedAt, severity: finding.severity, category: finding.category, code: finding.code, invariantId: finding.invariantId, title: message.title,
     diagnosis: finding.diagnosis, recommendedAction: finding.recommendedAction, confidence: finding.diagnosticConfidence, status: finding.status, fingerprint: item?.fingerprint ?? text(technical.subjectFingerprint), subjectType,
     transactionId, invoiceId: text(statement.statementIdentity ?? technical.invoiceId), card: text(transaction.cardIdentifier), transactionDate: date,
     transactionAmount: moneyLabel(transaction.amount), transactionDescription: description, counterparty: text(transaction.counterpartyName),
@@ -109,21 +114,25 @@ export function toAuditCsvRow(finding: AuditFinding, mode: 'RAPIDA' | 'PROFUNDA'
     relatedSheetRows, candidateCountRelevant: relevantCount, candidateCountEvaluated: evaluatedCount, directEvidence, decisions, sources, pureState: text(pure.status ?? finding.pureState ?? technical.pure),
     currentState: text(current.status ?? finding.currentState ?? technical.currentStatus ?? technical.status), expectedState: text(finding.expectedState ?? technical.expectedStatus ?? technical.expectedState), explanationStage,
     technicalSummary: JSON.stringify(technicalSummary), hidden,
+    primaryFindingId: finding.primaryFindingId ?? (finding.role === 'PRIMARY' ? finding.id : ''), rootCauseCode: finding.rootCauseCode ?? finding.rootCauseKey ?? finding.code,
+    relatedFindingsCount: finding.relatedFindings?.length ?? 0,
+    explanationSummary: (finding.explanationChain ?? item?.explanationChain)?.map((step) => ({ PURE_MATCHING: 'P', DECISION: 'D', RESERVATION: 'R', GROUP_MATCHING: 'G', REFUND: 'F', FINAL_ASSIGNMENT: 'A' }[step.stage])).join('>') ?? '',
+    role: finding.role ?? (finding.status === 'LEGACY' ? 'LEGACY' : finding.status === 'MAINTENANCE' ? 'MAINTENANCE' : finding.status === 'EXPECTED' ? 'EXPECTED' : finding.severity === 'INFO' ? 'INFO' : 'PRIMARY'),
   }
 }
 
 function auditRowValues(row: AuditCsvRow): unknown[] { return [
-  row.findingId, row.mode, row.auditedAt, row.severity, row.category, row.code, row.invariantId, row.title, row.diagnosis, row.recommendedAction, row.confidence, row.status, row.fingerprint,
-  row.subjectType, row.transactionId, row.invoiceId, row.card, row.transactionDate, row.transactionAmount, row.transactionDescription, row.counterparty, row.mainSheetId, row.mainSheetDate, row.mainSheetDescription, row.mainSheetAmount,
-  row.relatedSheetRows, row.candidateCountRelevant, row.candidateCountEvaluated, row.directEvidence, row.decisions, row.sources, row.pureState, row.currentState, row.expectedState, row.explanationStage, row.technicalSummary, row.hidden,
+  row.findingId, row.rootCauseCode, row.role, row.severity, row.confidence, row.fingerprint || row.transactionId || row.mainSheetId, row.expectedState, row.currentState,
+  row.relatedFindingsCount, (row.diagnosis || row.explanationSummary).slice(0, 500), row.hidden,
 ] }
 
-/** Exports every finding in the supplied run, including hidden findings, as one compact row each. */
-export function exportAuditFindings(findings: AuditFinding[], hiddenFindingIds: Set<string>, auditedAt: string, mode: 'RAPIDA' | 'PROFUNDA' = 'PROFUNDA') {
-  const rows = findings.map((finding) => auditRowValues(toAuditCsvRow(finding, mode, auditedAt, hiddenFindingIds.has(finding.id))))
+/** Exports top-level findings (including hidden ones); related evidence stays nested in JSON. */
+export function exportAuditFindings(findings: AuditFinding[], hiddenFindingIds: Set<string>, auditedAt: string, mode: 'RAPIDA' | 'PROFUNDA' = 'PROFUNDA', snapshot?: AuditInputSnapshot) {
+  const exported = findings.filter((finding) => finding.role !== 'RELATED')
+  const rows = exported.map((finding) => [...auditRowValues(toAuditCsvRow(finding, mode, auditedAt, hiddenFindingIds.has(finding.id))), snapshot?.state ?? 'UNAVAILABLE'])
   rows.forEach((row, index) => row.forEach((cell, column) => {
     const length = String(cell ?? '').length
-    if (length > 32_000) console.warn(`Célula grande na exportação da auditoria: finding ${findings[index]?.id}, coluna ${auditHeaders[column]}, ${length} caracteres. O CSV foi preservado integralmente; use o diagnóstico JSON para rastros extensos.`)
+    if (length > 2_000) console.warn(`Célula grande na exportação da auditoria: finding ${exported[index]?.id}, coluna ${auditHeaders[column]}, ${length} caracteres. O resumo foi limitado para manter o CSV compacto.`)
   }))
   const runDate = new Date(auditedAt)
   const validDate = Number.isNaN(runDate.getTime()) ? new Date() : runDate
@@ -132,20 +141,86 @@ export function exportAuditFindings(findings: AuditFinding[], hiddenFindingIds: 
   exportCsv(filename, auditHeaders, rows)
 }
 
+const rowRef = (row: Record<string, unknown>) => `sheet:${String(row.sheetRecordId ?? row.id ?? row.sheetIdentity ?? '')}`
+const statementRef = (statement: Record<string, unknown>) => `statement:${String(statement.statementIdentity ?? statement.identity ?? statement.sourceId ?? 'unknown')}`
+const transactionRef = (transaction: Record<string, unknown>, statement: Record<string, unknown>) => `card:${String(statement.statementIdentity ?? statement.identity ?? statement.sourceId ?? 'unknown')}:${String(transaction.id ?? transaction.transactionId ?? transaction.fingerprint ?? 'unknown')}`
+
+/** JSON diagnostic v2 stores repeated domain entities once and leaves references in findings/items. */
+export function createAuditDiagnosticPayload(audit: ConsistencyAuditResult, hiddenFindingIds: Set<string>) {
+  const statements = new Map<string, Record<string, unknown>>()
+  const transactions = new Map<string, Record<string, unknown>>()
+  const ledgerRows = new Map<string, Record<string, unknown>>()
+  const purchaseSubjects = new Map<string, Record<string, unknown>>()
+  for (const item of audit.items) {
+    const statement = item.statement as unknown as Record<string, unknown>
+    const txs = (item.statement.transactions ?? []) as unknown as Record<string, unknown>[]
+    const sRef = statementRef(statement)
+    if (!statements.has(sRef)) {
+      const { transactions: _transactions, ...summary } = statement
+      statements.set(sRef, safeTechnicalValue(summary) as Record<string, unknown>)
+      txs.forEach((transaction) => transactions.set(transactionRef(transaction, statement), safeTechnicalValue(transaction) as Record<string, unknown>))
+    }
+    transactions.set(transactionRef(item.transaction as unknown as Record<string, unknown>, statement), safeTechnicalValue(item.transaction) as Record<string, unknown>)
+    purchaseSubjects.set(`purchase:${item.fingerprint}`, { fingerprint: item.fingerprint, statementRef: sRef, transactionRef: transactionRef(item.transaction as unknown as Record<string, unknown>, statement) })
+    ;[...item.candidates, ...item.evaluatedCandidates.map(({ row }) => row)].forEach((row) => {
+      const ref = rowRef(row as unknown as Record<string, unknown>)
+      if (ref !== 'sheet:') ledgerRows.set(ref, safeTechnicalValue(row) as Record<string, unknown>)
+    })
+  }
+  const compactTechnical = (value: unknown, key = ''): unknown => {
+    if (Array.isArray(value)) return value.map((entry) => compactTechnical(entry, key))
+    if (!value || typeof value !== 'object') return safeTechnicalValue(value)
+    const recordValue = value as Record<string, unknown>
+    const possibleRowRef = rowRef(recordValue)
+    if (ledgerRows.has(possibleRowRef) && (recordValue.sheetRecordId || recordValue.sheetIdentity || recordValue.date && recordValue.amount)) return { ref: possibleRowRef }
+    if (['row', 'sheet', 'candidate'].includes(key)) {
+      const ref = rowRef(recordValue)
+      if (ledgerRows.has(ref)) return { ref }
+    }
+    if (key === 'statement') return { ref: statementRef(recordValue) }
+    if (key === 'transaction' && (recordValue.purchaseDate || recordValue.cardIdentifier)) {
+      const statement = recordValue.statement as Record<string, unknown> | undefined
+      const ref = transactionRef(recordValue, statement ?? {})
+      if (transactions.has(ref)) return { ref }
+    }
+    if (key === 'decision' && typeof recordValue.key === 'string') return { ref: `decision:${recordValue.key}` }
+    return Object.fromEntries(Object.entries(recordValue).filter(([childKey]) => !['original', 'raw', 'rawContent', 'fileContent', 'bytes', 'blob'].includes(childKey)).map(([childKey, child]) => [childKey, compactTechnical(child, childKey)]))
+  }
+  const items = audit.items.map((item) => ({
+    ...(compactTechnical({ ...item, statement: undefined, transaction: undefined, candidates: undefined, evaluatedCandidates: undefined }) as Record<string, unknown>),
+    statementRef: statementRef(item.statement as unknown as Record<string, unknown>),
+    transactionRef: transactionRef(item.transaction as unknown as Record<string, unknown>, item.statement as unknown as Record<string, unknown>),
+    candidateRefs: item.candidates.map((row) => rowRef(row as unknown as Record<string, unknown>)),
+    evaluatedCandidates: item.evaluatedCandidates.map(({ row, ...evaluation }) => ({ ...(safeTechnicalValue(evaluation) as Record<string, unknown>), rowRef: rowRef(row as unknown as Record<string, unknown>) })),
+  }))
+  const findings = audit.findings.map((finding) => {
+    const { item, technical, ...rest } = finding
+    return { findingId: finding.id, hidden: hiddenFindingIds.has(finding.id), itemRef: item?.fingerprint ?? null, finding: { ...(safeTechnicalValue(rest) as Record<string, unknown>), ...(technical ? { technical: compactTechnical(technical) } : {}) } }
+  })
+  const decisions = audit.decisionAudit.map(({ decision, ...entry }) => ({ ...(safeTechnicalValue(entry) as Record<string, unknown>), decisionRef: `decision:${decision.key}` }))
+  const decisionEntities = new Map<string, unknown>()
+  audit.decisionAudit.forEach(({ decision }) => decisionEntities.set(`decision:${decision.key}`, safeTechnicalValue(decision)))
+  return {
+    exportFormat: 'conciliador-auditoria-diagnostico', schemaVersion: 2,
+    metadata: { mode: audit.mode, auditedAt: audit.auditedAt, recomputation: safeTechnicalValue(audit.recomputation), performance: safeTechnicalValue(audit.performance), summary: safeTechnicalValue(audit.summary) },
+    snapshot: safeTechnicalValue(audit.auditInputSnapshot ?? null),
+    entities: { statements: Object.fromEntries(statements), cardTransactions: Object.fromEntries(transactions), ledgerRows: Object.fromEntries(ledgerRows), decisions: Object.fromEntries(decisionEntities), purchases: Object.fromEntries(purchaseSubjects) },
+    findings, items, decisionAudit: decisions, invariantExecutions: safeTechnicalValue(audit.invariantExecutions), selfChecks: safeTechnicalValue(audit.auditSelfChecks),
+    states: { pure: safeTechnicalValue(audit.pureStates), current: safeTechnicalValue(audit.currentStates), expected: safeTechnicalValue(audit.expectedStates) },
+  }
+}
+
 /** Full, safe diagnostic package for technical investigation; IDs match the compact CSV. */
 export function exportAuditDiagnosticJson(audit: ConsistencyAuditResult, hiddenFindingIds: Set<string>) {
-  const payload = {
-    exportFormat: 'conciliador-auditoria-diagnostico-v1', mode: audit.mode, auditedAt: audit.auditedAt,
-    findings: audit.findings.map((finding) => ({ findingId: finding.id, hidden: hiddenFindingIds.has(finding.id), finding: safeTechnicalValue(finding) })),
-    recomputation: safeTechnicalValue(audit.recomputation), summary: safeTechnicalValue(audit.summary),
-    items: safeTechnicalValue(audit.items), decisionAudit: safeTechnicalValue(audit.decisionAudit),
-    pureStates: safeTechnicalValue(audit.pureStates), currentStates: safeTechnicalValue(audit.currentStates),
-  }
+  const payload = createAuditDiagnosticPayload(audit, hiddenFindingIds)
   const runDate = new Date(audit.auditedAt)
   const validDate = Number.isNaN(runDate.getTime()) ? new Date() : runDate
   const two = (value: number) => String(value).padStart(2, '0')
   const filename = `auditoria_diagnostico_${audit.mode === 'RAPIDA' ? 'rapida' : 'profunda'}_${validDate.getFullYear()}-${two(validDate.getMonth() + 1)}-${two(validDate.getDate())}_${two(validDate.getHours())}${two(validDate.getMinutes())}.json`
-  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }))
+  const exportStartedAt = performance.now()
+  const serialized = JSON.stringify(payload, null, 2)
+  console.info(`Serialização do diagnóstico da Auditoria: ${serialized.length.toLocaleString('pt-BR')} caracteres em ${(performance.now() - exportStartedAt).toFixed(1)} ms`)
+  const url = URL.createObjectURL(new Blob([serialized], { type: 'application/json;charset=utf-8' }))
   const anchor = document.createElement('a')
   anchor.href = url; anchor.download = filename; anchor.click(); URL.revokeObjectURL(url)
 }

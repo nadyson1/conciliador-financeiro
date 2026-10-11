@@ -1,4 +1,4 @@
-import type { BankRefundGroup, BankTransaction, CardCompositionOption, DuplicateGroup, LedgerTransaction, MatchCandidate, ReconciliationItem, ReconciliationResult } from '../domain/types'
+import type { BankRefundGroup, BankTransaction, CandidatePipelineEvaluation, CardCompositionOption, DuplicateGroup, LedgerTransaction, MatchCandidate, ReconciliationItem, ReconciliationResult } from '../domain/types'
 import { descriptionSimilarity, normalizeDescription } from '../importers/normalize'
 import { auditBankBalance } from '../domain/bankBalanceAudit'
 
@@ -14,7 +14,11 @@ export const MATCHING_CONFIG = {
 export interface ReviewDecisions {
   ignoredBankIds?: Set<string>
   rejectedPairKeys?: Set<string>
+  rejectedPairDecisionKeys?: Map<string, string>
   confirmedPairs?: Map<string, string>
+  conflictingConfirmedSheetIds?: Set<string>
+  conflictingConfirmedBankIds?: Set<string>
+  conflictingConfirmedAssignments?: Map<string, LedgerTransaction[]>
   confirmedCompositions?: Map<string, string[]>
   identifiedCardPaymentIds?: Set<string>
 }
@@ -70,9 +74,17 @@ function candidate(bank: BankTransaction, sheet: LedgerTransaction): MatchCandid
   return { bankId: bank.id, sheetId: sheet.id, score, confidence, reasons, dateDistance: distance, descriptionSimilarity: similarity, counterpartySimilarity, matchMethod: 'SCORED' }
 }
 
+/** Canonical candidate generation and minimum plausibility check shared by matching and audit. */
+export function generatePlausibleCandidateEdges(bank: BankTransaction, sheets: LedgerTransaction[]) {
+  return sheets.flatMap((sheet) => {
+    const generated = candidate(bank, sheet)
+    return generated ? [{ sheet, candidate: generated }] : []
+  })
+}
+
 /** Returns only rows that pass the same minimum plausibility rules used by reconciliation. */
 export function findPlausibleLedgerCandidates(bank: BankTransaction, sheets: LedgerTransaction[]) {
-  return sheets.filter((sheet) => candidate(bank, sheet) != null)
+  return generatePlausibleCandidateEdges(bank, sheets).map((edge) => edge.sheet)
 }
 
 function structuralCandidate(candidateItem: MatchCandidate, bank: BankTransaction, locallyUnique: boolean): MatchCandidate {
@@ -203,6 +215,8 @@ function analyzeBankRefunds(banks: BankTransaction[]): BankRefundGroup[] {
 export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[], decisions: ReviewDecisions = {}): ReconciliationResult {
   const ignored = decisions.ignoredBankIds ?? new Set<string>(), rejected = decisions.rejectedPairKeys ?? new Set<string>()
   const confirmed = decisions.confirmedPairs ?? new Map<string, string>(), confirmedCompositions = decisions.confirmedCompositions ?? new Map<string, string[]>()
+  const conflictingConfirmedSheetIds = decisions.conflictingConfirmedSheetIds ?? new Set<string>()
+  const conflictingConfirmedBankIds = decisions.conflictingConfirmedBankIds ?? new Set<string>()
   const identifiedCardPaymentIds = decisions.identifiedCardPaymentIds ?? new Set<string>()
   const bankRefundGroups = analyzeBankRefunds(banks)
   const refundedOriginalIds = new Set(bankRefundGroups.filter((group) => group.status === 'REFUNDED').flatMap((group) => group.originalTransactionIds))
@@ -211,7 +225,25 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
   const refundedCreditIds = new Set(bankRefundGroups.filter((group) => group.status === 'REFUNDED').map((group) => group.refundTransactionId))
   const duplicateGroups = findDuplicateGroups(sheets)
   const excludedRefundMatchingIds = new Set([...refundedOriginalIds, ...ambiguousOriginalIds, ...refundIds])
-  const allCandidates = banks.filter((bank) => !excludedRefundMatchingIds.has(bank.id)).flatMap((bank) => sheets.map((sheet) => candidate(bank, sheet)).filter((item): item is MatchCandidate => item != null && !rejected.has(pairKey(item.bankId, item.sheetId))))
+  const candidatePipeline = new Map<string, CandidatePipelineEvaluation[]>()
+  const allCandidates: MatchCandidate[] = []
+  for (const bank of banks) {
+    const evaluations: CandidatePipelineEvaluation[] = []
+    for (const { sheet, candidate: generated } of generatePlausibleCandidateEdges(bank, sheets)) {
+      const key = pairKey(bank.id, sheet.id)
+      if (excludedRefundMatchingIds.has(bank.id)) {
+        evaluations.push({ sheet, candidate: generated, disposition: 'EXCLUDED_BY_REFUND', reason: 'Movimentação excluída do matching por análise de devolução/estorno.' })
+      } else if (conflictingConfirmedSheetIds.has(sheet.id)) {
+        evaluations.push({ sheet, candidate: generated, disposition: 'RESERVED', reason: 'A linha tem confirmações manuais incompatíveis; nenhum owner foi escolhido automaticamente.' })
+      } else if (rejected.has(key)) {
+        evaluations.push({ sheet, candidate: generated, disposition: 'REJECTED_BY_DECISION', reason: 'Par rejeitado por decisão persistida; removido antes da atribuição global.', ...(decisions.rejectedPairDecisionKeys?.get(key) ? { decisionKey: decisions.rejectedPairDecisionKeys.get(key) } : {}) })
+      } else {
+        evaluations.push({ sheet, candidate: generated, disposition: 'AVAILABLE', reason: 'Candidata plausível; entrou na atribuição global.' })
+        allCandidates.push(generated)
+      }
+    }
+    candidatePipeline.set(bank.id, evaluations)
+  }
   const byBank = groupBy(allCandidates, (item) => item.bankId)
   const usedBanks = new Set<string>(), usedSheets = new Set<string>(), matches = new Map<string, MatchCandidate>()
   for (const [bankId, sheetId] of confirmed) {
@@ -261,6 +293,34 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
     }
   }
   const plannedSheetIds = new Set([...planned.values()].map((item) => item.sheetId))
+  for (const [bankId, evaluations] of candidatePipeline) {
+    for (const evaluation of evaluations) {
+      const selected = matches.get(bankId)
+      if (selected?.sheetId === evaluation.sheet.id) {
+        evaluation.disposition = 'ASSIGNED'
+        evaluation.reason = 'A candidata foi selecionada no resultado da conciliação.'
+        evaluation.ownerBankId = bankId
+        continue
+      }
+      if (evaluation.disposition !== 'AVAILABLE') continue
+      const plannedCandidate = planned.get(bankId)
+      if (plannedCandidate?.sheetId === evaluation.sheet.id) {
+        evaluation.disposition = 'PLANNED_FOR_REVIEW'
+        evaluation.reason = 'A candidata foi selecionada pela atribuição global, mas requer revisão de confiança/ambiguidade.'
+        evaluation.ownerBankId = bankId
+        continue
+      }
+      const ownerId = [...matches.entries()].find(([, item]) => item.sheetId === evaluation.sheet.id)?.[0]
+        ?? [...planned.entries()].find(([, item]) => item.sheetId === evaluation.sheet.id)?.[0]
+      if (ownerId) {
+        evaluation.disposition = 'RESERVED'
+        evaluation.reason = 'A candidata foi reservada para outra movimentação na atribuição global.'
+        evaluation.ownerBankId = ownerId
+      } else {
+        evaluation.reason = 'A candidata permaneceu disponível após a atribuição global.'
+      }
+    }
+  }
 
   const cardOptions = new Map<string, CompositionSearch>()
   const cardBanks = banks.filter((bank) => bank.type === 'CARD_PAYMENT').sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id))
@@ -284,8 +344,12 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
     cardOptions.set(bank.id, search)
   }
 
-  const items: ReconciliationItem[] = banks.map((bank) => {
+  const items: ReconciliationItem[] = banks.map<ReconciliationItem>((bank) => {
     if (ignored.has(bank.id)) return emptyItem(bank, 'IGNORED')
+    if (conflictingConfirmedBankIds.has(bank.id)) {
+      const candidateSheets = decisions.conflictingConfirmedAssignments?.get(bank.id) ?? []
+      return { ...emptyItem(bank, 'REVIEW', undefined, 'ASSIGNMENT_CONFLICT'), sheet: null, candidate: null, candidateSheets, candidateOwners: {} }
+    }
     if (refundedOriginalIds.has(bank.id)) return emptyItem(bank, 'REFUNDED')
     if (ambiguousOriginalIds.has(bank.id)) return emptyItem(bank, 'REVIEW', undefined, 'REFUND_AMBIGUITY')
     if (refundIds.has(bank.id)) return refundedCreditIds.has(bank.id) ? emptyItem(bank, 'REFUNDED') : emptyItem(bank, 'OUT_OF_SCOPE', 'NOT_EXPENSE')
@@ -309,13 +373,23 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
     if (bank.direction === 'CREDIT' || bank.type === 'INCOME') return emptyItem(bank, 'OUT_OF_SCOPE', 'NOT_EXPENSE')
     const matched = matches.get(bank.id)
     if (matched) return { ...emptyItem(bank, 'MATCHED', matched.reasons.includes('Alias histórico de forma de pagamento: Pix ↔ Transferência') ? 'LEGACY_PAYMENT_ALIAS' : undefined), sheet: sheets.find((sheet) => sheet.id === matched.sheetId) ?? null, candidate: matched }
-    const assigned = planned.get(bank.id)
-    if (assigned) return { ...emptyItem(bank, 'REVIEW'), sheet: sheets.find((sheet) => sheet.id === assigned.sheetId) ?? null, candidate: assigned }
     const allPlausible = byBank.get(bank.id) ?? []
+    const candidateSheets = [...new Map(allPlausible
+      .sort((a, b) => b.score - a.score || a.sheetId.localeCompare(b.sheetId))
+      .map((item) => [item.sheetId, sheets.find((sheet) => sheet.id === item.sheetId)] as const)
+      .filter((entry): entry is readonly [string, LedgerTransaction] => entry[1] != null)).values()]
+    const candidateOwners = Object.fromEntries(candidateSheets.flatMap((sheet) => {
+      const ownerId = [...matches.entries()].find(([, assignment]) => assignment.sheetId === sheet.id)?.[0]
+        ?? [...planned.entries()].find(([, assignment]) => assignment.sheetId === sheet.id)?.[0]
+      const owner = ownerId ? banks.find((entry) => entry.id === ownerId) : null
+      return owner ? [[sheet.id, { bankId: owner.id, description: owner.originalDescription }] as const] : []
+    }))
+    const assigned = planned.get(bank.id)
+    if (assigned) return { ...emptyItem(bank, 'REVIEW'), sheet: sheets.find((sheet) => sheet.id === assigned.sheetId) ?? null, candidate: assigned, candidateSheets, candidateOwners }
     const plausible = allPlausible.filter((item) => !usedSheets.has(item.sheetId))
     const available = plausible.filter((item) => !plannedSheetIds.has(item.sheetId)).sort((a, b) => b.score - a.score)
     const best = available[0]
-    if (best) return { ...emptyItem(bank, 'REVIEW'), sheet: sheets.find((sheet) => sheet.id === best.sheetId) ?? null, candidate: best }
+    if (best) return { ...emptyItem(bank, 'REVIEW'), sheet: sheets.find((sheet) => sheet.id === best.sheetId) ?? null, candidate: best, candidateSheets, candidateOwners }
     const conflict = allPlausible
       .filter((item) => usedSheets.has(item.sheetId) || plannedSheetIds.has(item.sheetId))
       .sort((a, b) => b.score - a.score)[0]
@@ -325,12 +399,23 @@ export function reconcile(banks: BankTransaction[], sheets: LedgerTransaction[],
       const candidate = owner
         ? { ...conflict, reasons: [...conflict.reasons, `Linha reservada na atribuição global para a movimentação ${owner}`] }
         : conflict
-      return { ...emptyItem(bank, 'REVIEW', undefined, 'ASSIGNMENT_CONFLICT'), sheet: sheets.find((item) => item.id === conflict.sheetId) ?? null, candidate, ...(owner ? { assignmentConflictOwnerBankId: owner } : {}) }
+      return { ...emptyItem(bank, 'REVIEW', undefined, 'ASSIGNMENT_CONFLICT'), sheet: sheets.find((item) => item.id === conflict.sheetId) ?? null, candidate, candidateSheets, candidateOwners, ...(owner ? { assignmentConflictOwnerBankId: owner } : {}) }
+    }
+    // A plausible edge left outside the selected assignment is still a user-review case.
+    // Keep MISSING reserved for subjects with no candidate surviving matching decisions.
+    const unresolved = allPlausible.sort((a, b) => b.score - a.score)[0]
+    if (unresolved) {
+      const owner = [...matches.entries()].find(([, assignment]) => assignment.sheetId === unresolved.sheetId)?.[0]
+        ?? [...planned.entries()].find(([, assignment]) => assignment.sheetId === unresolved.sheetId)?.[0]
+      const candidate = owner
+        ? { ...unresolved, reasons: [...unresolved.reasons, `Linha reservada na atribuição global para a movimentação ${owner}`] }
+        : unresolved
+      return { ...emptyItem(bank, 'REVIEW', undefined, 'ASSIGNMENT_CONFLICT'), sheet: sheets.find((item) => item.id === unresolved.sheetId) ?? null, candidate, candidateSheets, candidateOwners, ...(owner ? { assignmentConflictOwnerBankId: owner } : {}) }
     }
     if (bank.directionKnown === false) return emptyItem(bank, 'REVIEW', undefined, 'DIRECTION_UNCERTAIN')
     if (bank.type === 'OTHER') return emptyItem(bank, 'OUT_OF_SCOPE', 'NOT_EXPENSE')
     return emptyItem(bank, 'MISSING', 'MISSING_NO_CANDIDATE')
-  })
+  }).map((item) => ({ ...item, candidatePipeline: candidatePipeline.get(item.bank.id) ?? [] }))
   const matchedSheetIds = new Set([...matches.values()].map((item) => item.sheetId))
   for (const composition of compositionByBank.values()) composition.forEach((sheet) => matchedSheetIds.add(sheet.id))
   const reviewSheetIds = new Set(items.filter((item) => item.status === 'REVIEW' && item.sheet).map((item) => item.sheet!.id))

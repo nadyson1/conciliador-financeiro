@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { clearPersistedDecisions, deletePersistedDecision, decisionKey, listPersistedDecisions, replacePersistedDecision, savePersistedDecision } from './localDecisions'
+import { clearPersistedDecisions, deletePersistedDecision, decisionKey, listPersistedDecisions, nextDecisionTimestamp, replacePersistedDecision, savePersistedDecision } from './localDecisions'
 
 type RequestLike<T> = IDBRequest<T>
 
@@ -56,6 +56,14 @@ afterEach(() => {
 })
 
 describe('decisões locais persistidas', () => {
+  it('gera timestamp lógico estritamente posterior às revisões observadas', () => {
+    localStorage.clear()
+    const latest = '2030-01-01T00:00:00.000Z'
+    const first = nextDecisionTimestamp(latest)
+    const second = nextDecisionTimestamp(latest)
+    expect(Date.parse(first)).toBeGreaterThan(Date.parse(latest))
+    expect(Date.parse(second)).toBeGreaterThan(Date.parse(first))
+  })
   it('mantém metadados entre leituras, atualiza a escolha, remove uma decisão e limpa apenas sob pedido explícito', async () => {
     Object.defineProperty(globalThis, 'indexedDB', { configurable: true, value: new FakeIndexedDB() as unknown as IDBFactory })
     const key = decisionKey('PAIR_CONFIRMED', ['bank:hash-a'])

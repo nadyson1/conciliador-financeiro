@@ -1,7 +1,7 @@
-import { fireEvent, render, screen } from '@testing-library/react'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AuditFinding } from './consistencyAudit'
-import { describeAuditFinding } from './auditFindingPresentation'
+import { AUDIT_CODE_CATALOG, AUDIT_CODE_LIFECYCLE, describeAuditFinding } from './auditFindingPresentation'
 import { auditFindingFingerprint, auditHideKey, dismissAuditFinding, isAuditFindingDismissed, loadAuditFindingVisibility, restoreAuditFinding, saveAuditFindingVisibility } from './auditFindingVisibility'
 import { AuditFindingCard } from '../components/AuditFindingCard'
 
@@ -14,15 +14,36 @@ const makeFinding = (overrides: Partial<AuditFinding> = {}): AuditFinding => ({
 
 describe('audit finding presentation and visibility', () => {
   beforeEach(() => localStorage.clear())
+  afterEach(() => cleanup())
 
   it('uses human language for every known finding code', () => {
-    const codes: AuditFinding['code'][] = ['MISSING_COM_CANDIDATO', 'MISSING_WITH_STRONG_CANDIDATE', 'CARD_MISSING_NO_CANDIDATE', 'DERIVED_STATE_MISMATCH', 'EXPECTED_OVERRIDE', 'EXPECTED_GROUP_RESOLUTION', 'EXPECTED_MANUAL_RESERVATION', 'PREWRITE_MATCH_MISMATCH', 'STALE_MISSING_DECISION', 'ORPHANED_SHEET_REFERENCE', 'EDITED_SHEET_REFERENCE', 'MISSING_ADDED_TO_SHEET_ORPHAN', 'DOUBLE_CLAIM', 'UNUSED_STRONG_CANDIDATE', 'LEGACY_FINGERPRINT_MATCH', 'LOCAL_REMOTE_DECISION_DIVERGENCE', 'NEWER_TOMBSTONE_EXISTS', 'WRONG_DECISION_DOMAIN', 'REVIEW_ONLY_WRONG_CYCLE_CANDIDATES', 'IGNORED_DECISION_REVIEW', 'CURRENT_SOURCE_DIVERGENCE', 'REJECTED_CANDIDATE_FILTERED', 'DECISION_STATUS', 'SYNC_PENDING', 'REVIEW_WITHOUT_CANDIDATES', 'ASSIGNMENT_CONFLICT', 'REFUNDED_BUT_MISSING', 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS', 'INVOICE_TOTAL_MISMATCH', 'CARD_SUBTOTAL_MISMATCH', 'REFUND_NET_MISMATCH', 'RESOLVED_SOURCE_OVERLAP', 'MATCHED_WITHOUT_LINK', 'ACTIVE_ENTITY_WITHOUT_SOURCE', 'SOURCE_POINTS_TO_MISSING_ENTITY', 'SOURCE_CONFLICT']
+    const codes = Object.keys(AUDIT_CODE_LIFECYCLE) as AuditFinding['code'][]
     for (const code of codes) {
       const description = describeAuditFinding(makeFinding({ code }))
       expect(description.title).toBeTruthy()
       expect(description.explanation).toBeTruthy()
       expect(description.title).not.toBe(code)
       expect(description.severityLabel).toBe('Informativo')
+    }
+  })
+
+  it('classifica códigos ativos, legados e relacionados para o contrato do Auditor', () => {
+    expect(Object.values(AUDIT_CODE_LIFECYCLE)).toContain('emitted')
+    expect(AUDIT_CODE_LIFECYCLE.DOUBLE_CLAIM_AFTER_CONFIRMATION).toBe('related-only')
+    expect(AUDIT_CODE_LIFECYCLE.NEWER_TOMBSTONE_EXISTS).toBe('legacy')
+    expect(AUDIT_CODE_LIFECYCLE.AUDITOR_INTERNAL_INCONSISTENCY).toBe('emitted')
+    expect(AUDIT_CODE_LIFECYCLE).not.toHaveProperty('DECISION_STATUS')
+    expect(AUDIT_CODE_LIFECYCLE).not.toHaveProperty('MATCHED_BUT_STILL_REVIEW')
+    for (const [code, entry] of Object.entries(AUDIT_CODE_CATALOG)) {
+      expect(entry.presentation.title, `${code} presentation`).toBeTruthy()
+      expect(entry.severityPolicy, `${code} severity policy`).toBeTruthy()
+      expect(entry.confidencePolicy, `${code} confidence policy`).toBeTruthy()
+      expect(entry.invariantId, `${code} invariant`).toMatch(/^INV-\d{2}$/)
+      expect(entry.role, `${code} role`).toBeTruthy()
+      expect(entry.rootCauseBehavior, `${code} root cause`).toBeTruthy()
+      expect(entry.exportMapping, `${code} export mapping`).toBeTruthy()
+      if (entry.lifecycle === 'related-only') expect(entry.role).toBe('RELATED')
+      if (entry.lifecycle === 'legacy') expect(entry.role).not.toBe('PRIMARY')
     }
   })
 
@@ -53,12 +74,27 @@ describe('audit finding presentation and visibility', () => {
     expect(isAuditFindingDismissed(finding, loadAuditFindingVisibility())).toBe(false)
   })
 
-  it('reativa quando a evidência semântica muda, mas mantém ocultação se só a severidade variar', () => {
+  it('reativa quando a materialidade piora e mantém ocultação quando só muda timestamp ou evidência relacionada', () => {
     const finding = makeFinding()
     const hidden = dismissAuditFinding(finding, {}, '2026-10-06T12:00:00.000Z')
-    expect(isAuditFindingDismissed(makeFinding({ severity: 'CRITICAL' }), hidden)).toBe(true)
+    expect(isAuditFindingDismissed(makeFinding({ severity: 'CRITICAL' }), hidden)).toBe(false)
+    expect(isAuditFindingDismissed(makeFinding({ technical: { ...finding.technical, auditedAt: '2030-01-01', related: ['new-related'] } }), hidden)).toBe(true)
     expect(isAuditFindingDismissed(makeFinding({ technical: { pipeline: { base: 'CARD_MISSING', later: 'GROUP_MATCHING', final: 'CARD_GROUP_MATCHED' } } }), hidden)).toBe(false)
     expect(Object.keys(hidden)).toHaveLength(1)
+  })
+
+  it('não compartilha ocultação entre subjects e reexibe quando root cause muda materialmente', () => {
+    const finding = makeFinding({ item: { fingerprint: 'subject-a' } as NonNullable<AuditFinding['item']>, rootCauseCode: 'ROOT_A' })
+    const hidden = dismissAuditFinding(finding, {})
+    expect(isAuditFindingDismissed(makeFinding({ item: { fingerprint: 'subject-b' } as NonNullable<AuditFinding['item']>, rootCauseCode: 'ROOT_A' }), hidden)).toBe(false)
+    expect(isAuditFindingDismissed(makeFinding({ item: { fingerprint: 'subject-a' } as NonNullable<AuditFinding['item']>, rootCauseCode: 'ROOT_B' }), hidden)).toBe(false)
+  })
+
+  it('reexibe quando o impacto declarado aumenta sem depender do texto cosmético', () => {
+    const finding = makeFinding({ technical: { impactLevel: 'LOW' } })
+    const hidden = dismissAuditFinding(finding, {})
+    expect(isAuditFindingDismissed(makeFinding({ technical: { impactLevel: 'HIGH' } }), hidden)).toBe(false)
+    expect(isAuditFindingDismissed(makeFinding({ technical: { impactLevel: 'LOW', auditedAt: '2031-01-01', message: 'Texto atualizado' } }), hidden)).toBe(true)
   })
 
   it('does not depend on audit timestamps or finding-list order for identity', () => {
@@ -97,5 +133,55 @@ describe('audit finding presentation and visibility', () => {
     fireEvent.click(screen.getByText('Detalhes técnicos'))
     expect(screen.getByText(/DERIVED_STATE_MISMATCH/)).toBeInTheDocument()
     expect(screen.getByText(/CARD_REVIEW/)).toBeInTheDocument()
+  })
+
+  it('mantém findings relacionados recolhidos dentro do primário', () => {
+    const finding = makeFinding({ relatedFindings: [{ id: 'related-1', code: 'ASSIGNMENT_CONFLICT', title: 'Reserva relacionada', detail: 'A linha já pertence a outro subject.' }] })
+    render(<AuditFindingCard finding={finding} visibility={{}} hiddenView={false} onDismiss={() => {}} onRestore={() => {}} onDiscardObsolete={() => {}} onViewPurchase={() => {}} onUseCandidate={() => {}} onInvalidateDecision={() => {}} onReanalyze={() => {}} />)
+    const summary = screen.getByText('1 verificações relacionadas')
+    expect(summary).toBeInTheDocument()
+    expect(summary.closest('details')).not.toHaveAttribute('open')
+    expect(screen.getByText('ASSIGNMENT_CONFLICT · RELATED')).not.toBeVisible()
+    fireEvent.click(summary)
+    expect(summary.closest('details')).toHaveAttribute('open')
+    expect(screen.getByText('ASSIGNMENT_CONFLICT · RELATED')).toBeInTheDocument()
+    expect(screen.getByText('Evidência: A linha já pertence a outro subject.')).toBeInTheDocument()
+  })
+
+  it('marca confiança limitada em finding crítico e explica que inconsistência interna é técnica', () => {
+    const critical = makeFinding({ code: 'AUDITOR_INTERNAL_INCONSISTENCY', severity: 'CRITICAL', diagnosticConfidence: 'LOW' })
+    render(<AuditFindingCard finding={critical} visibility={{}} hiddenView={false} onDismiss={() => {}} onRestore={() => {}} onDiscardObsolete={() => {}} onViewPurchase={() => {}} onUseCandidate={() => {}} onInvalidateDecision={() => {}} onReanalyze={() => {}} />)
+    expect(screen.getByText(/certeza limitada/)).toBeInTheDocument()
+    expect(screen.getByText(/mecanismo da Auditoria/)).toBeInTheDocument()
+  })
+
+  it('oferece invalidação por decisionId somente para confirmações de conflito resolvidas no snapshot', () => {
+    const finding = makeFinding({
+      code: 'PAIR_CONFIRMED_ASSIGNMENT_CONFLICT', severity: 'CRITICAL', category: 'DECISION', invariantId: 'INV-08',
+      technical: {
+        rowIdentity: 'sheet:row-a',
+        row: { id: 'record-123', description: 'Compra sintética', date: '2026-06-12', amount: 4000 },
+        assignments: [
+          { decisionId: 'id-a', decisionKey: 'PAIR_CONFIRMED:["bank-a"]', bankIdentity: 'bank-a', description: 'PIX A', date: '2026-06-10', amount: 4000 },
+          { decisionId: 'id-b', decisionKey: 'PAIR_CONFIRMED:["bank-b"]', bankIdentity: 'bank-b', description: 'PIX B', date: '2026-06-11', amount: 4000 },
+        ],
+      },
+    })
+    const invalidate = vi.fn()
+    const resolvable = (_finding: AuditFinding, assignment: Record<string, unknown>) => assignment.decisionKey === 'PAIR_CONFIRMED:["bank-a"]'
+    render(<AuditFindingCard finding={finding} visibility={{}} hiddenView={false} onDismiss={() => {}} onRestore={() => {}} onDiscardObsolete={() => {}} onViewPurchase={() => {}} onUseCandidate={() => {}} onInvalidateDecision={() => {}} onInvalidateBankConfirmation={invalidate} isBankConfirmationResolvable={resolvable} onReanalyze={() => {}} />)
+
+    const selectedAssignment = document.querySelector('.audit-bank-conflict-assignment') as HTMLElement
+    expect(within(selectedAssignment).getByText(/PIX A/)).toBeInTheDocument()
+    expect(within(selectedAssignment).getByText(/record-123/)).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: 'Desfazer esta confirmação' })).toHaveLength(1)
+    fireEvent.click(within(selectedAssignment).getByRole('button', { name: 'Desfazer esta confirmação' }))
+    expect(invalidate).toHaveBeenCalledWith(finding, finding.technical?.assignments && (finding.technical.assignments as Record<string, unknown>[])[0])
+  })
+
+  it('não oferece invalidação quando decisionId não pode ser resolvido sem ambiguidade', () => {
+    const finding = makeFinding({ code: 'PAIR_CONFIRMED_ASSIGNMENT_CONFLICT', severity: 'CRITICAL', technical: { rowIdentity: 'row', row: { id: 'row' }, assignments: [{ decisionId: 'same', decisionKey: 'same' }, { decisionId: 'same', decisionKey: 'same' }] } })
+    render(<AuditFindingCard finding={finding} visibility={{}} hiddenView={false} onDismiss={() => {}} onRestore={() => {}} onDiscardObsolete={() => {}} onViewPurchase={() => {}} onUseCandidate={() => {}} onInvalidateDecision={() => {}} onInvalidateBankConfirmation={() => {}} isBankConfirmationResolvable={() => true} onReanalyze={() => {}} />)
+    expect(screen.queryByRole('button', { name: 'Desfazer esta confirmação' })).not.toBeInTheDocument()
   })
 })

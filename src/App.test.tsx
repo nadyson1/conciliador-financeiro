@@ -2,12 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { CardStatement } from './domain/types'
+import type { PersistedDecision } from './domain/localDecisions'
 import { readCardStatementPdf } from './importers/cardStatement'
 import { appendCostYearRecord, GoogleSheetsError, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
 import { loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import { saveDriveFolders } from './integrations/googleDriveStorage'
 import { listDecisionTombstones } from './integrations/googleSheetDecisions'
-import { cardReviewCandidateIdentity, cardTransactionIdentity, sheetIdentity, stableFingerprint } from './domain/identity'
+import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, sheetIdentity, stableFingerprint } from './domain/identity'
+import { initialColumnMap, parseCsvText } from './importers/csv'
+import { parseBankRows, parseLedgerRows } from './importers/transactions'
 import App from './App'
 
 const syntheticStatement: CardStatement = {
@@ -37,7 +40,7 @@ vi.mock('./domain/localDecisions', () => ({
 }))
 
 vi.mock('./integrations/googleSheetDecisions', () => ({
-  addDecisionTombstone: decisionSyncMocks.tombstone, listDecisionTombstones: () => Object.fromEntries(decisionSyncMocks.tombstones), removeDecisionTombstone: vi.fn((key: string) => decisionSyncMocks.tombstones.delete(key)),
+  addDecisionTombstone: decisionSyncMocks.tombstone, listDecisionTombstones: () => Object.fromEntries(decisionSyncMocks.tombstones), removeDecisionTombstone: vi.fn((key: string) => decisionSyncMocks.tombstones.delete(key)), restoreDecisionTombstone: vi.fn((key: string, previous: { updatedAt: string; decision: { key: string } } | undefined) => { if (previous) decisionSyncMocks.tombstones.set(key, previous); else decisionSyncMocks.tombstones.delete(key) }),
   readGoogleSheetDecisionsReadOnly: decisionSyncMocks.readRemote,
   syncGoogleSheetDecisions: decisionSyncMocks.sync, syncOneGoogleSheetDecision: decisionSyncMocks.save, syncOneGoogleSheetDeletion: decisionSyncMocks.deletion,
 }))
@@ -113,6 +116,116 @@ function hideReconcileButtonFromViewport() {
 }
 
 describe('fluxo completo no navegador', () => {
+  it('tombstona somente a confirmação escolhida no conflito do Auditor e atualiza o resultado', async () => {
+    const user = userEvent.setup()
+    const bankText = 'Data,Descrição,Valor,Tipo,Documento\n12/03/2026,PIX ENVIADO,"12,00",Débito,bank-conflict-a\n12/03/2026,PIX ENVIADO,"12,00",Débito,bank-conflict-b'
+    const bankCsv = parseCsvText(bankText)
+    const banks = parseBankRows(bankCsv.rows, initialColumnMap(bankCsv.headers, 'bank')).transactions
+    const sheetText = 'Descrição,Data,Custo,ID\nMel sache Feirinha,12/03/2026,"12,00",row-conflict'
+    const sheetCsv = parseCsvText(sheetText)
+    const row = parseLedgerRows(sheetCsv.rows, initialColumnMap(sheetCsv.headers, 'sheet')).transactions[0]
+    const makeConfirmed = (bank: typeof banks[number]): PersistedDecision => {
+      const identities = [bankIdentity(bank)]
+      return { key: `PAIR_CONFIRMED:${JSON.stringify(identities)}`, schemaVersion: 1, kind: 'PAIR_CONFIRMED', identities, selected: [sheetIdentity(row)], updatedAt: '2026-10-10T10:00:00.000Z' }
+    }
+    const first = makeConfirmed(banks[0])
+    const second = makeConfirmed(banks[1])
+    const rejection: PersistedDecision = { key: `PAIR_REJECTED:${JSON.stringify([bankIdentity(banks[0]), sheetIdentity(row)])}`, schemaVersion: 1, kind: 'PAIR_REJECTED', identities: [bankIdentity(banks[0]), sheetIdentity(row)], selected: [], updatedAt: '2026-10-10T10:01:00.000Z' }
+    const legacy: PersistedDecision = { key: 'PAIR_CONFIRMED:["bank:legacy-unresolved"]', schemaVersion: 1, kind: 'PAIR_CONFIRMED', identities: ['bank:legacy-unresolved'], selected: [sheetIdentity(row)], updatedAt: '2026-10-09T10:00:00.000Z' }
+    for (const decision of [first, second, rejection, legacy]) savedDecisionStore.set(decision.key, decision)
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<App />)
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File([sheetText], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File([bankText], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: 'Conciliar agora' }))
+    await user.click(screen.getByRole('button', { name: 'Auditar consistência' }))
+    const finding = await screen.findByRole('heading', { name: 'Confirmações bancárias incompatíveis' })
+    const auditCard = finding.closest('article')!
+    const selectedAction = within(auditCard).getAllByRole('button', { name: 'Desfazer esta confirmação' }).map((button) => button.closest('.audit-bank-conflict-assignment') as HTMLElement | null).find((element) => element?.textContent?.includes(stableFingerprint([first.key])))!
+    await user.click(within(selectedAction).getByRole('button', { name: 'Desfazer esta confirmação' }))
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Esta ação desfará apenas esta confirmação manual. Outras decisões e rejeições serão preservadas.'))
+    await waitFor(() => expect(savedDecisionStore.has(first.key)).toBe(false))
+    expect(savedDecisionStore.has(second.key)).toBe(true)
+    expect(savedDecisionStore.has(rejection.key)).toBe(true)
+    expect(savedDecisionStore.has(legacy.key)).toBe(true)
+    expect(listDecisionTombstones()[first.key]).toBeDefined()
+    expect(listDecisionTombstones()[second.key]).toBeUndefined()
+    expect(listDecisionTombstones()[rejection.key]).toBeUndefined()
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Confirmações bancárias incompatíveis' })).not.toBeInTheDocument())
+  })
+
+  it('preserva decisão e finding quando a persistência local do tombstone falha', async () => {
+    const user = userEvent.setup()
+    const bankText = 'Data,Descrição,Valor,Tipo,Documento\n12/03/2026,PIX ENVIADO,"12,00",Débito,bank-local-failure-a\n12/03/2026,PIX ENVIADO,"12,00",Débito,bank-local-failure-b'
+    const bankCsv = parseCsvText(bankText)
+    const banks = parseBankRows(bankCsv.rows, initialColumnMap(bankCsv.headers, 'bank')).transactions
+    const sheetText = 'Descrição,Data,Custo,ID\nCompra sintética,12/03/2026,"12,00",row-local-failure'
+    const sheetCsv = parseCsvText(sheetText)
+    const row = parseLedgerRows(sheetCsv.rows, initialColumnMap(sheetCsv.headers, 'sheet')).transactions[0]
+    const decisions = banks.map((bank): PersistedDecision => {
+      const identities = [bankIdentity(bank)]
+      return { key: `PAIR_CONFIRMED:${JSON.stringify(identities)}`, schemaVersion: 1, kind: 'PAIR_CONFIRMED', identities, selected: [sheetIdentity(row)], updatedAt: '2026-10-10T10:00:00.000Z' }
+    })
+    decisions.forEach((decision) => savedDecisionStore.set(decision.key, decision))
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    decisionSyncMocks.deleteDecision.mockRejectedValueOnce(new Error('local storage failure'))
+    render(<App />)
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File([sheetText], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File([bankText], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: 'Conciliar agora' }))
+    await user.click(screen.getByRole('button', { name: 'Auditar consistência' }))
+    const finding = await screen.findByRole('heading', { name: 'Confirmações bancárias incompatíveis' })
+    const auditCard = finding.closest('article')!
+    const selectedAction = within(auditCard).getAllByRole('button', { name: 'Desfazer esta confirmação' }).map((button) => button.closest('.audit-bank-conflict-assignment') as HTMLElement | null).find((element) => element?.textContent?.includes(stableFingerprint([decisions[0].key])))!
+    await user.click(within(selectedAction).getByRole('button', { name: 'Desfazer esta confirmação' }))
+
+    await screen.findByText(/Não foi possível salvar a remoção neste dispositivo/)
+    expect(savedDecisionStore.has(decisions[0].key)).toBe(true)
+    expect(savedDecisionStore.has(decisions[1].key)).toBe(true)
+    expect(listDecisionTombstones()[decisions[0].key]).toBeUndefined()
+    expect(screen.getByRole('heading', { name: 'Confirmações bancárias incompatíveis' })).toBeInTheDocument()
+  })
+
+  it('mantém o tombstone local e sinaliza sincronização pendente quando a gravação remota falha', async () => {
+    const user = userEvent.setup()
+    const bankText = 'Data,Descrição,Valor,Tipo,Documento\n12/03/2026,PIX ENVIADO,"12,00",Débito,bank-remote-failure-a\n12/03/2026,PIX ENVIADO,"12,00",Débito,bank-remote-failure-b'
+    const bankCsv = parseCsvText(bankText)
+    const banks = parseBankRows(bankCsv.rows, initialColumnMap(bankCsv.headers, 'bank')).transactions
+    const sheetText = 'Descrição,Data,Custo,ID\nCompra sintética,12/03/2026,"12,00",row-remote-failure'
+    const sheetCsv = parseCsvText(sheetText)
+    const row = parseLedgerRows(sheetCsv.rows, initialColumnMap(sheetCsv.headers, 'sheet')).transactions[0]
+    const decisions = banks.map((bank): PersistedDecision => {
+      const identities = [bankIdentity(bank)]
+      return { key: `PAIR_CONFIRMED:${JSON.stringify(identities)}`, schemaVersion: 1, kind: 'PAIR_CONFIRMED', identities, selected: [sheetIdentity(row)], updatedAt: '2026-10-10T10:00:00.000Z' }
+    })
+    decisions.forEach((decision) => savedDecisionStore.set(decision.key, decision))
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha de teste', lastUpdated: null, autoConnect: true })
+    vi.mocked(readGoogleSheetLedger).mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha de teste', transactions: [row], rowCount: 2 })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File([bankText], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: 'Conciliar agora' }))
+    await user.click(screen.getByRole('button', { name: 'Auditar consistência' }))
+    const finding = await screen.findByRole('heading', { name: 'Confirmações bancárias incompatíveis' })
+    const auditCard = finding.closest('article')!
+    const selectedAction = within(auditCard).getAllByRole('button', { name: 'Desfazer esta confirmação' }).map((button) => button.closest('.audit-bank-conflict-assignment') as HTMLElement | null).find((element) => element?.textContent?.includes(stableFingerprint([decisions[0].key])))!
+    decisionSyncMocks.sync.mockRejectedValueOnce(new Error('network unavailable'))
+    await user.click(within(selectedAction).getByRole('button', { name: 'Desfazer esta confirmação' }))
+
+    await screen.findByText(/Confirmação desfeita neste dispositivo; sincronização pendente/)
+    expect(savedDecisionStore.has(decisions[0].key)).toBe(false)
+    expect(savedDecisionStore.has(decisions[1].key)).toBe(true)
+    expect(listDecisionTombstones()[decisions[0].key]).toBeDefined()
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Confirmações bancárias incompatíveis' })).not.toBeInTheDocument())
+  })
+
   it('executa Auditor de consistência sem escrever na planilha nem alterar decisões', async () => {
     const user = userEvent.setup()
     const kindleStatement: CardStatement = { ...structuredClone(syntheticStatement), fileName: 'fatura-kindle.pdf', statementIdentity: 'statement-kindle-regression', dueDate: '2026-03-12', reportedTotal: 299, purchasesDebitsTotal: 299, transactions: [{ ...syntheticStatement.transactions[0], id: 'kindle-purchase', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', originalDescription: 'Amazon Kindle Unltd', description: 'Amazon Kindle Unltd', amount: 299, statementTotal: 299 }] }
@@ -155,7 +268,8 @@ describe('fluxo completo no navegador', () => {
     expect(screen.queryByText(/CARD_MISSING_NO_CANDIDATE/)).not.toBeInTheDocument()
     await user.click(screen.getByText(/Compras avaliadas/))
     await user.click(screen.getByText('Detalhes técnicos da avaliação'))
-    expect(document.querySelector('pre')?.textContent).toContain('"estadoPuro": "CARD_MATCHED"')
+    expect([...document.querySelectorAll('pre')].some((pre) => pre.textContent?.includes('"estadoPuro": "CARD_MATCHED"'))).toBe(true)
+    expect(screen.getByText(/Auditoria parcial — algumas fontes/)).toBeInTheDocument()
     expect([...savedDecisionStore.entries()]).toEqual(savedBefore)
     expect(decisionSyncMocks.tombstone).not.toHaveBeenCalled()
     expect(decisionSyncMocks.deletion).not.toHaveBeenCalled()
@@ -430,6 +544,103 @@ describe('fluxo completo no navegador', () => {
     expect(decisionSyncMocks.sync).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', [], {})
     await user.click(screen.getByRole('button', { name: 'Sincronizar decisões' }))
     await waitFor(() => expect(decisionSyncMocks.sync).toHaveBeenCalledTimes(2))
+  })
+
+  it('reidrata PAIR_REJECTED no reload e permite reconsiderar somente o par rejeitado', async () => {
+    const user = userEvent.setup()
+    const bankCsv = parseCsvText('Data,Descrição,Valor,Tipo,Documento\n12/03/2026,PIX ENVIADO,"2,99",Débito,bank-01')
+    const bank = parseBankRows(bankCsv.rows, initialColumnMap(bankCsv.headers, 'bank')).transactions[0]
+    const ledgerCsv = parseCsvText('Descrição,Data,Custo,ID\nAssinatura Kindle,12/03/2026,"2,99",row-01')
+    const sheet = parseLedgerRows(ledgerCsv.rows, initialColumnMap(ledgerCsv.headers, 'sheet')).transactions[0]
+    const identities = [bankIdentity(bank), sheetIdentity(sheet)]
+    const rejected: PersistedDecision = { key: `PAIR_REJECTED:${JSON.stringify(identities)}`, schemaVersion: 1, kind: 'PAIR_REJECTED', identities, selected: [], updatedAt: '2026-10-09T12:00:00.000Z' }
+    savedDecisionStore.set(rejected.key, rejected)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<App />)
+    await user.upload(screen.getAllByLabelText('Selecionar arquivo CSV')[0], new File(['Descrição,Data,Custo,ID\nAssinatura Kindle,12/03/2026,"2,99",row-01'], 'custos.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo,Documento\n12/03/2026,PIX ENVIADO,"2,99",Débito,bank-01'], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: 'Conciliar agora' }))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+
+    expect(await screen.findByRole('button', { name: 'Reconsiderar correspondência' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Reconsiderar correspondência' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Reconsiderar correspondência' })).not.toBeInTheDocument())
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('será substituída por uma confirmação'))
+    expect(decisionSyncMocks.tombstone).toHaveBeenCalledWith(rejected)
+    expect(screen.getByRole('tab', { name: /Ausentes/ })).toHaveTextContent('0')
+    await waitFor(() => expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'PAIR_CONFIRMED' && decision.selected[0] === identities[1])).toBe(true))
+    expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'PAIR_REJECTED')).toBe(false)
+  })
+
+  it('recalcula imediatamente quando o sync manual hidrata um PAIR_REJECTED remoto', async () => {
+    const user = userEvent.setup()
+    const bankCsv = parseCsvText('Data,Descrição,Valor,Tipo,Documento\n12/03/2026,PIX ENVIADO,"2,99",Débito,bank-remote')
+    const bank = parseBankRows(bankCsv.rows, initialColumnMap(bankCsv.headers, 'bank')).transactions[0]
+    const row = { id: 'sheet-row-remote', source: 'SHEET' as const, sheetRecordId: 'row-remote', bankTransactionId: null, date: '2026-03-12', description: 'Assinatura Kindle', originalDescription: 'Assinatura Kindle', amount: 299, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '03 - Março', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const identities = [bankIdentity(bank), sheetIdentity(row)]
+    const remoteRejection: PersistedDecision = { key: `PAIR_REJECTED:${JSON.stringify(identities)}`, schemaVersion: 1, kind: 'PAIR_REJECTED', identities, selected: [], updatedAt: '2026-10-09T12:00:00.000Z' }
+    decisionSyncMocks.sync.mockResolvedValueOnce([]).mockResolvedValueOnce([remoteRejection])
+    vi.mocked(readGoogleSheetLedger).mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha com decisão', transactions: [row], rowCount: 2 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha com decisão', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await waitFor(() => expect(decisionSyncMocks.sync).toHaveBeenCalledOnce())
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo,Documento\n12/03/2026,PIX ENVIADO,"2,99",Débito,bank-remote'], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: 'Conciliar agora' }))
+    expect(screen.getByRole('tab', { name: /Conciliadas/ })).toHaveTextContent('1')
+    await user.click(screen.getByRole('button', { name: 'Sincronizar decisões' }))
+    await waitFor(() => expect(screen.getByRole('tab', { name: /Ausentes/ })).toHaveTextContent('1'))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+
+    expect(await screen.findByRole('button', { name: 'Reconsiderar correspondência' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /Ausentes/ })).toHaveTextContent('1')
+  })
+
+  it('não deixa o resultado stale quando uma decisão local muda durante o sync remoto', async () => {
+    const user = userEvent.setup()
+    const syncResult = deferred<PersistedDecision[]>()
+    const bankCsv = parseCsvText('Data,Descrição,Valor,Tipo,Documento\n12/03/2026,PIX ENVIADO,"2,99",Débito,bank-race-a\n13/03/2026,PIX ENVIADO,"8,00",Débito,bank-race-b')
+    const parsedBanks = parseBankRows(bankCsv.rows, initialColumnMap(bankCsv.headers, 'bank')).transactions
+    const rows = [
+      { id: 'sheet-race-a', source: 'SHEET' as const, sheetRecordId: 'row-race-a', bankTransactionId: null, date: '2026-03-12', description: 'Compra A', originalDescription: 'Compra A', amount: 299, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '03 - Março', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} },
+      { id: 'sheet-race-b', source: 'SHEET' as const, sheetRecordId: 'row-race-b', bankTransactionId: null, date: '2026-03-12', description: 'Compra B', originalDescription: 'Compra B', amount: 299, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '03 - Março', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} },
+    ]
+    const rejected = rows.map((row): PersistedDecision => {
+      const identities = [bankIdentity(parsedBanks[0]), sheetIdentity(row)]
+      return { key: `PAIR_REJECTED:${JSON.stringify(identities)}`, schemaVersion: 1, kind: 'PAIR_REJECTED', identities, selected: [], updatedAt: '2026-10-09T12:00:00.000Z' }
+    })
+    decisionSyncMocks.sync.mockResolvedValueOnce([]).mockReturnValueOnce(syncResult.promise)
+    vi.mocked(readGoogleSheetLedger).mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha com decisões concorrentes', transactions: rows, rowCount: 3 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha com decisões concorrentes', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await waitFor(() => expect(decisionSyncMocks.sync).toHaveBeenCalledOnce())
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo,Documento\n12/03/2026,PIX ENVIADO,"2,99",Débito,bank-race-a\n13/03/2026,PIX ENVIADO,"8,00",Débito,bank-race-b'], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 2 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: 'Conciliar agora' }))
+    expect(screen.getByRole('tab', { name: /Revisão/ })).toHaveTextContent('1')
+    await user.click(screen.getByRole('button', { name: 'Sincronizar decisões' }))
+    await waitFor(() => expect(decisionSyncMocks.sync).toHaveBeenCalledTimes(2))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    const ignoredCard = screen.getByText('R$ 8,00').closest('article')!
+    await user.click(within(ignoredCard).getByRole('button', { name: 'Ignorar' }))
+    // The workspace queue keeps the local mutation behind the in-flight sync.
+    // Once the older remote snapshot is committed, the queued ignore must win.
+    rejected.forEach((decision) => savedDecisionStore.set(decision.key, decision))
+    syncResult.resolve(rejected)
+    const localIgnore = await waitFor(() => {
+      const found = [...savedDecisionStore.values()].find((decision) => decision.kind === 'BANK_IGNORED' && decision.identities[0] === bankIdentity(parsedBanks[1]))
+      expect(found).toBeDefined()
+      return found as unknown as PersistedDecision
+    })
+
+    await waitFor(() => expect(screen.getByRole('tab', { name: /Ausentes/ })).toHaveTextContent('1'))
+    expect(screen.getByRole('tab', { name: /Revisão/ })).toHaveTextContent('0')
+    expect(screen.getAllByRole('button', { name: 'Reconsiderar correspondência' })).toHaveLength(2)
+    expect(savedDecisionStore.has(localIgnore.key)).toBe(true)
   })
 
   it('oculta o upload CUSTOS ANO ao escolher Google Sheets e permite voltar ao CSV sem desconectar', async () => {
@@ -837,7 +1048,7 @@ describe('fluxo completo no navegador', () => {
     expect(screen.queryByText(/Candidato já atribuído a outra compra/)).not.toBeInTheDocument()
   })
 
-  it('invalida confirmação persistida de ausência quando a CUSTOS ANO atual contém a compra', async () => {
+  it('não aplica confirmação de ausência obsoleta e preserva a decisão para diagnóstico', async () => {
     const user = userEvent.setup()
     const statement: CardStatement = { ...structuredClone(syntheticStatement), statementIdentity: 'statement-kindle', dueDate: '2026-03-12', transactions: [{ ...syntheticStatement.transactions[0], id: 'kindle-card', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description: 'Amazon Kindle Unltd', originalDescription: 'Amazon Kindle Unltd', amount: 299 }] }
     // Historical fingerprint from before the card identifier became part of the hash.
@@ -855,9 +1066,9 @@ describe('fluxo completo no navegador', () => {
     await screen.findByText(/Lançamentos carregados do Google Sheets/)
     await user.upload(screen.getByLabelText('Selecionar fatura PDF'), new File(['synthetic'], 'kindle.pdf', { type: 'application/pdf' }))
     await screen.findByText(/^Fatura /)
-    await waitFor(() => expect(savedDecisionStore.has(decision.key)).toBe(false))
+    await waitFor(() => expect(savedDecisionStore.has(decision.key)).toBe(true))
     expect(savedDecisionStore.has(unrelatedBankDecision.key)).toBe(true)
-    expect(decisionSyncMocks.tombstone).toHaveBeenCalledWith(decision)
+    expect(decisionSyncMocks.tombstone).not.toHaveBeenCalledWith(decision)
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
     await user.click(await screen.findByRole('button', { name: 'Mostrar conciliadas' }))
@@ -867,7 +1078,7 @@ describe('fluxo completo no navegador', () => {
     expect(within(row).queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
   })
 
-  it('rebaixa para REVIEW um vínculo confirmado cuja linha teve a data editada', async () => {
+  it('não aplica vínculo de cartão que requer revisão após edição da data e preserva a decisão', async () => {
     const user = userEvent.setup()
     const statement: CardStatement = { ...structuredClone(syntheticStatement), statementIdentity: 'statement-kindle-date-edit', dueDate: '2026-03-12', transactions: [{ ...syntheticStatement.transactions[0], id: 'kindle-date-edit', date: '2026-02-02', purchaseDate: '2026-02-02', invoiceDueDate: '2026-03-12', statementDueDate: '2026-03-12', description: 'Amazon Kindle Unltd', originalDescription: 'Amazon Kindle Unltd', amount: 299 }] }
     const identity = `${statement.statementIdentity}:${stableFingerprint([statement.transactions[0].cardIdentifier, statement.transactions[0].date, statement.transactions[0].originalDescription, statement.transactions[0].amount, statement.transactions[0].direction, null, null])}`
@@ -884,9 +1095,8 @@ describe('fluxo completo no navegador', () => {
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Faturas PDF/ }))
     const row = screen.getByText(/Amazon Kindle Unltd/).closest('article')!
-    expect(within(row).getByText('REVISAR CORRESPONDÊNCIA')).toBeInTheDocument()
-    expect(within(row).getByText(/CUSTOS ANO: 12\/04\/2026 · Assinatura Kindle unlimited/)).toBeInTheDocument()
-    expect(within(row).queryByText('COMPRA DE CARTÃO NÃO REGISTRADA')).not.toBeInTheDocument()
+    expect(within(row).getByText('COMPRA DE CARTÃO NÃO REGISTRADA')).toBeInTheDocument()
+    expect(within(row).queryByText('REVISAR CORRESPONDÊNCIA')).not.toBeInTheDocument()
     expect(savedDecisionStore.has(saved.key)).toBe(true)
   })
 
@@ -909,7 +1119,7 @@ describe('fluxo completo no navegador', () => {
     await waitFor(() => expect([...savedDecisionStore.values()].some((record) => record.kind === 'CARD_REVIEW_REJECTED_CANDIDATES')).toBe(true))
     const rejection = [...savedDecisionStore.values()].find((record) => record.kind === 'CARD_REVIEW_REJECTED_CANDIDATES')!
     expect(rejection.selected).toEqual([cardReviewCandidateIdentity(oldCycle)])
-    await waitFor(() => expect(decisionSyncMocks.save).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', rejection))
+    await waitFor(() => expect(decisionSyncMocks.sync).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', expect.arrayContaining([rejection]), expect.any(Object)))
     expect(await screen.findByText('COMPRA DE CARTÃO NÃO REGISTRADA')).toBeInTheDocument()
     const missingRow = screen.getByText(/IFD\*iFood/).closest('article')!
     expect(within(missingRow).getByRole('button', { name: 'Adicionar à CUSTOS ANO' })).toBeInTheDocument()
@@ -951,7 +1161,7 @@ describe('fluxo completo no navegador', () => {
     expect(savedDecisionStore.size).toBe(0)
   })
 
-  it('remove confirmação MISSING_ADDED_TO_SHEET órfã quando a linha já não existe na CUSTOS ANO', async () => {
+  it('mantém confirmação MISSING_ADDED_TO_SHEET órfã para diagnóstico sem aplicá-la', async () => {
     const user = userEvent.setup()
     const orphan = { key: 'MISSING_ADDED_TO_SHEET:["doc:orphan-bank"]', schemaVersion: 1 as const, kind: 'MISSING_ADDED_TO_SHEET', identities: ['doc:orphan-bank'], selected: ['deleted-sheet-row'], updatedAt: new Date().toISOString() }
     savedDecisionStore.set(orphan.key, orphan)
@@ -960,8 +1170,8 @@ describe('fluxo completo no navegador', () => {
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha com linha removida', lastUpdated: null, autoConnect: true })
     render(<App />)
     await screen.findByText(/Lançamentos carregados do Google Sheets/)
-    await waitFor(() => expect(savedDecisionStore.has(orphan.key)).toBe(false))
-    expect(decisionSyncMocks.tombstone).toHaveBeenCalledWith(orphan)
+    await waitFor(() => expect(savedDecisionStore.has(orphan.key)).toBe(true))
+    expect(decisionSyncMocks.tombstone).not.toHaveBeenCalledWith(orphan)
     await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo,ID\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito,orphan-bank'], 'banco.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
@@ -1297,7 +1507,11 @@ describe('fluxo completo no navegador', () => {
     expect(screen.getByText('Nenhuma despesa ausente')).toBeInTheDocument()
     expect(within(screen.getByRole('tablist')).getByRole('tab', { name: /Ausentes/ })).toHaveAttribute('aria-selected', 'true')
     await user.click(screen.getByRole('button', { name: /Conciliadas/ }))
-    expect(screen.getByText('Tudo em dia por aqui')).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /Conciliadas/ })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByText('Mercado Central')).toBeInTheDocument()
+    expect(screen.getByText('Café Nova')).toBeInTheDocument()
+    expect(screen.getAllByText(/Origem: Correspondência automática/)).toHaveLength(2)
+    expect(screen.queryByRole('button', { name: 'Desfazer decisão' })).not.toBeInTheDocument()
 
     await user.selectOptions(screen.getByLabelText('Ano'), '2027')
     expect(document.querySelector('.metric-green .metric-value')).toHaveTextContent('1')
@@ -1309,6 +1523,7 @@ describe('fluxo completo no navegador', () => {
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
     const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    await user.click(within(screen.getByRole('tablist')).getByRole('tab', { name: /Resumo/ }))
     await user.click(screen.getByRole('button', { name: '↓ Resumo' }))
     expect(URL.createObjectURL).toHaveBeenCalledOnce()
     expect(anchorClick).toHaveBeenCalledOnce()
@@ -1335,6 +1550,7 @@ describe('fluxo completo no navegador', () => {
     await user.click(screen.getByRole('tab', { name: /Revisão/ }))
 
     expect(screen.getByText('Loja Antiga')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '✓ Confirmar' }))
     expect(scrollTo).toHaveBeenCalledOnce()
     expect(screen.queryByText('Loja Antiga')).not.toBeInTheDocument()
@@ -1551,6 +1767,43 @@ describe('fluxo completo no navegador', () => {
     await user.click(within(drivePanel).getByRole('button', { name: 'Sincronizar arquivos' }))
     await waitFor(() => expect(googleDriveMocks.list).toHaveBeenCalledTimes(8))
     expect(googleDriveMocks.download).toHaveBeenCalledTimes(2)
+  })
+
+  it('mostra confirmações manuais na lista Conciliadas e desfaz somente a decisão persistida', async () => {
+    const user = userEvent.setup()
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const row = (id: string) => ({ id, source: 'SHEET' as const, sheetRecordId: id, bankTransactionId: null, date: '2026-01-08', description: 'Mercado Central', originalDescription: 'Mercado Central', amount: 1000, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Alimentação', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: true, installment: null, totalInstallments: null, balanceAfter: null, original: {} })
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha de teste', transactions: [row('sheet-a'), row('sheet-b')], rowCount: 2 })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha de teste', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    const bankFile = new File(['Data,Descrição,Valor,Tipo,Forma de pagamento,ID\n08/01/2026,Mercado Central,"10,00",Débito,Pix,bank-manual'], 'banco.csv', { type: 'text/csv' })
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), bankFile)
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Revisão/ }))
+    const reviewCard = screen.getByText('Confira este par de lançamentos').closest('article')!
+    expect(within(reviewCard).getAllByRole('button', { name: 'Usar este lançamento' })).toHaveLength(2)
+    await user.click(within(reviewCard).getAllByRole('button', { name: 'Usar este lançamento' })[0])
+    await waitFor(() => expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'PAIR_CONFIRMED')).toBe(true))
+    const [decision] = [...savedDecisionStore.values()].filter((item) => item.kind === 'PAIR_CONFIRMED')
+    await user.click(screen.getByRole('tab', { name: /Conciliadas/ }))
+    const conciliated = screen.getByText('Mercado Central').closest('article')!
+    expect(within(conciliated).getByText('Origem: Confirmação manual')).toBeInTheDocument()
+    expect(within(conciliated).getByText(/Forma de pagamento: Pix/)).toBeInTheDocument()
+    const undo = within(conciliated).getByRole('button', { name: 'Desfazer decisão' })
+    await user.click(undo)
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('O vínculo será removido e o caso será recalculado.'))
+    await waitFor(() => expect(savedDecisionStore.has(decision.key)).toBe(false))
+    expect([...savedDecisionStore.values()].some((record) => record.kind === 'PAIR_REJECTED')).toBe(false)
+    await waitFor(() => expect(decisionSyncMocks.sync).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', [], expect.objectContaining({ [decision.key]: expect.objectContaining({ decision: expect.objectContaining({ key: decision.key }) }) })))
+    expect(Object.keys(listDecisionTombstones())).not.toContain(decision.key)
+    expect(screen.queryByRole('button', { name: 'Desfazer decisão' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('tab', { name: /Revisão/ }))
+    expect(screen.getByText('Confira este par de lançamentos')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: 'Usar este lançamento' })).toHaveLength(2)
+    expect(screen.queryByRole('button', { name: 'Adicionar à CUSTOS ANO' })).not.toBeInTheDocument()
+    expect(savedDecisionStore.size).toBe(0)
   })
 
   it('importa OFX pelo seletor local mesmo quando o arquivo tem extensão CSV', async () => {

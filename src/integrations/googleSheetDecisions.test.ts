@@ -4,7 +4,7 @@ import type { PersistedDecision } from '../domain/localDecisions'
 import { stableFingerprint } from '../domain/identity'
 
 const localStoreMocks = vi.hoisted(() => ({ put: vi.fn(), remove: vi.fn() }))
-vi.mock('../domain/localDecisions', () => ({ putPersistedDecision: localStoreMocks.put, deletePersistedDecision: localStoreMocks.remove }))
+vi.mock('../domain/localDecisions', () => ({ putPersistedDecision: localStoreMocks.put, deletePersistedDecision: localStoreMocks.remove, nextDecisionTimestamp: (...observed: string[]) => new Date(Math.max(Date.now(), ...observed.map((item) => Date.parse(item) + 1).filter(Number.isFinite))).toISOString() }))
 
 const decision: PersistedDecision = { key: 'PAIR_CONFIRMED:["bank:fingerprint"]', schemaVersion: 1, kind: 'PAIR_CONFIRMED', identities: ['bank:fingerprint'], selected: ['sheet:fingerprint'], updatedAt: '2026-01-02T00:00:00.000Z' }
 const headers = ['decisionId', 'decisionType', 'subjectFingerprint', 'status', 'relatedIds', 'metadata', 'createdAt', 'updatedAt', 'schemaVersion']
@@ -109,6 +109,95 @@ describe('sincronização de decisões no Google Sheets', () => {
     expect(active).toEqual([])
     expect(JSON.parse(String((fetcher.mock.calls[2][1] as RequestInit).body)).values[0][3]).toBe('DELETED')
     expect(localStoreMocks.remove).toHaveBeenCalledWith(absence.key)
+  })
+
+  it('merge repetido é idempotente e mantém tombstone mais novo contra cópia ativa antiga', async () => {
+    const newerTombstone = '2026-01-05T00:00:00.000Z'
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(decision)] }))
+      .mockResolvedValueOnce(response({}))
+    const first = await syncGoogleSheetDecisions('spreadsheet-id-monotonic', 'token', [decision], { [decision.key]: { updatedAt: newerTombstone, decision } }, fetcher)
+    expect(first).toEqual([])
+    expect(JSON.parse(String((fetcher.mock.calls[2][1] as RequestInit).body)).values[0][3]).toBe('DELETED')
+    const remoteTombstone = { ...decision, updatedAt: newerTombstone }
+    const retryFetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(remoteTombstone, 'DELETED')] }))
+    const retry = await syncGoogleSheetDecisions('spreadsheet-id-monotonic', 'token', [decision], {}, retryFetcher)
+    expect(retry).toEqual([])
+    expect(retryFetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('retry após falha parcial converge para tombstone sem duplicar ou reativar a decisão', async () => {
+    const tombstoneAt = '2026-01-05T00:00:00.000Z'
+    const failedWrite = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(decision)] }))
+      .mockResolvedValueOnce(response({}, 500))
+    await expect(syncGoogleSheetDecisions('spreadsheet-retry', 'token', [decision], { [decision.key]: { updatedAt: tombstoneAt, decision } }, failedWrite)).rejects.toThrow(/HTTP 500/)
+    const retry = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(decision)] }))
+      .mockResolvedValueOnce(response({}))
+    expect(await syncGoogleSheetDecisions('spreadsheet-retry', 'token', [decision], { [decision.key]: { updatedAt: tombstoneAt, decision } }, retry)).toEqual([])
+    expect(retry).toHaveBeenCalledTimes(3)
+    expect(JSON.parse(String((retry.mock.calls[2][1] as RequestInit).body)).values[0][3]).toBe('DELETED')
+  })
+
+  it('retry de substituição PAIR_CONFIRMED → PAIR_REJECTED converge sem reativar a confirmação', async () => {
+    const confirmed: PersistedDecision = { key: 'PAIR_CONFIRMED:["bank:pair"]', schemaVersion: 1, kind: 'PAIR_CONFIRMED', identities: ['bank:pair'], selected: ['sheet:pair'], updatedAt: '2026-01-02T00:00:00.000Z' }
+    const rejected: PersistedDecision = { key: 'PAIR_REJECTED:["bank:pair","sheet:pair"]', schemaVersion: 1, kind: 'PAIR_REJECTED', identities: ['bank:pair', 'sheet:pair'], selected: [], updatedAt: '2026-01-04T00:00:00.000Z' }
+    const tombstoneAt = '2026-01-05T00:00:00.000Z'
+    const partial = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(confirmed)] }))
+      .mockResolvedValueOnce(response({}))
+      .mockResolvedValueOnce(response({}, 500))
+    const tombstones = { [confirmed.key]: { updatedAt: tombstoneAt, decision: confirmed } }
+    await expect(syncGoogleSheetDecisions('spreadsheet-pair-retry', 'token', [rejected], tombstones, partial)).rejects.toThrow(/HTTP 500/)
+    expect(JSON.parse(String((partial.mock.calls[2][1] as RequestInit).body)).values[0][3]).toBe('DELETED')
+    expect(JSON.parse(String((partial.mock.calls[3][1] as RequestInit).body)).values[0][3]).toBe('ACTIVE')
+
+    const retry = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow({ ...confirmed, updatedAt: tombstoneAt }, 'DELETED')] }))
+      .mockResolvedValueOnce(response({}))
+      .mockResolvedValueOnce(response({}))
+      .mockResolvedValueOnce(response({}))
+    const active = await syncGoogleSheetDecisions('spreadsheet-pair-retry', 'token', [rejected], tombstones, retry)
+    expect(active).toEqual([rejected])
+    const writtenRows = retry.mock.calls.slice(2).map(([, init]) => JSON.parse(String((init as RequestInit).body)).values[0] as unknown[])
+    expect(writtenRows).toContainEqual(expect.arrayContaining(['PAIR_REJECTED', 'ACTIVE']))
+    expect(localStoreMocks.remove).toHaveBeenCalledWith(confirmed.key)
+  })
+
+  it('reload/sync de substituição entrega apenas a decisão ativa do par', async () => {
+    const confirmed: PersistedDecision = { key: 'PAIR_CONFIRMED:["bank:reload"]', schemaVersion: 1, kind: 'PAIR_CONFIRMED', identities: ['bank:reload'], selected: ['sheet:reload'], updatedAt: '2026-01-04T00:00:00.000Z' }
+    const rejected: PersistedDecision = { key: 'PAIR_REJECTED:["bank:reload","sheet:reload"]', schemaVersion: 1, kind: 'PAIR_REJECTED', identities: ['bank:reload', 'sheet:reload'], selected: [], updatedAt: '2026-01-03T00:00:00.000Z' }
+    const deletedAt = '2026-01-05T00:00:00.000Z'
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(confirmed), remoteRow(rejected)] }))
+      .mockResolvedValueOnce(response({}))
+    const active = await syncGoogleSheetDecisions('spreadsheet-pair-reload', 'token', [confirmed], {
+      [rejected.key]: { updatedAt: deletedAt, decision: rejected },
+    }, fetcher)
+    expect(active).toEqual([confirmed])
+    const write = JSON.parse(String((fetcher.mock.calls[2][1] as RequestInit).body)).values[0]
+    expect(write[1]).toBe('PAIR_REJECTED')
+    expect(write[3]).toBe('DELETED')
+    expect(localStoreMocks.remove).toHaveBeenCalledWith(rejected.key)
+  })
+
+  it('mantém decisão local malformada fora do conjunto ativo sincronizado', async () => {
+    const malformed = { ...decision, key: 'legacy-bad-key' }
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers] }))
+    expect(await syncGoogleSheetDecisions('spreadsheet-invalid-local', 'token', [malformed], {}, fetcher)).toEqual([])
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(localStoreMocks.put).not.toHaveBeenCalled()
   })
 
   it('aplica tombstone remoto depois de um registro local antigo e entrega somente decisões ativas após reload/sync', async () => {

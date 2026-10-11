@@ -9,10 +9,14 @@ import { bankDisplayDescription, normalizeDate, normalizeDescription } from './i
 import { counterpartyLabel, descriptionWithoutCounterparty } from './importers/counterparty'
 import { canonicalCompositionKey, findPlausibleLedgerCandidates, pairKey, reconcile } from './matching/reconcile'
 import { exportAuditDiagnosticJson, exportAuditFindings, exportCardPayments, exportDuplicates, exportMissing, exportOutOfScope, exportReviews, exportSummary } from './features/export'
-import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity } from './domain/identity'
+import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity, stableFingerprint } from './domain/identity'
 import { auditPersistedDecisions } from './domain/decisionAudit'
+import { buildBankPairDecisionReplacement, type BankPairAction } from './domain/bankPairDecision'
+import { decisionRevision, serializeDecisionMutation } from './domain/decisionMutationQueue'
+import { resolveConfirmedBankAssignments } from './domain/bankDecisionAssignments'
 import { retainActiveInvoiceSources, retainCurrentDriveBankSources } from './domain/sourceLifecycle'
-import { auditConsistency, filterAuditFindings, summarizeAudit, type AuditFilter, type AuditMode, type ConsistencyAuditResult } from './domain/consistencyAudit'
+import { auditConsistency, auditDecisionMerge, finalizeAuditInputSnapshot, filterAuditFindings, summarizeAudit, type AuditFilter, type AuditMode, type ConsistencyAuditResult } from './domain/consistencyAudit'
+import { cloneAuditInput, compareAuditInputSnapshots, createAuditInputSnapshot, revisionForDerivedSources } from './domain/auditInputSnapshot'
 import { dismissAuditFinding, isAuditFindingDismissed, loadAuditFindingVisibility, restoreAuditFinding, saveAuditFindingVisibility } from './domain/auditFindingVisibility'
 import { AuditFindingCard } from './components/AuditFindingCard'
 import { clearPersistedDecisions, decisionKey, deletePersistedDecision, listPersistedDecisions, replacePersistedDecision, savePersistedDecision } from './domain/localDecisions'
@@ -33,7 +37,7 @@ import { auditBankBalance, selectMissingExpenses } from './domain/bankBalanceAud
 import { canAddMissingToCostYear } from './features/missingEligibility'
 import { summarizeCardPurchases } from './features/cardStatementCounts'
 import { GoogleSheetsError, appendCostYearRecord, readGoogleSheetLedger, requestGoogleSheetsAccessToken, revokeGoogleSheetsAccessToken } from './integrations/googleSheets'
-import { addDecisionTombstone, listDecisionTombstones, readGoogleSheetDecisionsReadOnly, removeDecisionTombstone, syncGoogleSheetDecisions, syncOneGoogleSheetDecision, syncOneGoogleSheetDeletion } from './integrations/googleSheetDecisions'
+import { addDecisionTombstone, listDecisionTombstones, readGoogleSheetDecisionsReadOnly, removeDecisionTombstone, restoreDecisionTombstone, syncGoogleSheetDecisions } from './integrations/googleSheetDecisions'
 import { forgetGoogleSheetLink, GOOGLE_SHEET_TAB_NAME, loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import type { SavedGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import { downloadGoogleDriveFile, isSupportedDriveFile, listGoogleDriveFolder, selectGoogleDriveFolder, GoogleDriveError } from './integrations/googleDrive'
@@ -136,6 +140,7 @@ export default function App() {
   const [consistencyAuditBusy, setConsistencyAuditBusy] = useState(false)
   const consistencyAuditRunLock = useRef(false)
   const [consistencyAuditError, setConsistencyAuditError] = useState('')
+  const [auditRefreshRequested, setAuditRefreshRequested] = useState(false)
   const [consistencyAuditFilter, setConsistencyAuditFilter] = useState<AuditFilter>('ALL')
   const [consistencyAuditSourceNote, setConsistencyAuditSourceNote] = useState('')
   const [dismissedAuditFindings, setDismissedAuditFindings] = useState(loadAuditFindingVisibility)
@@ -144,7 +149,6 @@ export default function App() {
   const pdfEntryTokens = useRef(new Map<string, object>())
   const [auditFocusTransactionId, setAuditFocusTransactionId] = useState('')
   const [auditFocusStatementIdentity, setAuditFocusStatementIdentity] = useState('')
-  const staleMissingDecisionCleanup = useRef(new Set<string>())
   const seenPdfFingerprints = useRef(new Set<string>())
   const seenSemanticPdfFingerprints = useRef(new Map<string, 'MOBILE_APP' | 'INTERNET_BANKING'>())
   const seenSemanticPdfOrigins = useRef(new Map<string, Set<'MANUAL' | 'DRIVE'>>())
@@ -155,7 +159,7 @@ export default function App() {
   const [decisionsReady, setDecisionsReady] = useState(false)
   const decisionStateRevision = useRef(0)
   const [screen, setScreen] = useState<'home' | 'results'>('home')
-  const [tab, setTab] = useState<'overview' | 'review' | 'missing' | 'card' | 'statement' | 'duplicates' | 'outofscope' | 'flags' | 'auditor'>('overview')
+  const [tab, setTab] = useState<'overview' | 'matched' | 'review' | 'missing' | 'card' | 'statement' | 'duplicates' | 'outofscope' | 'flags' | 'auditor'>('overview')
   const [filterYear, setFilterYear] = useState('all')
   const [filterMonth, setFilterMonth] = useState('all')
   const [fromDate, setFromDate] = useState('')
@@ -245,9 +249,9 @@ export default function App() {
   }
 
   async function persistDecision(kind: DecisionKind, identities: string[], selected: string[] = []) {
-    try {
+    return serializeDecisionMutation('conciliador-workspace', async () => { try {
       const key = decisionKey(kind, identities)
-      const record = await savePersistedDecision({ key, kind, identities, selected })
+      await savePersistedDecision({ key, kind, identities, selected })
       removeDecisionTombstone(key)
       decisionStateRevision.current += 1
       setSavedDecisions(await listPersistedDecisions())
@@ -255,21 +259,56 @@ export default function App() {
       if (googleSheetLink?.spreadsheetId) {
         markDecisionPending(key, true)
         if (googleAccessToken.current) {
-          try { await syncOneGoogleSheetDecision(googleSheetLink.spreadsheetId, googleAccessToken.current, record); markDecisionPending(key, false); setGoogleDecisionStatus('Decisões sincronizadas.') }
-          catch { setGoogleDecisionStatus('Decisões mantidas neste dispositivo; falha de sincronização.') }
+          await synchronizeSavedDecisionsNow(googleSheetLink.spreadsheetId, googleAccessToken.current)
         }
       }
     } catch {
       setError('Não foi possível salvar esta decisão neste dispositivo. Ela continuará disponível apenas nesta sessão.')
     }
+    })
+  }
+
+  async function setBankPairDecision(action: BankPairAction, bankId: string, rowId: string) {
+    return serializeDecisionMutation('conciliador-workspace', async () => {
+      const previousTombstones = listDecisionTombstones()
+      const stored = await listPersistedDecisions()
+      const replacement = buildBankPairDecisionReplacement(stored, action, bankId, rowId)
+      const supersededKeys = replacement.superseded.map((decision) => decision.key)
+      const changedKeys = [...new Set([replacement.decision.key, ...supersededKeys])]
+      const tombstonesBefore = new Map(changedKeys.map((key) => [key, previousTombstones[key]]))
+
+      try {
+        replacement.superseded.forEach((decision) => {
+          const tombstone = previousTombstones[decision.key]
+          if (!tombstone || Date.parse(tombstone.updatedAt) < Date.parse(decision.updatedAt)) addDecisionTombstone(decision)
+        })
+        removeDecisionTombstone(replacement.decision.key)
+        // The new decision and deletion of its exact opposite key commit together in IndexedDB.
+        await replacePersistedDecision(replacement.decision, supersededKeys)
+      } catch {
+        tombstonesBefore.forEach((tombstone, key) => restoreDecisionTombstone(key, tombstone))
+        setError('Não foi possível substituir a decisão do par bancário neste dispositivo. Nenhuma alteração foi confirmada.')
+        return false
+      }
+
+      decisionStateRevision.current += 1
+      setSavedDecisions(await listPersistedDecisions())
+      setError('')
+      if (googleSheetLink?.spreadsheetId) {
+        changedKeys.forEach((key) => markDecisionPending(key, true))
+        if (googleAccessToken.current) await synchronizeSavedDecisionsNow(googleSheetLink.spreadsheetId, googleAccessToken.current)
+      }
+      return true
+    })
   }
 
   async function persistStatementMatchReplacingOwners(statement: CardStatement, transaction: CardStatementTransaction, sheet: LedgerTransaction) {
+    return serializeDecisionMutation('conciliador-workspace', async () => {
     const identity = cardTransactionIdentity(statement, transaction)
     const aliases = cardTransactionIdentityVariants(statement, transaction, cardPdfs.find((entry) => entry.statement === statement)?.legacyStatementIdentity)
     const targetIdentity = sheetIdentity(sheet)
-    const superseded = conflictingDecisionsForStatementRow(savedDecisions, aliases, targetIdentity)
-    const existingSameOwner = savedDecisions.find((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED'
+    const superseded = conflictingDecisionsForStatementRow(applicableDecisions, aliases, targetIdentity)
+    const existingSameOwner = applicableDecisions.find((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED'
       && aliases.includes(decision.identities[0])
       && decision.selected.some((selected) => selected === targetIdentity || data.sheet.some((row) => row.id === selected && sheetIdentity(row) === targetIdentity)))
     const decisionIdentity = existingSameOwner?.identities[0] ?? identity
@@ -279,7 +318,7 @@ export default function App() {
       return { decision, updatedAt: listDecisionTombstones()[decision.key]?.updatedAt ?? new Date().toISOString() }
     })
     try {
-      const record = await replacePersistedDecision({ key, kind: 'STATEMENT_MATCH_CONFIRMED', identities: [decisionIdentity], selected: [targetIdentity] }, superseded.map((decision) => decision.key))
+      await replacePersistedDecision({ key, kind: 'STATEMENT_MATCH_CONFIRMED', identities: [decisionIdentity], selected: [targetIdentity] }, superseded.map((decision) => decision.key))
       decisionStateRevision.current += 1
       setSavedDecisions(await listPersistedDecisions())
       setError('')
@@ -288,12 +327,8 @@ export default function App() {
         markDecisionPending(key, true)
         if (googleAccessToken.current) {
           try {
-            for (const { decision, updatedAt } of tombstones) {
-              await syncOneGoogleSheetDeletion(googleSheetLink.spreadsheetId, googleAccessToken.current, decision, updatedAt)
-              removeDecisionTombstone(decision.key); markDecisionPending(decision.key, false)
-            }
-            await syncOneGoogleSheetDecision(googleSheetLink.spreadsheetId, googleAccessToken.current, record)
-            markDecisionPending(key, false); setGoogleDecisionStatus('Vínculo atualizado e decisões sincronizadas.')
+            await synchronizeSavedDecisionsNow(googleSheetLink.spreadsheetId, googleAccessToken.current)
+            markDecisionPending(key, false)
           } catch { setGoogleDecisionStatus('Vínculo atualizado neste dispositivo; sincronização pendente.') }
         }
       }
@@ -303,10 +338,11 @@ export default function App() {
       setError('Não foi possível substituir a confirmação neste dispositivo. Nenhum vínculo foi alterado.')
       return false
     }
+    })
   }
 
   async function removeDecision(kind: DecisionKind, identities: string[]) {
-    try {
+    return serializeDecisionMutation('conciliador-workspace', async () => { try {
       const key = decisionKey(kind, identities)
       const decision = (await listPersistedDecisions()).find((item) => item.key === key)
       if (decision) addDecisionTombstone(decision)
@@ -316,36 +352,27 @@ export default function App() {
       if (decision && googleSheetLink?.spreadsheetId) {
         markDecisionPending(key, true)
         if (googleAccessToken.current) {
-          try { await syncOneGoogleSheetDeletion(googleSheetLink.spreadsheetId, googleAccessToken.current, decision, listDecisionTombstones()[key].updatedAt); removeDecisionTombstone(key); markDecisionPending(key, false); setGoogleDecisionStatus('Decisões sincronizadas.') }
-          catch { setGoogleDecisionStatus('Decisões mantidas neste dispositivo; falha de sincronização.') }
+          await synchronizeSavedDecisionsNow(googleSheetLink.spreadsheetId, googleAccessToken.current)
         }
       }
     } catch {
       setError('Não foi possível atualizar as decisões salvas neste dispositivo.')
     }
+    })
   }
 
-  const orphanDecisionCleanup = useRef(new Set<string>())
   useEffect(() => {
     if (!decisionsReady || sourceStatus.sheet !== 'ACCEPTED' || (sheetSource !== 'google' && googleSheetRows === null)) return
     const truthRows = googleSheetRows ?? data.sheet
     const liveSheetIdentities = new Set(truthRows.map(sheetIdentity))
     const liveBankIdentities = new Set(data.bank.map(bankIdentity))
-    const orphans = savedDecisions.filter((decision) => decision.kind === 'MISSING_ADDED_TO_SHEET'
-      && decision.selected[0]
-      && !liveSheetIdentities.has(decision.selected[0])
-      && !orphanDecisionCleanup.current.has(decision.key))
-    for (const decision of orphans) {
-      orphanDecisionCleanup.current.add(decision.key)
-      void removeDecision('MISSING_ADDED_TO_SHEET', decision.identities).finally(() => orphanDecisionCleanup.current.delete(decision.key))
-    }
     setLocallyAddedMissingPairs((current) => Object.fromEntries(Object.entries(current).filter(([bankKey, sheetKey]) =>
       liveBankIdentities.has(bankKey) && liveSheetIdentities.has(sheetKey))))
-  }, [decisionsReady, sourceStatus.sheet, sheetSource, googleSheetRows, data, savedDecisions])
+  }, [decisionsReady, sourceStatus.sheet, sheetSource, googleSheetRows, data])
 
   async function clearSavedDecisions() {
     if (!window.confirm('Apagar as confirmações e decisões salvas neste dispositivo e sincronizar a remoção com os outros dispositivos quando houver conexão? Esta ação não pode ser desfeita.')) return
-    try {
+    return serializeDecisionMutation('conciliador-workspace', async () => { try {
       const existing = await listPersistedDecisions()
       existing.forEach((decision) => addDecisionTombstone(decision))
       await clearPersistedDecisions()
@@ -353,27 +380,39 @@ export default function App() {
       setSavedDecisions([])
       if (googleAccessToken.current && googleSheetLink?.spreadsheetId) {
         existing.forEach((decision) => markDecisionPending(decision.key, true))
-        for (const decision of existing) {
-          try { await syncOneGoogleSheetDeletion(googleSheetLink.spreadsheetId, googleAccessToken.current, decision, listDecisionTombstones()[decision.key].updatedAt); removeDecisionTombstone(decision.key); markDecisionPending(decision.key, false) }
-          catch { setGoogleDecisionStatus('Limpeza salva neste dispositivo; sincronização pendente.'); break }
-        }
+        await synchronizeSavedDecisionsNow(googleSheetLink.spreadsheetId, googleAccessToken.current)
       }
     } catch {
       setError('Não foi possível apagar as decisões salvas neste dispositivo.')
     }
+    })
   }
 
   async function synchronizeSavedDecisions(spreadsheetId: string, token: string) {
+    return serializeDecisionMutation('conciliador-workspace', () => synchronizeSavedDecisionsNow(spreadsheetId, token))
+  }
+
+  async function synchronizeSavedDecisionsNow(spreadsheetId: string, token: string) {
     setGoogleDecisionStatus('Sincronizando decisões…')
     const revision = decisionStateRevision.current
     try {
       const local = await listPersistedDecisions()
       const tombstones = listDecisionTombstones()
       const merged = await syncGoogleSheetDecisions(spreadsheetId, token, local, tombstones)
+      const effectiveKeys = new Set(merged.map((decision) => decision.key))
+      const deletedKeys = new Set(Object.keys(tombstones))
+      const diagnosticOnly = local.filter((decision) => !effectiveKeys.has(decision.key) && !deletedKeys.has(decision.key))
       if (decisionStateRevision.current === revision) {
         decisionStateRevision.current += 1
-        setSavedDecisions(merged)
+        setSavedDecisions([...merged, ...diagnosticOnly])
+      } else {
+        // A local action may finish while the remote merge is in flight. The merge
+        // can still update IndexedDB, so re-read its final state instead of leaving
+        // the screen on the pre-sync snapshot.
+        setSavedDecisions(await listPersistedDecisions())
       }
+      // The workspace queue guarantees no newer local mutation can be hidden by
+      // this snapshot while it is being written. Tombstones survive every failure.
       Object.keys(tombstones).forEach((key) => removeDecisionTombstone(key))
       setPendingDecisionIds((current) => {
         const next = new Set(current)
@@ -382,8 +421,10 @@ export default function App() {
         return next
       })
       setGoogleDecisionStatus('Decisões sincronizadas entre dispositivos.')
+      return true
     } catch (error) {
       setGoogleDecisionStatus(error instanceof Error ? `Decisões mantidas neste dispositivo. ${error.message}` : 'Decisões mantidas neste dispositivo; não foi possível sincronizar.')
+      return false
     }
   }
 
@@ -829,18 +870,26 @@ export default function App() {
     }
   }
 
+  const persistedDecisionAudit = useMemo(() => sourceStatus.sheet === 'ACCEPTED'
+    ? auditPersistedDecisions(savedDecisions, { banks: data.bank, sheets: data.sheet, statements: cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []) })
+    : [], [sourceStatus.sheet, savedDecisions, data.bank, data.sheet, cardPdfs])
+  const applicableDecisions = useMemo(() => sourceStatus.sheet === 'ACCEPTED'
+    ? savedDecisions.filter((decision) => {
+      const tombstone = listDecisionTombstones()[decision.key]
+      const tombstoned = tombstone && Date.parse(tombstone.updatedAt) >= Date.parse(decision.updatedAt)
+      return !tombstoned && persistedDecisionAudit.find((audit) => audit.decision.key === decision.key)?.status === 'VALID'
+    })
+    : [], [sourceStatus.sheet, savedDecisions, persistedDecisionAudit])
+  const effectiveDecisionRevision = useMemo(() => decisionRevision(applicableDecisions), [applicableDecisions])
+  const bankAssignments = useMemo(() => resolveConfirmedBankAssignments(applicableDecisions, data.bank, data.sheet), [applicableDecisions, data.bank, data.sheet])
   const hydratedDecisions = useMemo(() => {
-    const ignoredBankIds = new Set<string>(), rejectedPairKeys = new Set<string>(), confirmedPairs = new Map<string, string>(), confirmedCompositions = new Map<string, string[]>(), ignoredSheetIdentities = new Set<string>()
-    for (const record of savedDecisions) {
+    const ignoredBankIds = new Set<string>(), rejectedPairKeys = new Set<string>(), rejectedPairDecisionKeys = new Map<string, string>(), confirmedPairs = new Map<string, string>(), confirmedCompositions = new Map<string, string[]>(), ignoredSheetIdentities = new Set<string>()
+    for (const record of applicableDecisions) {
       if (record.kind === 'BANK_IGNORED') { const bank = data.bank.find((item) => bankIdentity(item) === record.identities[0]); if (bank) ignoredBankIds.add(bank.id) }
       if (record.kind === 'SHEET_IGNORED') ignoredSheetIdentities.add(record.identities[0])
       if (record.kind === 'PAIR_REJECTED') {
         const bank = data.bank.find((item) => bankIdentity(item) === record.identities[0]), sheet = data.sheet.find((item) => sheetIdentity(item) === record.identities[1])
-        if (bank && sheet) rejectedPairKeys.add(pairKey(bank.id, sheet.id))
-      }
-      if (record.kind === 'PAIR_CONFIRMED') {
-        const bank = data.bank.find((item) => bankIdentity(item) === record.identities[0]), sheet = data.sheet.find((item) => sheetIdentity(item) === record.selected[0])
-        if (bank && sheet) confirmedPairs.set(bank.id, sheet.id)
+        if (bank && sheet) { const key = pairKey(bank.id, sheet.id); rejectedPairKeys.add(key); rejectedPairDecisionKeys.set(key, record.key) }
       }
       if (record.kind === 'MISSING_ADDED_TO_SHEET') {
         const bank = data.bank.find((item) => bankIdentity(item) === record.identities[0])
@@ -857,19 +906,21 @@ export default function App() {
       const sheet = data.sheet.find((item) => sheetIdentity(item) === sheetKey)
       if (bank && sheet) confirmedPairs.set(bank.id, sheet.id)
     }
-    return { ignoredBankIds, ignoredSheetIdentities, rejectedPairKeys, confirmedPairs, confirmedCompositions }
-  }, [savedDecisions, data, cardPdfs, locallyAddedMissingPairs])
+    bankAssignments.confirmedPairs.forEach((sheetId, bankId) => confirmedPairs.set(bankId, sheetId))
+    return { ignoredBankIds, ignoredSheetIdentities, rejectedPairKeys, rejectedPairDecisionKeys, confirmedPairs, confirmedCompositions }
+  }, [applicableDecisions, bankAssignments, data, cardPdfs, locallyAddedMissingPairs])
   const statementPayments = useMemo(() => identifyStatementPayments(cardPdfs.flatMap((entry) => entry.statement ? [entry.statement] : []), data.bank), [cardPdfs, data.bank])
-  const result = useMemo(() => reconcile(data.bank, data.sheet, {
-    ignoredBankIds: hydratedDecisions.ignoredBankIds, rejectedPairKeys: hydratedDecisions.rejectedPairKeys, confirmedPairs: hydratedDecisions.confirmedPairs, confirmedCompositions: hydratedDecisions.confirmedCompositions,
+  const result = useMemo(() => ({ ...reconcile(data.bank, data.sheet, {
+    ignoredBankIds: hydratedDecisions.ignoredBankIds, rejectedPairKeys: hydratedDecisions.rejectedPairKeys, rejectedPairDecisionKeys: hydratedDecisions.rejectedPairDecisionKeys, confirmedPairs: hydratedDecisions.confirmedPairs, confirmedCompositions: hydratedDecisions.confirmedCompositions,
+    conflictingConfirmedSheetIds: bankAssignments.conflictingSheetIds, conflictingConfirmedBankIds: bankAssignments.conflictingBankIds, conflictingConfirmedAssignments: bankAssignments.conflictingConfirmedAssignments,
     identifiedCardPaymentIds: new Set([...statementPayments.values()].map((payment) => payment.id)),
-  }), [data, hydratedDecisions, statementPayments])
+  }), decisionRevisionUsed: effectiveDecisionRevision, sourceRevisionUsed: revisionForDerivedSources(data.bank, data.sheet, cardPdfs.flatMap((entry) => entry.statement ? [entry.statement] : [])) }), [data, hydratedDecisions, statementPayments, bankAssignments, effectiveDecisionRevision, cardPdfs])
   const statementResults = useMemo(() => {
     const usedSheetIds = new Set<string>()
     const parsed = cardPdfs.filter((entry): entry is CardPdfEntry & { statement: CardStatement } => entry.statement != null)
       .sort((a, b) => (a.statement.dueDate ?? '').localeCompare(b.statement.dueDate ?? '') || a.key.localeCompare(b.key))
     const confirmedSheetOwners = new Map<string, string>()
-    const savedStatementMatches = savedDecisions.filter((item) => item.kind === 'STATEMENT_MATCH_CONFIRMED')
+    const savedStatementMatches = applicableDecisions.filter((item) => item.kind === 'STATEMENT_MATCH_CONFIRMED')
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.key.localeCompare(b.key))
     const activeAssignments = resolveStatementMatchAssignments(savedStatementMatches, parsed.map(({ statement, legacyStatementIdentity }) => ({ statement, legacyStatementIdentity })), data.sheet)
     const conflictingAssignments = conflictingStatementAssignments(activeAssignments)
@@ -892,11 +943,11 @@ export default function App() {
       }
       const ignored = new Set<string>()
       const rejectedCandidates = new Map<string, ReadonlySet<string>>()
-      for (const record of savedDecisions.filter((item) => item.kind === 'CARD_PURCHASE_IGNORED')) {
+      for (const record of applicableDecisions.filter((item) => item.kind === 'CARD_PURCHASE_IGNORED')) {
         const transaction = entry.statement.transactions.find((item) => cardTransactionIdentityVariants(entry.statement, item, entry.legacyStatementIdentity).includes(record.identities[0]))
         if (transaction) ignored.add(transaction.id)
       }
-      for (const record of savedDecisions.filter((item) => item.kind === 'CARD_REVIEW_REJECTED_CANDIDATES')) {
+      for (const record of applicableDecisions.filter((item) => item.kind === 'CARD_REVIEW_REJECTED_CANDIDATES')) {
         const transaction = entry.statement.transactions.find((item) => cardTransactionIdentityVariants(entry.statement, item, entry.legacyStatementIdentity).includes(record.identities[0]))
         if (!transaction) continue
         const rejectedIds = new Set(record.selected.flatMap((identity) => {
@@ -932,24 +983,15 @@ export default function App() {
       const matchedRowIds = new Set(matches.flatMap((match) => match.status === 'CARD_MATCHED' && match.sheet ? [match.sheet.id] : match.status === 'CARD_GROUP_MATCHED' ? match.candidates.map((row) => row.id) : []))
       const matchedTotal = data.sheet.filter((row) => matchedRowIds.has(row.id)).reduce((sum, row) => sum + row.amount, 0)
       const extractedTotal = entry.statement.transactions.filter((transaction) => transaction.type === 'PURCHASE' && transaction.financialStatus !== 'REFUNDED').reduce((sum, transaction) => sum + transaction.amount, 0)
-      return { entry, statement: entry.statement, payment: statementPayments.get(entry.statement) ?? null, matches, confirmations, extractedTotal, matchedTotal, difference: extractedTotal - matchedTotal }
+      return { entry, statement: entry.statement, payment: statementPayments.get(entry.statement) ?? null, matches, confirmations, extractedTotal, matchedTotal, difference: extractedTotal - matchedTotal, decisionRevisionUsed: effectiveDecisionRevision, sourceRevisionUsed: revisionForDerivedSources(data.bank, data.sheet, [entry.statement]) }
     })
-  }, [cardPdfs, data.sheet, savedDecisions, statementPayments, cardReviewOverrides])
+  }, [cardPdfs, data.sheet, applicableDecisions, statementPayments, cardReviewOverrides, effectiveDecisionRevision])
+  const auditLiveStateRef = useRef({ data, cardPdfs, result, statementResults, effectiveDecisionRevision, sheetSource, googleSheetLink })
+  auditLiveStateRef.current = { data, cardPdfs, result, statementResults, effectiveDecisionRevision, sheetSource, googleSheetLink }
   const visibleStatementResults = useMemo(() => statementOnlyIssues
     ? statementResults.filter((item) => item.matches.some((match) => match.status === 'CARD_MISSING' || match.status === 'CARD_MISSING_CONFIRMED' || match.status === 'CARD_REVIEW')
       || item.statement.errors.length > 0 || item.payment == null || item.statement.accountingDifference != null && item.statement.accountingDifference !== 0)
     : statementResults, [statementResults, statementOnlyIssues])
-  const persistedDecisionAudit = useMemo(() => sourceStatus.sheet === 'ACCEPTED'
-    ? auditPersistedDecisions(savedDecisions, { banks: data.bank, sheets: data.sheet, statements: cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []) })
-    : [], [sourceStatus.sheet, savedDecisions, data.bank, data.sheet, cardPdfs])
-  useEffect(() => {
-    if (!decisionsReady || sourceStatus.sheet !== 'ACCEPTED') return
-    for (const audit of persistedDecisionAudit) {
-      if (audit.status === 'VALID' || audit.status === 'NEEDS_REVIEW' || !audit.resolved || audit.decision.kind === 'MISSING_ADDED_TO_SHEET' && audit.status === 'ORPHANED' || staleMissingDecisionCleanup.current.has(audit.decision.key)) continue
-      staleMissingDecisionCleanup.current.add(audit.decision.key)
-      void removeDecision(audit.decision.kind, audit.decision.identities).finally(() => staleMissingDecisionCleanup.current.delete(audit.decision.key))
-    }
-  }, [decisionsReady, sourceStatus.sheet, persistedDecisionAudit])
   const years = useMemo(() => [...new Set([...data.bank.map((item) => item.year), ...data.sheet.map((item) => item.year)].filter(Boolean))].sort().reverse(), [data])
   const filteredItems = useMemo(() => result.items.filter(({ bank }) => inPeriod(bank, filterYear, filterMonth, fromDate, toDate)), [result.items, filterYear, filterMonth, fromDate, toDate])
   const filteredDuplicates = useMemo(() => result.duplicateGroups.filter((group) => inDatePeriod(group.date, filterYear, filterMonth, fromDate, toDate)), [result.duplicateGroups, filterYear, filterMonth, fromDate, toDate])
@@ -1212,6 +1254,10 @@ export default function App() {
   }
 
   function runReconciliation() {
+    if (!decisionsReady) {
+      setError('Aguarde o carregamento das decisões salvas antes de conciliar.')
+      return
+    }
     if (isSourceProcessing) {
       setError('Aguarde o processamento dos arquivos antes de conciliar.')
       return
@@ -1226,16 +1272,45 @@ export default function App() {
     setTab('overview')
   }
 
-  function decide(item: ReconciliationItem, decision: 'confirm' | 'reject' | 'ignore') {
+  function decide(item: ReconciliationItem, decision: 'confirm' | 'reject' | 'ignore', selectedSheet?: LedgerTransaction) {
     const bankId = bankIdentity(item.bank)
     if (decision === 'ignore') void persistDecision('BANK_IGNORED', [bankId])
-    if (decision === 'confirm' && item.sheet) void persistDecision('PAIR_CONFIRMED', [bankId], [sheetIdentity(item.sheet)])
-    if (decision === 'reject' && item.sheet && item.candidate) void persistDecision('PAIR_REJECTED', [bankId, sheetIdentity(item.sheet)])
+    if (decision === 'confirm' && (selectedSheet ?? item.sheet)) void setBankPairDecision('PAIR_CONFIRMED', bankId, sheetIdentity(selectedSheet ?? item.sheet!))
+    if (decision === 'reject' && item.sheet && item.candidate) void setBankPairDecision('PAIR_REJECTED', bankId, sheetIdentity(item.sheet))
+  }
+
+  function rejectedPairDecisions(item: ReconciliationItem) {
+    return (item.candidatePipeline ?? []).flatMap((evaluation) => {
+      if (evaluation.disposition !== 'REJECTED_BY_DECISION' || !evaluation.decisionKey) return []
+      const decision = applicableDecisions.find((record) => record.kind === 'PAIR_REJECTED' && record.key === evaluation.decisionKey)
+      const validation = decision && persistedDecisionAudit.find((entry) => entry.decision.key === decision.key)
+      return decision && validation?.status === 'VALID' ? [{ decision, candidate: evaluation.sheet }] : []
+    })
+  }
+
+  function reconsiderRejectedPair(decision: PersistedDecision) {
+    if (!window.confirm('Reconsiderar esta correspondência?\n\nA rejeição deste par será substituída por uma confirmação. O resultado será recalculado com este vínculo.')) return
+    void setBankPairDecision('PAIR_CONFIRMED', decision.identities[0], decision.identities[1])
+  }
+
+  function hasPersistedPairDecision(item: ReconciliationItem) {
+    if (!item.sheet) return false
+    const bankKey = bankIdentity(item.bank)
+    const rowKey = sheetIdentity(item.sheet)
+    return applicableDecisions.some((decision) => decision.kind === 'PAIR_CONFIRMED'
+      && decision.identities[0] === bankKey
+      && decision.selected[0] === rowKey)
+  }
+
+  function undoPairDecision(item: ReconciliationItem) {
+    if (!item.sheet || !hasPersistedPairDecision(item)) return
+    if (!window.confirm('Desfazer esta confirmação manual?\n\nO vínculo será removido e o caso será recalculado.')) return
+    void removeDecision('PAIR_CONFIRMED', [bankIdentity(item.bank)])
   }
 
   function bankAddEligibility(item: ReconciliationItem) {
     const bankKey = bankIdentity(item.bank)
-    const alreadyAdded = savedDecisions.some((record) => record.kind === 'MISSING_ADDED_TO_SHEET' && record.identities[0] === bankKey)
+    const alreadyAdded = applicableDecisions.some((record) => record.kind === 'MISSING_ADDED_TO_SHEET' && record.identities[0] === bankKey)
       || Object.prototype.hasOwnProperty.call(locallyAddedMissingPairs, bankKey)
     return canAddMissingToCostYear({ source: 'BANK', status: item.status, direction: item.bank.direction, type: item.bank.type, alreadyAdded, hasRequiredFields: Boolean(item.bank.date && item.bank.originalDescription && item.bank.amount > 0) })
   }
@@ -1248,7 +1323,7 @@ export default function App() {
 
   function openCardMissing(statement: CardStatement, match: CardStatementMatch) {
     const identity = cardTransactionIdentity(statement, match.transaction)
-    const alreadyAdded = savedDecisions.some((record) => record.kind === 'STATEMENT_MATCH_CONFIRMED' && record.identities[0] === identity)
+    const alreadyAdded = applicableDecisions.some((record) => record.kind === 'STATEMENT_MATCH_CONFIRMED' && record.identities[0] === identity)
     const eligible = canAddMissingToCostYear({ source: 'STATEMENT', status: match.status, direction: match.transaction.direction, type: match.transaction.type, alreadyAdded, hasRequiredFields: Boolean(match.transaction.date && match.transaction.originalDescription && match.transaction.amount > 0) })
     if (!eligible.eligible) { setMissingWriteNotice('Esta compra já não está marcada como ausente. A conciliação foi atualizada; confira o vínculo ou a revisão exibidos no item.'); return }
     setMissingWriteError(''); setMissingWriteNotice(''); setMissingToAdd({ kind: 'STATEMENT', statement, transaction: match.transaction })
@@ -1294,7 +1369,7 @@ export default function App() {
       }
     } else {
       const current = statementResults.find((entry) => entry.statement.statementIdentity === target.statement.statementIdentity)?.matches.find((match) => match.transaction.id === target.transaction.id)
-      if (!current || !canAddMissingToCostYear({ source: 'STATEMENT', status: current.status, direction: target.transaction.direction, type: target.transaction.type, alreadyAdded: savedDecisions.some((record) => record.kind === 'STATEMENT_MATCH_CONFIRMED' && record.identities[0] === targetKey) }).eligible) {
+      if (!current || !canAddMissingToCostYear({ source: 'STATEMENT', status: current.status, direction: target.transaction.direction, type: target.transaction.type, alreadyAdded: applicableDecisions.some((record) => record.kind === 'STATEMENT_MATCH_CONFIRMED' && record.identities[0] === targetKey) }).eligible) {
         setMissingWriteNotice('Esta compra da fatura já não está elegível para inclusão; confira a conciliação atualizada.'); setMissingToAdd(null); return
       }
     }
@@ -1303,7 +1378,7 @@ export default function App() {
     try {
       if (target.kind === 'STATEMENT') {
         const latest = await readGoogleSheetLedger(googleSheetLink.spreadsheetId, googleAccessToken.current)
-        const confirmedStatementMatches = savedDecisions.filter((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED')
+        const confirmedStatementMatches = applicableDecisions.filter((decision) => decision.kind === 'STATEMENT_MATCH_CONFIRMED')
         const orderedEntries = cardPdfs.filter((entry): entry is CardPdfEntry & { statement: CardStatement } => entry.statement != null)
           .sort((a, b) => (a.statement.dueDate ?? '').localeCompare(b.statement.dueDate ?? '') || a.key.localeCompare(b.key))
         const usedSheetIds = new Set<string>()
@@ -1317,7 +1392,7 @@ export default function App() {
             if (transaction && row) confirmations.set(transaction.id, row.id)
           }
           const rejectedCandidates = new Map<string, ReadonlySet<string>>()
-          for (const decision of savedDecisions.filter((item) => item.kind === 'CARD_REVIEW_REJECTED_CANDIDATES')) {
+          for (const decision of applicableDecisions.filter((item) => item.kind === 'CARD_REVIEW_REJECTED_CANDIDATES')) {
             const transaction = entry.statement.transactions.find((item) => cardTransactionIdentityVariants(entry.statement!, item, entry.legacyStatementIdentity).includes(decision.identities[0]))
             if (!transaction) continue
             const rejectedIds = new Set(decision.selected.flatMap((identity) => {
@@ -1392,7 +1467,7 @@ export default function App() {
     if (transaction && sheet) {
       const identity = cardTransactionIdentity(statement, transaction)
       const currentAliases = cardTransactionIdentityVariants(statement, transaction, cardPdfs.find((entry) => entry.statement === statement)?.legacyStatementIdentity)
-      const rejectedDecision = savedDecisions.find((record) => record.kind === 'CARD_REVIEW_REJECTED_CANDIDATES'
+      const rejectedDecision = applicableDecisions.find((record) => record.kind === 'CARD_REVIEW_REJECTED_CANDIDATES'
         && currentAliases.includes(record.identities[0]))
       if (rejectedDecision) await removeDecision(rejectedDecision.kind, rejectedDecision.identities)
       setCardReviewOverrides((current) => { const next = { ...current }; delete next[identity]; return next })
@@ -1419,22 +1494,101 @@ export default function App() {
     const transaction = statement.transactions.find((item) => cardTransactionIdentity(statement, item) === currentIdentity)
     const entry = cardPdfs.find((item) => item.statement === statement)
     const legacyIdentity = transaction && entry?.legacyStatementIdentity ? cardTransactionIdentity(entry.legacyStatementIdentity, transaction) : null
-    const stored = savedDecisions.find((record) => record.kind === kind && (record.identities[0] === currentIdentity || record.identities[0] === legacyIdentity))
+    const stored = applicableDecisions.find((record) => record.kind === kind && (record.identities[0] === currentIdentity || record.identities[0] === legacyIdentity))
     void removeDecision(kind, stored?.identities ?? identities)
   }
   function ignoreSheet(id: string) { const sheet = data.sheet.find((entry) => entry.id === id); if (sheet) void persistDecision('SHEET_IGNORED', [sheetIdentity(sheet)]) }
   const ignoredSheetIds = hydratedDecisions.ignoredSheetIdentities
   function compositionWasSaved(item: ReconciliationItem, statementIdentity: string | null) {
-    return savedDecisions.some((record) => record.kind === 'COMPOSITION_CONFIRMED' && record.identities[0] === bankIdentity(item.bank) && (statementIdentity == null || record.identities[1] === statementIdentity))
+    return applicableDecisions.some((record) => record.kind === 'COMPOSITION_CONFIRMED' && record.identities[0] === bankIdentity(item.bank) && (statementIdentity == null || record.identities[1] === statementIdentity))
   }
   function savedCompositionIdentity(item: ReconciliationItem) {
-    return savedDecisions.find((record) => record.kind === 'COMPOSITION_CONFIRMED' && record.identities[0] === bankIdentity(item.bank))?.identities[1] ?? 'no-statement'
+    return applicableDecisions.find((record) => record.kind === 'COMPOSITION_CONFIRMED' && record.identities[0] === bankIdentity(item.bank))?.identities[1] ?? 'no-statement'
   }
 
   async function auditInvalidateDecision(decision: PersistedDecision, reason: string) {
     if (!window.confirm(`Esta ação invalidará somente ${decision.kind} desta compra e registrará uma exclusão nas decisões locais${googleAccessToken.current ? ' e sincronizadas' : ''}. Motivo: ${reason}\n\nContinuar?`)) return
     await removeDecision(decision.kind, decision.identities)
     setConsistencyAuditError('Decisão invalidada para este item. Execute a auditoria novamente para atualizar o relatório.')
+  }
+
+  function isResolvableBankConflictDecision(finding: import('./domain/consistencyAudit').AuditFinding, assignment: Record<string, unknown>) {
+    if (finding.code !== 'PAIR_CONFIRMED_ASSIGNMENT_CONFLICT') return false
+    const decisionKey = typeof assignment.decisionKey === 'string' ? assignment.decisionKey : ''
+    const decisionId = typeof assignment.decisionId === 'string' ? assignment.decisionId : ''
+    const rowIdentity = typeof finding.technical?.rowIdentity === 'string' ? finding.technical.rowIdentity : ''
+    const listed = Array.isArray(finding.technical?.assignments) ? finding.technical.assignments as Record<string, unknown>[] : []
+    const exactAssignments = listed.filter((item) => item.decisionKey === decisionKey && item.decisionId === decisionId)
+    if (!decisionKey || !decisionId || decisionId !== stableFingerprint([decisionKey]) || !rowIdentity || exactAssignments.length !== 1) return false
+    const auditSnapshotDecision = consistencyAudit?.decisionAudit.find((item) => item.decision.key === decisionKey && item.decision.kind === 'PAIR_CONFIRMED' && item.source !== 'TOMBSTONE')
+    const currentDecision = savedDecisions.find((item) => item.key === decisionKey && item.kind === 'PAIR_CONFIRMED')
+    const tombstone = listDecisionTombstones()[decisionKey]
+    const isTombstoned = Boolean(tombstone && currentDecision && Date.parse(tombstone.updatedAt) >= Date.parse(currentDecision.updatedAt))
+    return Boolean(auditSnapshotDecision && currentDecision && !isTombstoned && currentDecision.selected.length === 1 && currentDecision.selected[0] === rowIdentity)
+  }
+
+  async function auditInvalidateBankConfirmation(finding: import('./domain/consistencyAudit').AuditFinding, assignment: Record<string, unknown>) {
+    if (!isResolvableBankConflictDecision(finding, assignment)) return
+    const decisionKey = String(assignment.decisionKey)
+    const decisionId = String(assignment.decisionId)
+    const row = finding.technical?.row as Record<string, unknown> | undefined
+    const rowIdentity = typeof finding.technical?.rowIdentity === 'string' ? finding.technical.rowIdentity : ''
+    const assignmentList = Array.isArray(finding.technical?.assignments) ? finding.technical.assignments as Record<string, unknown>[] : []
+    const selectedAssignment = assignmentList.find((item) => item.decisionKey === decisionKey && item.decisionId === decisionId)
+    const snapshotEntry = consistencyAudit?.decisionAudit.find((item) => item.decision.key === decisionKey && item.decision.kind === 'PAIR_CONFIRMED' && item.source !== 'TOMBSTONE')
+    const decision = snapshotEntry?.decision
+    if (!decision || !selectedAssignment || decision.selected.length !== 1 || decision.selected[0] !== rowIdentity) return
+
+    const bankDescription = String(selectedAssignment.description ?? 'Movimentação bancária')
+    const bankCounterparty = String(selectedAssignment.counterpartyName ?? '')
+    const bankIdentityLabel = String(selectedAssignment.bankIdentity ?? selectedAssignment.bankId ?? '')
+    const bankDate = String(selectedAssignment.date ?? '')
+    const bankAmount = Number(selectedAssignment.amount ?? 0)
+    const rowDescription = String(row?.description ?? 'Lançamento da CUSTOS ANO')
+    const rowDate = String(row?.date ?? '')
+    const rowAmount = Number(row?.amount ?? 0)
+    const rowId = String(row?.id ?? rowIdentity)
+    const confirmation = `Desfazer esta confirmação manual?\n\nMovimentação: ${bankDescription}${bankCounterparty ? ` · ${bankCounterparty}` : ''} · ${dateLabel(bankDate)} · ${formatCents(bankAmount)}${bankIdentityLabel ? `\nIdentidade bancária: ${bankIdentityLabel}` : ''}\nLinha da CUSTOS ANO a liberar: ${rowDescription} · ${dateLabel(rowDate)} · ${formatCents(rowAmount)} · ID ${rowId}\nDecisão: ${decisionId}\n\nEsta ação desfará apenas esta confirmação manual. Outras decisões e rejeições serão preservadas.\n\nContinuar?`
+    if (!window.confirm(confirmation)) return
+
+    const removed = await serializeDecisionMutation('conciliador-workspace', async () => {
+      const current = (await listPersistedDecisions()).find((item) => item.key === decisionKey)
+      const currentSnapshot = consistencyAudit?.decisionAudit.find((item) => item.decision.key === decisionKey && item.decision.kind === 'PAIR_CONFIRMED' && item.source !== 'TOMBSTONE')?.decision
+      const exact = current ?? currentSnapshot
+      if (!exact || exact.kind !== 'PAIR_CONFIRMED' || stableFingerprint([exact.key]) !== decisionId || exact.selected.length !== 1 || exact.selected[0] !== rowIdentity) {
+        setConsistencyAuditError('A confirmação mudou desde a auditoria. Nenhuma decisão foi alterada; execute a auditoria novamente.')
+        return false
+      }
+      const previousTombstone = listDecisionTombstones()[decisionKey]
+      if (previousTombstone && Date.parse(previousTombstone.updatedAt) >= Date.parse(exact.updatedAt)) {
+        setConsistencyAuditError('Esta confirmação já foi substituída por uma decisão mais recente. Nenhuma alteração foi feita.')
+        return false
+      }
+      try {
+        addDecisionTombstone(exact)
+        await deletePersistedDecision(decisionKey)
+      } catch {
+        restoreDecisionTombstone(decisionKey, previousTombstone)
+        setConsistencyAuditError('Não foi possível salvar a remoção neste dispositivo. A confirmação continua ativa.')
+        return false
+      }
+
+      decisionStateRevision.current += 1
+      setSavedDecisions(await listPersistedDecisions())
+      setError('')
+      let syncPending = false
+      const spreadsheetId = googleSheetLink?.spreadsheetId
+      if (spreadsheetId) {
+        markDecisionPending(decisionKey, true)
+        if (googleAccessToken.current) syncPending = !(await synchronizeSavedDecisionsNow(spreadsheetId, googleAccessToken.current))
+      }
+      setConsistencyAuditError(syncPending
+        ? 'Confirmação desfeita neste dispositivo; sincronização pendente. A conciliação foi recalculada.'
+        : 'Confirmação desfeita. Recalculando a conciliação e a Auditoria.')
+      setAuditRefreshRequested(true)
+      return true
+    })
+    if (!removed) return
   }
 
   async function auditDiscardObsoleteDoubleClaim(finding: NonNullable<ConsistencyAuditResult['findings'][number]>) {
@@ -1455,7 +1609,7 @@ export default function App() {
     if (!window.confirm(confirmation)) return
     const decision = safe.decision
     const affectedFingerprints = [safe.obsoleteSubject.fingerprint, safe.winningSubject.fingerprint]
-    try {
+    return serializeDecisionMutation('conciliador-workspace', async () => { try {
       addDecisionTombstone(decision)
       await deletePersistedDecision(decision.key)
       decisionStateRevision.current += 1
@@ -1470,10 +1624,7 @@ export default function App() {
         markDecisionPending(decision.key, true)
         if (googleAccessToken.current) {
           try {
-            await syncOneGoogleSheetDeletion(spreadsheetId, googleAccessToken.current, decision, listDecisionTombstones()[decision.key].updatedAt)
-            removeDecisionTombstone(decision.key)
-            markDecisionPending(decision.key, false)
-            setGoogleDecisionStatus('Decisão antiga descartada e sincronizada.')
+            await synchronizeSavedDecisionsNow(spreadsheetId, googleAccessToken.current)
           } catch {
             setGoogleDecisionStatus('Decisão descartada neste dispositivo; sincronização pendente.')
           }
@@ -1484,6 +1635,7 @@ export default function App() {
     } catch (error) {
       setConsistencyAuditError(error instanceof Error ? error.message : 'Não foi possível descartar o vínculo antigo.')
     }
+    })
   }
 
   async function auditUseCandidate(item: NonNullable<ReturnType<typeof auditConsistency>['items'][number]>) {
@@ -1521,6 +1673,8 @@ export default function App() {
           ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, sourceName: transactions[0]?.statementFileName ?? sourceId, transactions })),
         ],
         currentBankItems: result.items,
+        currentDecisionRevision: effectiveDecisionRevision,
+        derivedDecisionRevision: result.decisionRevisionUsed ?? '',
         missingActionVisibility: Object.fromEntries(result.items.map((item) => [item.bank.id, selectMissingExpenses([item]).length > 0 && bankAddEligibility(item).eligible])),
         bankRefundGroups: result.bankRefundGroups,
         sheets: auditSheets,
@@ -1552,73 +1706,139 @@ export default function App() {
     setConsistencyAuditError('')
     setConsistencyAuditSourceNote('')
     try {
-      let auditSheets = data.sheet
-      let remoteDecisions: PersistedDecision[] = []
-      let remoteTombstones: PersistedDecision[] = []
-      if (mode === 'PROFUNDA' && sheetSource === 'google' && googleSheetLink?.spreadsheetId && googleAccessToken.current) {
-        try {
-          const [ledger, decisions] = await Promise.all([
-            readGoogleSheetLedger(googleSheetLink.spreadsheetId, googleAccessToken.current),
-            readGoogleSheetDecisionsReadOnly(googleSheetLink.spreadsheetId, googleAccessToken.current),
-          ])
-          auditSheets = ledger.transactions
-          remoteDecisions = decisions.active
-          remoteTombstones = decisions.tombstones
-          setConsistencyAuditSourceNote(`Leitura atualizada de CUSTOS ANO e _CONCILIADOR · ${ledger.rowCount} linhas. Nenhuma alteração foi feita.`)
-        } catch (remoteError) {
-          setConsistencyAuditSourceNote(`Não foi possível reler as fontes remotas (${remoteError instanceof Error ? remoteError.message : 'erro de leitura'}). Relatório parcial usando fontes atuais carregadas e decisões locais; nenhuma alteração foi feita.`)
-        }
-      } else if (mode === 'PROFUNDA' && sheetSource === 'google' && googleSheetLink?.spreadsheetId) {
-        setConsistencyAuditSourceNote('Google precisa ser reconectado para reler as fontes remotas. Auditoria parcial usando os dados já carregados nesta sessão; nenhuma alteração foi feita.')
-      } else {
-        setConsistencyAuditSourceNote('Auditoria das fontes carregadas nesta sessão e das decisões locais; nenhuma alteração foi feita.')
-      }
-      const localDecisions = await listPersistedDecisions()
-      if (mode === 'PROFUNDA') await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
-      const auditResult = auditConsistency({
-        mode,
-        banks: data.bank,
+      const capturedAt = new Date().toISOString()
+      const liveAtStart = auditLiveStateRef.current
+      const sessionSnapshot = cloneAuditInput({
+        banks: liveAtStart.data.bank, sheets: liveAtStart.data.sheet,
+        statements: liveAtStart.cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity, entry }] : []),
+        currentBankItems: liveAtStart.result.items, currentCardMatches: liveAtStart.statementResults.flatMap((entry) => entry.matches.map((match) => ({ statementIdentity: entry.statement.statementIdentity, transactionId: match.transaction.id, match }))),
         bankSourceRows: [
           ...(manualBankTransactions.current.length ? [{ sourceId: 'manual', sourceName: uploads.bank?.fileName ?? 'Extrato local', transactions: manualBankTransactions.current }] : []),
           ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, sourceName: transactions[0]?.statementFileName ?? sourceId, transactions })),
         ],
-        currentBankItems: result.items,
-        missingActionVisibility: Object.fromEntries(result.items.map((item) => [item.bank.id, selectMissingExpenses([item]).length > 0 && bankAddEligibility(item).eligible])),
-        bankRefundGroups: result.bankRefundGroups,
-        missingCounterCollections: [
-          { source: 'card superior', items: selectMissingExpenses(result.items) },
-          { source: 'badge da aba', items: selectMissingExpenses(result.items) },
-          { source: 'resumo e lista', items: selectMissingExpenses(result.items) },
-        ],
-        activeDriveSourceIds: Object.keys(driveBankFiles.current),
-        currentDriveSourceIds: Object.values(driveFolderSnapshotsRef.current).flatMap((snapshot) => snapshot.fileIds),
-        missingDriveSourceIds: driveLastMissingSourceIds.current,
-        duplicateInvoiceSources: cardPdfs.flatMap((entry) => {
-          if (!entry.statement) return []
-          const identity = cardStatementFinancialIdentity(entry.statement)
-          const sourceIds = entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : [])
-          return identity && sourceIds.length > 1 ? [{ identity, sourceIds }] : []
-        }),
+        manualSourceIds: manualBankTransactions.current.map((transaction) => transaction.statementSourceId ?? 'manual'),
+        driveSourceIds: [...Object.keys(driveBankFiles.current), ...liveAtStart.cardPdfs.flatMap((entry) => entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : []))],
+        sourceFileIds: [...(uploads.bank?.fileName ? [`bank:${uploads.bank.fileName}`] : []), ...(liveAtStart.sheetSource === 'google' && liveAtStart.googleSheetLink?.spreadsheetId ? [`google-sheet:${liveAtStart.googleSheetLink.spreadsheetId}`] : []), ...Object.values(driveBankFiles.current).flat().map((transaction) => `drive-bank:${transaction.statementFileName ?? transaction.statementSourceId ?? transaction.id}`), ...liveAtStart.cardPdfs.map((entry) => `${entry.source ?? 'source'}:${entry.fileName}`)],
+        activeDriveBankSourceIds: Object.keys(driveBankFiles.current),
+        driveSnapshots: Object.values(driveFolderSnapshotsRef.current).flatMap((snapshot) => snapshot.fileIds),
+        missingDriveSourceIds: [...driveLastMissingSourceIds.current],
         sourceProvenance: [
           ...(manualBankTransactions.current.length ? [{ sourceId: 'manual', entityIds: manualBankTransactions.current.map((transaction) => transaction.id) }] : []),
           ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, entityIds: transactions.map((transaction) => transaction.id) })),
-          ...cardPdfs.flatMap((entry) => {
-            if (!entry.statement) return []
-            const sourceIds = [...(entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : [])), ...(entry.manualSourceIds ?? (entry.source === 'MANUAL' ? [entry.fingerprint] : []))]
-            return sourceIds.map((sourceId) => ({ sourceId, entityIds: [entry.statement!.statementIdentity, ...entry.statement!.transactions.map((transaction) => transaction.id)] }))
-          }),
+          ...liveAtStart.cardPdfs.flatMap((entry) => entry.statement ? (entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : [])).concat(entry.manualSourceIds ?? (entry.source === 'MANUAL' ? [entry.fingerprint] : [])).map((sourceId) => ({ sourceId, entityIds: [entry.statement!.statementIdentity, ...entry.statement!.transactions.map((transaction) => transaction.id)] })) : []),
         ],
-        sheets: auditSheets,
-        statements: cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []),
-        currentCardMatches: statementResults.flatMap((entry) => entry.matches.map((match) => ({ statementIdentity: entry.statement.statementIdentity, transactionId: match.transaction.id, match }))),
-        currentSheets: data.sheet,
-        localDecisions,
-        remoteDecisions,
-        remoteTombstones,
-        localTombstones: listDecisionTombstones(),
       })
+      const localCapture = await serializeDecisionMutation('conciliador-workspace', async () => ({ decisions: await listPersistedDecisions(), tombstones: listDecisionTombstones() }))
+      const localCapturedAt = new Date().toISOString()
+      let auditSheets = sessionSnapshot.sheets
+      let remoteDecisions: PersistedDecision[] = []
+      let remoteTombstones: PersistedDecision[] = []
+      let remoteLedgerCapturedAt: string | undefined
+      let remoteDecisionsCapturedAt: string | undefined
+      let remoteSourcesAvailable = false
+      const sourceIds = sessionSnapshot.driveSourceIds
+      const sourceProvenance = sessionSnapshot.sourceProvenance
+      const configuredDrive = Boolean(driveFoldersRef.current.invoices || driveFoldersRef.current.statements)
+      if (mode === 'PROFUNDA' && sheetSource === 'google' && googleSheetLink?.spreadsheetId && googleAccessToken.current) {
+        try {
+          const [ledgerCapture, decisionsCapture] = await Promise.all([
+            readGoogleSheetLedger(googleSheetLink.spreadsheetId, googleAccessToken.current).then((ledger) => ({ ledger, capturedAt: new Date().toISOString() })),
+            readGoogleSheetDecisionsReadOnly(googleSheetLink.spreadsheetId, googleAccessToken.current).then((decisions) => ({ decisions, capturedAt: new Date().toISOString() })),
+          ])
+          remoteLedgerCapturedAt = ledgerCapture.capturedAt
+          remoteDecisionsCapturedAt = decisionsCapture.capturedAt
+          auditSheets = cloneAuditInput(ledgerCapture.ledger.transactions)
+          remoteDecisions = cloneAuditInput(decisionsCapture.decisions.active)
+          remoteTombstones = cloneAuditInput(decisionsCapture.decisions.tombstones)
+          remoteSourcesAvailable = true
+          setConsistencyAuditSourceNote(`CUSTOS ANO e _CONCILIADOR lidos separadamente · ${ledgerCapture.ledger.rowCount} linhas. O Google Sheets não fornece snapshot transacional conjunto; nenhuma alteração foi feita.`)
+        } catch (remoteError) {
+          setConsistencyAuditSourceNote(`Não foi possível reler as fontes remotas (${remoteError instanceof Error ? remoteError.message : 'erro de leitura'}). Auditoria parcial usando os snapshots carregados na sessão e decisões locais; nenhuma alteração foi feita.`)
+        }
+      } else if (mode === 'PROFUNDA' && sheetSource === 'google' && googleSheetLink?.spreadsheetId) {
+        setConsistencyAuditSourceNote('Google precisa ser reconectado para reler as fontes remotas. Auditoria parcial com snapshots desta sessão e decisões locais; nenhuma alteração foi feita.')
+      } else {
+        setConsistencyAuditSourceNote(configuredDrive
+          ? 'Auditoria das fontes carregadas na sessão. O estado atual das pastas do Google Drive não foi relido; nenhuma alteração foi feita.'
+          : 'Auditoria das fontes carregadas nesta sessão e das decisões locais; nenhuma alteração foi feita.')
+      }
+      const auditStatements = sessionSnapshot.statements.map(({ statement, legacyStatementIdentity }) => ({ statement, legacyStatementIdentity }))
+      const mergedAuditDecisionSet = auditDecisionMerge({ localDecisions: localCapture.decisions, localTombstones: localCapture.tombstones, remoteDecisions, remoteTombstones })
+      const auditEffectiveDecisionRevision = decisionRevision(auditPersistedDecisions(mergedAuditDecisionSet.effective.filter((item) => item.state === 'ACTIVE').map((item) => item.decision), { banks: sessionSnapshot.banks, sheets: auditSheets, statements: auditStatements }).filter((item) => item.status === 'VALID').map((item) => item.decision))
+      const auditedSourceRevision = revisionForDerivedSources(sessionSnapshot.banks, auditSheets, auditStatements.map(({ statement }) => statement))
+      const mixedRevisionSources = [
+        ...(liveAtStart.result.sourceRevisionUsed && liveAtStart.result.sourceRevisionUsed !== auditedSourceRevision ? ['derived-source-result'] : []),
+        ...(liveAtStart.result.decisionRevisionUsed !== liveAtStart.effectiveDecisionRevision ? ['derived-decision-result'] : []),
+        ...(liveAtStart.result.decisionRevisionUsed && liveAtStart.result.decisionRevisionUsed !== auditEffectiveDecisionRevision ? ['derived-decision-vs-audit-decisions'] : []),
+      ]
+      const unavailableSources = [
+        ...(!remoteSourcesAvailable && mode === 'PROFUNDA' && sheetSource === 'google' ? ['google-current-ledger', 'google-current-decisions'] : []),
+        ...(sourceStatus.sheet !== 'ACCEPTED' ? ['custos-ano-session-source'] : []),
+        ...(sourceStatus.bank !== 'ACCEPTED' ? ['bank-session-source'] : []),
+        ...(liveAtStart.cardPdfs.some((entry) => entry.status === 'ERROR' || entry.status === 'PROCESSING') ? ['one-or-more-card-files-unavailable'] : []),
+      ]
+      const snapshot = createAuditInputSnapshot({
+        banks: sessionSnapshot.banks, sheets: auditSheets, statements: auditStatements.map(({ statement }) => statement),
+        decisions: [...localCapture.decisions, ...remoteDecisions], tombstones: { ...localCapture.tombstones, ...Object.fromEntries(remoteTombstones.map((decision) => [decision.key, { updatedAt: decision.updatedAt, decision }])) }, driveSourceIds: sourceIds, sourceFileIds: sessionSnapshot.sourceFileIds, sourceProvenance,
+        capturedAt, capturedAtBySource: { bankSourceRevision: capturedAt, cardStatementRevision: capturedAt, custosAnoRevision: remoteLedgerCapturedAt ?? capturedAt, decisionRevision: remoteDecisionsCapturedAt ?? localCapturedAt, driveSourceRevision: capturedAt },
+        unavailableSources, driveListing: configuredDrive ? 'SESSION_ONLY' : 'NOT_CONFIGURED', mixedRevisionSources,
+      })
+      const auditInput = cloneAuditInput({
+        mode, banks: sessionSnapshot.banks, bankSourceRows: sessionSnapshot.bankSourceRows, currentBankItems: sessionSnapshot.currentBankItems,
+        currentDecisionRevision: auditEffectiveDecisionRevision, derivedDecisionRevision: liveAtStart.result.decisionRevisionUsed ?? '',
+        derivedSourceRevision: liveAtStart.result.sourceRevisionUsed ?? '', auditInputSnapshot: snapshot,
+        missingActionVisibility: Object.fromEntries(sessionSnapshot.currentBankItems.map((item) => [item.bank.id, selectMissingExpenses([item]).length > 0 && bankAddEligibility(item).eligible])),
+        bankRefundGroups: liveAtStart.result.bankRefundGroups,
+        missingCounterCollections: [
+          { source: 'card superior', items: selectMissingExpenses(sessionSnapshot.currentBankItems) },
+          { source: 'badge da aba', items: selectMissingExpenses(sessionSnapshot.currentBankItems) },
+          { source: 'resumo e lista', items: selectMissingExpenses(sessionSnapshot.currentBankItems) },
+        ],
+        activeDriveSourceIds: sessionSnapshot.activeDriveBankSourceIds, currentDriveSourceIds: sessionSnapshot.driveSnapshots, missingDriveSourceIds: sessionSnapshot.missingDriveSourceIds,
+        duplicateInvoiceSources: sessionSnapshot.statements.flatMap(({ statement, entry }) => {
+          const identity = cardStatementFinancialIdentity(statement)
+          const ids = entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : [])
+          return identity && ids.length > 1 ? [{ identity, sourceIds: ids }] : []
+        }),
+        sourceProvenance, sheets: auditSheets, statements: auditStatements,
+        currentCardMatches: sessionSnapshot.currentCardMatches, currentSheets: sessionSnapshot.sheets,
+        localDecisions: localCapture.decisions, remoteDecisions, remoteTombstones, localTombstones: localCapture.tombstones,
+      })
+      let auditResult = auditConsistency(auditInput)
+      if (mode === 'PROFUNDA') await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+      const latest = auditLiveStateRef.current
+      const latestDecisions = await serializeDecisionMutation('conciliador-workspace', async () => ({ decisions: await listPersistedDecisions(), tombstones: listDecisionTombstones() }))
+      let latestSheets = latest.data.sheet
+      let latestRemoteDecisions: PersistedDecision[] = []
+      let latestRemoteTombstones: PersistedDecision[] = []
+      let finalRemoteReadAvailable = false
+      if (mode === 'PROFUNDA' && latest.sheetSource === 'google' && latest.googleSheetLink?.spreadsheetId && googleAccessToken.current) {
+        try {
+          const [ledger, decisions] = await Promise.all([readGoogleSheetLedger(latest.googleSheetLink.spreadsheetId, googleAccessToken.current), readGoogleSheetDecisionsReadOnly(latest.googleSheetLink.spreadsheetId, googleAccessToken.current)])
+          latestSheets = ledger.transactions
+          latestRemoteDecisions = decisions.active
+          latestRemoteTombstones = decisions.tombstones
+          finalRemoteReadAvailable = true
+        } catch { /* The initial frozen snapshot remains the report basis; final freshness is unknown. */ }
+      }
+      const latestStatements = latest.cardPdfs.flatMap((entry) => entry.statement ? [entry.statement] : [])
+      const latestMerge = auditDecisionMerge({ localDecisions: latestDecisions.decisions, localTombstones: latestDecisions.tombstones, remoteDecisions: finalRemoteReadAvailable ? latestRemoteDecisions : remoteDecisions, remoteTombstones: finalRemoteReadAvailable ? latestRemoteTombstones : remoteTombstones })
+      const latestEffectiveDecisionRevision = decisionRevision(auditPersistedDecisions(latestMerge.effective.filter((item) => item.state === 'ACTIVE').map((item) => item.decision), { banks: latest.data.bank, sheets: latestSheets, statements: latest.cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []) }).filter((item) => item.status === 'VALID').map((item) => item.decision))
+      const latestSnapshot = createAuditInputSnapshot({
+        banks: latest.data.bank, sheets: latestSheets, statements: latestStatements, decisions: [...latestDecisions.decisions, ...(finalRemoteReadAvailable ? latestRemoteDecisions : remoteDecisions)],
+        tombstones: { ...latestDecisions.tombstones, ...Object.fromEntries((finalRemoteReadAvailable ? latestRemoteTombstones : remoteTombstones).map((decision) => [decision.key, { updatedAt: decision.updatedAt, decision }])) }, driveSourceIds: [...Object.keys(driveBankFiles.current), ...latest.cardPdfs.flatMap((entry) => entry.driveFileIds ?? (entry.driveFileId ? [entry.driveFileId] : []))],
+        sourceFileIds: [...(uploads.bank?.fileName ? [`bank:${uploads.bank.fileName}`] : []), ...(latest.sheetSource === 'google' && latest.googleSheetLink?.spreadsheetId ? [`google-sheet:${latest.googleSheetLink.spreadsheetId}`] : []), ...Object.values(driveBankFiles.current).flat().map((transaction) => `drive-bank:${transaction.statementFileName ?? transaction.statementSourceId ?? transaction.id}`), ...latest.cardPdfs.map((entry) => `${entry.source ?? 'source'}:${entry.fileName}`)],
+        sourceProvenance, unavailableSources: !finalRemoteReadAvailable && mode === 'PROFUNDA' && latest.sheetSource === 'google' ? ['remote-final-state-unreadable'] : [],
+        driveListing: configuredDrive ? 'SESSION_ONLY' : 'NOT_CONFIGURED', mixedRevisionSources: latest.result.sourceRevisionUsed !== revisionForDerivedSources(latest.data.bank, latestSheets, latestStatements) || latest.result.decisionRevisionUsed !== latestEffectiveDecisionRevision ? ['derived-result'] : [],
+      })
+      auditResult = finalizeAuditInputSnapshot(auditResult, compareAuditInputSnapshots(snapshot, latestSnapshot))
+      const invariantCounts = auditResult.invariantExecutions.reduce((counts, entry) => {
+        counts[entry.status] = (counts[entry.status] ?? 0) + 1
+        return counts
+      }, {} as Record<string, number>)
+      setConsistencyAuditSourceNote((note) => `${note} · Invariantes: ${invariantCounts.EXECUTED_PASS ?? 0} sem finding, ${invariantCounts.EXECUTED_FAIL ?? 0} com finding, ${invariantCounts.UNAVAILABLE ?? 0} indisponíveis, ${invariantCounts.SKIPPED_DUE_TO_REVISION ?? 0} não comparáveis.`)
       if (mode === 'PROFUNDA' && import.meta.env.DEV) {
-        console.info(`Auditoria Profunda concluída em ${(performance.now() - auditStartedAt).toFixed(1)} ms`)
+        console.info(`Auditoria Profunda concluída em ${(performance.now() - auditStartedAt).toFixed(1)} ms · estado esperado ${auditResult.performance.expectedStateDerivationMs.toFixed(1)} ms · invariantes ${auditResult.performance.invariantChecksMs.toFixed(1)} ms`)
       }
       setConsistencyAudit(auditResult)
       setConsistencyAuditFilter('ALL')
@@ -1628,9 +1848,18 @@ export default function App() {
     } finally { consistencyAuditRunLock.current = false; setConsistencyAuditBusy(false) }
   }
 
+  useEffect(() => {
+    if (!auditRefreshRequested || !consistencyAudit || consistencyAuditBusy) return
+    const timer = window.setTimeout(() => {
+      setAuditRefreshRequested(false)
+      void runConsistencyAudit('PROFUNDA')
+    }, 0)
+    return () => window.clearTimeout(timer)
+  }, [auditRefreshRequested, consistencyAudit, consistencyAuditBusy, result, statementResults])
+
   const activeAuditFindings = consistencyAudit?.findings.filter((finding) => !isAuditFindingDismissed(finding, dismissedAuditFindings)) ?? []
   const hiddenAuditFindings = consistencyAudit?.findings.filter((finding) => isAuditFindingDismissed(finding, dismissedAuditFindings)) ?? []
-  const activeAuditSummary = consistencyAudit ? summarizeAudit(activeAuditFindings, consistencyAudit.items, consistencyAudit.summary.evaluatedPurchases, consistencyAudit.mode) : null
+  const activeAuditSummary = consistencyAudit ? summarizeAudit(activeAuditFindings, consistencyAudit.items, consistencyAudit.summary.evaluatedPurchases, consistencyAudit.mode, consistencyAudit.invariantExecutions) : null
   const auditDisplayedFindings = consistencyAudit
     ? consistencyAuditFilter === 'HIDDEN'
       ? hiddenAuditFindings
@@ -1680,6 +1909,8 @@ export default function App() {
             ...Object.entries(driveBankFiles.current).map(([sourceId, transactions]) => ({ sourceId, sourceName: transactions[0]?.statementFileName ?? sourceId, transactions })),
           ],
           currentBankItems: result.items,
+          currentDecisionRevision: effectiveDecisionRevision,
+          derivedDecisionRevision: result.decisionRevisionUsed ?? '',
           bankRefundGroups: result.bankRefundGroups,
           sheets: auditSheets,
           statements: cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []),
@@ -1748,7 +1979,7 @@ export default function App() {
           <FilterBar years={years} year={filterYear} month={filterMonth} fromDate={fromDate} toDate={toDate} onYear={setFilterYear} onMonth={setFilterMonth} onFrom={setFromDate} onTo={setToDate}/>
           {missingWriteNotice && <p className="cost-write-notice" role="status">{missingWriteNotice}</p>}
           <div className="stat-grid">
-            <Metric label="Conciliadas" value={filteredItems.filter((item) => item.status === 'MATCHED').length} tone="green" icon="✓" onClick={() => setTab('overview')}/>
+            <Metric label="Conciliadas" value={shownMatched.length} tone="green" icon="✓" onClick={() => setTab('matched')}/>
             <Metric label="Para revisar" value={shownReview.length} tone="amber" icon="!" onClick={() => setTab('review')}/>
             <Metric label="Ausentes" value={shownMissing.length} tone="red" icon="⌕" onClick={() => setTab('missing')}/>
             <Metric label="Divergências de cartão" value={shownCardDivergences.length} tone="blue" icon="▣" onClick={() => setTab('card')}/>
@@ -1756,19 +1987,19 @@ export default function App() {
             <Metric label="Duplicidades" value={filteredDuplicates.length} tone="orange" icon="Ⅱ" onClick={() => setTab('duplicates')}/>
             <Metric label="Fora do escopo" value={shownOutOfScope.length} tone="blue" icon="ℹ" onClick={() => setTab('outofscope')}/>
           </div>
-          <div className="tab-row" role="tablist" aria-label="Seções da conciliação"><Tab active={tab === 'overview'} onClick={() => setTab('overview')}>Resumo</Tab><Tab active={tab === 'review'} onClick={() => setTab('review')}>Revisão <span className="tab-count">{shownReview.length}</span></Tab><Tab active={tab === 'missing'} onClick={() => setTab('missing')}>Ausentes <span className="tab-count">{shownMissing.length}</span></Tab><Tab active={tab === 'card'} onClick={() => setTab('card')}>Faturas <span className="tab-count">{shownCardDivergences.length}</span></Tab>{statementResults.length > 0 && <Tab active={tab === 'statement'} onClick={() => setTab('statement')}>Faturas PDF <span className="tab-count">{statementResults.reduce((sum, result) => sum + result.matches.filter((match) => match.status === 'CARD_MISSING').length, 0)}</span></Tab>}{consistencyAudit && <Tab active={tab === 'auditor'} onClick={() => setTab('auditor')}>Auditoria <span className="tab-count">{activeAuditSummary?.attention ?? 0}</span></Tab>}<Tab active={tab === 'duplicates'} onClick={() => setTab('duplicates')}>Duplicidades <span className="tab-count">{filteredDuplicates.length}</span></Tab><Tab active={tab === 'outofscope'} onClick={() => setTab('outofscope')}>Fora do escopo <span className="tab-count">{shownOutOfScope.length}</span></Tab><Tab active={tab === 'flags'} onClick={() => setTab('flags')}>Sinalizações</Tab></div>
-          {tab === 'auditor' && consistencyAudit && <section className="consistency-audit"><header className="panel audit-summary"><div><span className="eyebrow">SOMENTE LEITURA</span><h2>Auditoria de consistência</h2><small>Executada em {new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(consistencyAudit.auditedAt))}</small></div><button className="button button-outline" onClick={() => void runConsistencyAudit('PROFUNDA')} disabled={consistencyAuditBusy}>{consistencyAuditBusy ? 'Executando auditoria…' : 'Executar novamente'}</button><p>{consistencyAuditSourceNote}</p></header>{consistencyAuditError && <p className="cost-write-notice" role="status">{consistencyAuditError}</p>}<div className="audit-counts"><strong>✓ {consistencyAudit.summary.validatedInvariants} invariantes validadas</strong><strong>⚠ {activeAuditSummary?.attention ?? 0} problemas que exigem atenção</strong><strong>⛔ {activeAuditSummary?.critical ?? 0} críticos</strong><strong>{activeAuditSummary?.review ?? 0} para revisão</strong><strong>{activeAuditSummary?.maintenance ?? 0} manutenções</strong><strong>{activeAuditSummary?.legacy ?? 0} legados</strong><strong>{hiddenAuditFindings.length} avisos ocultos</strong><strong>{consistencyAudit.summary.evaluatedPurchases} compras avaliadas</strong><strong>ℹ {activeAuditSummary?.informational ?? 0} informativos</strong></div><details className="panel audit-inventory"><summary>Compras avaliadas · {consistencyAudit.items.length}</summary>{consistencyAudit.items.map((item) => <div className="audit-transaction" key={item.fingerprint}><strong>{item.transaction.originalDescription}</strong><span>{dateLabel(item.transaction.purchaseDate)} · {formatCents(item.transaction.amount)}</span><details><summary>Detalhes técnicos da avaliação</summary><pre>{JSON.stringify({ diagnostico: item.diagnosis, estadoPuro: item.pure.status, estadoAtual: item.current?.status ?? null, fingerprint: item.fingerprint }, null, 2)}</pre></details></div>)}</details><div className="audit-filter"><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('ALL')}>Todos ({activeAuditFindings.length})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('CRITICAL')}>Críticos ({activeAuditSummary?.critical ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('REVIEW')}>Revisão ({activeAuditSummary?.review ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('LEGACY')}>Legado/Manutenção ({(activeAuditSummary?.maintenance ?? 0) + (activeAuditSummary?.legacy ?? 0)})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('HIDDEN')}>Ocultos ({hiddenAuditFindings.length})</button></div>{auditDisplayedFindings.length ? auditDisplayedFindings.map((finding) => <AuditFindingCard key={finding.id} finding={finding} visibility={dismissedAuditFindings} hiddenView={consistencyAuditFilter === 'HIDDEN'} onDismiss={hideAuditFinding} onRestore={restoreHiddenAuditFinding} onDiscardObsolete={(item) => void auditDiscardObsoleteDoubleClaim(item)} onViewPurchase={(item) => { if (!item.item) return; setAuditFocusTransactionId(item.item.transaction.id); setAuditFocusStatementIdentity(item.item.statement.statementIdentity); setTab('statement'); setStatementOnlyIssues(false) }} onUseCandidate={(item) => { if (item.item) void auditUseCandidate(item.item) }} onInvalidateDecision={(_item, decision, explanation) => void auditInvalidateDecision(decision, explanation)} onReanalyze={(item) => { if (item.item) void auditRecalculateItem(item.item) }}/>) : <div className="panel"><EmptyState title={consistencyAuditFilter === 'HIDDEN' ? 'Nenhum aviso oculto' : 'Nenhuma inconsistência neste filtro'} copy={consistencyAuditFilter === 'HIDDEN' ? 'Os avisos ocultados aparecerão aqui.' : 'O relatório não encontrou problemas para mostrar nesta categoria.'}/></div>}</section>}
+          <div className="tab-row" role="tablist" aria-label="Seções da conciliação"><Tab active={tab === 'overview'} onClick={() => setTab('overview')}>Resumo</Tab><Tab active={tab === 'matched'} onClick={() => setTab('matched')}>Conciliadas <span className="tab-count">{shownMatched.length}</span></Tab><Tab active={tab === 'review'} onClick={() => setTab('review')}>Revisão <span className="tab-count">{shownReview.length}</span></Tab><Tab active={tab === 'missing'} onClick={() => setTab('missing')}>Ausentes <span className="tab-count">{shownMissing.length}</span></Tab><Tab active={tab === 'card'} onClick={() => setTab('card')}>Faturas <span className="tab-count">{shownCardDivergences.length}</span></Tab>{statementResults.length > 0 && <Tab active={tab === 'statement'} onClick={() => setTab('statement')}>Faturas PDF <span className="tab-count">{statementResults.reduce((sum, result) => sum + result.matches.filter((match) => match.status === 'CARD_MISSING').length, 0)}</span></Tab>}{consistencyAudit && <Tab active={tab === 'auditor'} onClick={() => setTab('auditor')}>Auditoria <span className="tab-count">{activeAuditSummary?.attention ?? 0}</span></Tab>}<Tab active={tab === 'duplicates'} onClick={() => setTab('duplicates')}>Duplicidades <span className="tab-count">{filteredDuplicates.length}</span></Tab><Tab active={tab === 'outofscope'} onClick={() => setTab('outofscope')}>Fora do escopo <span className="tab-count">{shownOutOfScope.length}</span></Tab><Tab active={tab === 'flags'} onClick={() => setTab('flags')}>Sinalizações</Tab></div>
+          {tab === 'auditor' && consistencyAudit && <section className="consistency-audit"><header className="panel audit-summary"><div><span className="eyebrow">SOMENTE LEITURA</span><h2>Auditoria de consistência</h2><small>Executada em {new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(consistencyAudit.auditedAt))}</small></div><button className="button button-outline" onClick={() => void runConsistencyAudit('PROFUNDA')} disabled={consistencyAuditBusy}>{consistencyAuditBusy ? 'Executando auditoria…' : 'Executar novamente'}</button><p>{consistencyAuditSourceNote}</p></header>{consistencyAuditError && <p className="cost-write-notice" role="status">{consistencyAuditError}</p>}{consistencyAudit.auditInputSnapshot && <><p className="audit-snapshot-status" role="status">{consistencyAudit.auditInputSnapshot.state === 'COMPLETE' ? '✓ Auditoria completa' : consistencyAudit.auditInputSnapshot.state === 'PARTIAL' ? 'Auditoria parcial — algumas fontes não estavam disponíveis ou não foram atualizadas' : consistencyAudit.auditInputSnapshot.state === 'STALE' ? 'Os dados mudaram durante a auditoria. Execute novamente.' : 'Revisões incompatíveis — resultados dependentes estão sinalizados para revisão.'}</p><details className="audit-snapshot-technical"><summary>Revisões técnicas do snapshot</summary><pre>{JSON.stringify(consistencyAudit.auditInputSnapshot, null, 2)}</pre></details></>}<div className="audit-counts"><strong>✓ {consistencyAudit.summary.validatedInvariants} invariantes validadas</strong><strong>⚠ {activeAuditSummary?.attention ?? 0} problemas que exigem atenção</strong><strong>⛔ {activeAuditSummary?.critical ?? 0} críticos</strong><strong>{activeAuditSummary?.review ?? 0} para revisão</strong><strong>{activeAuditSummary?.maintenance ?? 0} manutenções</strong><strong>{activeAuditSummary?.legacy ?? 0} legados</strong><strong>{hiddenAuditFindings.length} avisos ocultos</strong><strong>{consistencyAudit.summary.evaluatedPurchases} compras avaliadas</strong><strong>ℹ {activeAuditSummary?.informational ?? 0} informativos</strong></div><details className="panel audit-inventory"><summary>Compras avaliadas · {consistencyAudit.items.length}</summary>{consistencyAudit.items.map((item) => <div className="audit-transaction" key={item.fingerprint}><strong>{item.transaction.originalDescription}</strong><span>{dateLabel(item.transaction.purchaseDate)} · {formatCents(item.transaction.amount)}</span><details><summary>Detalhes técnicos da avaliação</summary><pre>{JSON.stringify({ diagnostico: item.diagnosis, estadoPuro: item.pure.status, estadoAtual: item.current?.status ?? null, fingerprint: item.fingerprint }, null, 2)}</pre></details></div>)}</details><div className="audit-filter"><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('ALL')}>Todos ({activeAuditFindings.length})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('CRITICAL')}>Críticos ({activeAuditSummary?.critical ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('REVIEW')}>Revisão ({activeAuditSummary?.review ?? 0})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('LEGACY')}>Legado/Manutenção ({(activeAuditSummary?.maintenance ?? 0) + (activeAuditSummary?.legacy ?? 0)})</button><button className="button button-quiet" onClick={() => setConsistencyAuditFilter('HIDDEN')}>Ocultos ({hiddenAuditFindings.length})</button></div>{auditDisplayedFindings.length ? auditDisplayedFindings.map((finding) => <AuditFindingCard key={finding.id} finding={finding} visibility={dismissedAuditFindings} hiddenView={consistencyAuditFilter === 'HIDDEN'} onDismiss={hideAuditFinding} onRestore={restoreHiddenAuditFinding} onDiscardObsolete={(item) => void auditDiscardObsoleteDoubleClaim(item)} onViewPurchase={(item) => { if (!item.item) return; setAuditFocusTransactionId(item.item.transaction.id); setAuditFocusStatementIdentity(item.item.statement.statementIdentity); setTab('statement'); setStatementOnlyIssues(false) }} onUseCandidate={(item) => { if (item.item) void auditUseCandidate(item.item) }} onInvalidateDecision={(_item, decision, explanation) => void auditInvalidateDecision(decision, explanation)} onInvalidateBankConfirmation={auditInvalidateBankConfirmation} isBankConfirmationResolvable={isResolvableBankConflictDecision} onReanalyze={(item) => { if (item.item) void auditRecalculateItem(item.item) }}/>) : <div className="panel"><EmptyState title={consistencyAuditFilter === 'HIDDEN' ? 'Nenhum aviso oculto' : 'Nenhuma inconsistência neste filtro'} copy={consistencyAuditFilter === 'HIDDEN' ? 'Os avisos ocultados aparecerão aqui.' : 'O relatório não encontrou problemas para mostrar nesta categoria.'}/></div>}</section>}
           {tab === 'overview' && <>
             <div className="summary-grid"><section className="panel"><PanelTitle title="Movimentação no período" note="Valores apresentados em reais"/><div className="totals-list"><AmountRow label="Total de movimentações do banco" amount={filteredItems.filter((item) => item.bank.direction === 'DEBIT' || item.bank.direction === 'CREDIT').reduce((sum, item) => sum + item.bank.amount, 0)} /><AmountRow label="Saídas" amount={filteredItems.filter((item) => item.bank.direction === 'DEBIT').reduce((sum, item) => sum + item.bank.amount, 0)}/><AmountRow label="Entradas" amount={filteredItems.filter((item) => item.bank.direction === 'CREDIT').reduce((sum, item) => sum + item.bank.amount, 0)}/><AmountRow label="Lançamentos da planilha" amount={filteredSheet.reduce((sum, item) => sum + item.amount, 0)} strong/></div></section>
               <section className="panel"><PanelTitle title="Arquivos usados" note="Dados temporários nesta sessão"/><div className="file-summary"><FileLine icon="▤" title="Tabela CUSTOS ANO" detail={`${data.sheet.length} linhas válidas`} /><FileLine icon="◈" title={driveStatementFiles.length > 0 ? `Extratos bancários · ${driveStatementFiles.length + (manualBankTransactions.current.length ? 1 : 0)} arquivos` : 'Extrato bancário'} detail={`${data.bank.length} movimentações únicas${uploads.bank?.csv.statementPeriodStart && uploads.bank.csv.statementPeriodEnd ? ` · ${dateLabel(uploads.bank.csv.statementPeriodStart)} a ${dateLabel(uploads.bank.csv.statementPeriodEnd)}` : ''}`} />{uploads.bank?.auxiliaryIncludedCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryIncludedCount} lançamento(s) dentro do período foram incorporados de Últimos Lançamentos.</small> : null}{uploads.bank?.auxiliaryOutsidePeriodCount ? <small className="auxiliary-import-note">{uploads.bank.auxiliaryOutsidePeriodCount} lançamento(s) auxiliares fora do período foram ignorados.</small> : null}</div>{manualBankTransactions.current.length > 0 && (uploads.bank?.balanceEvidence ? <small className="auxiliary-import-note">Saldo informado no OFX: {formatCents(uploads.bank.balanceEvidence.amount)} em {dateLabel(uploads.bank.balanceEvidence.date)}.</small> : <BalanceAuditPanel audit={bankBalanceAudit}/>)}{driveStatementFiles.map((file) => { const statementTransactions = driveBankFiles.current[file.id] ?? []; return file.format === 'OFX' && file.balanceEvidence ? <small key={file.id} className="auxiliary-import-note">{file.name}: saldo OFX informado de {formatCents(file.balanceEvidence.amount)} em {dateLabel(file.balanceEvidence.date)}.</small> : <StatementBalanceAccordion fileName={file.name} audit={auditBankBalance(statementTransactions, file.excludedRows)} key={file.id}/> })}</section></div>
             {shownBankRefundGroups.length > 0 && <details className="panel bank-refund-groups"><summary><strong>Devoluções bancárias · {shownBankRefundGroups.length}</strong><small>Despesas e devoluções relacionadas antes da análise de ausências</small></summary><div>{shownBankRefundGroups.map((group) => { const refund = data.bank.find((item) => item.id === group.refundTransactionId); const originals = group.originalTransactionIds.map((id) => data.bank.find((item) => item.id === id)).filter((item): item is BankTransaction => Boolean(item)); return <article className="issue-row" key={group.id}><span className={`status-icon ${group.status === 'REVIEW' ? 'amber' : 'green'}`}>{group.status === 'REVIEW' ? '!' : '✓'}</span><div><strong>{group.status === 'REFUNDED' ? 'Pagamento devolvido integralmente' : group.status === 'PARTIAL' ? 'Devolução parcial' : 'Devolução precisa de revisão'}</strong>{group.status === 'REVIEW' ? <><p>{refund ? `${dateLabel(refund.date)} · ${refund.originalDescription} · ${formatCents(refund.amount)}` : 'Devolução'} combina com mais de uma saída PIX anterior:</p>{refund && <CounterpartyNote transaction={refund}/>} {originals.map((item) => <div key={item.id}><small>{dateLabel(item.date)} · {item.originalDescription} · {formatCents(item.amount)}</small><CounterpartyNote transaction={item}/></div>)}</> : <><p>{originals[0] ? `${originals[0].originalDescription} de ${formatCents(group.grossAmount ?? originals[0].amount)}` : 'Saída bancária'} · {originals[0] ? dateLabel(originals[0].date) : ''}{refund ? ` → devolvido em ${dateLabel(refund.date)}` : ''}</p>{originals[0] && <CounterpartyNote transaction={originals[0]}/>} {refund && <CounterpartyNote transaction={refund}/>}<small>Devolução: {formatCents(group.refundAmount)} · líquido: {formatCents(group.netAmount ?? 0)}</small></>}</div></article>})}</div></details>}
             <section className="panel recent-panel"><PanelTitle title="Atividade para acompanhar" note="Os itens abaixo precisam da sua atenção" action={<button className="text-button" onClick={() => setTab('review')}>Ver revisão →</button>}/>{shownReview.length + shownMissing.length ? <div className="activity-list">{[...shownReview, ...shownMissing].slice(0, 5).map((item) => <ActivityItem key={item.bank.id} item={item}/>)}</div> : <EmptyState title="Tudo em dia por aqui" copy="Nenhuma ausência ou correspondência pendente para o período selecionado."/>}</section>
-            {shownMatched.length > 0 && <details className="panel matched-details" open={shownMatched.some((item) => item.candidate?.reasons.includes('Correspondência 1:1 escolhida globalmente'))}><summary><span><strong>Correspondências encontradas · {shownMatched.length}</strong><small>Abra para ver evidências, descrição e confiança</small></span><span aria-hidden="true">⌄</span></summary><div className="matched-list">{shownMatched.map((item) => <MatchedDetail key={item.bank.id} item={item} confirmedPreviously={savedDecisions.some((record) => record.kind === 'PAIR_CONFIRMED' && record.identities[0] === bankIdentity(item.bank))} onUndo={() => { if (item.sheet) void removeDecision('PAIR_CONFIRMED', [bankIdentity(item.bank)]) }}/>)}</div></details>}
+            {shownMatched.length > 0 && <details className="panel matched-details" open={shownMatched.some((item) => item.candidate?.reasons.includes('Correspondência 1:1 escolhida globalmente'))}><summary><span><strong>Correspondências encontradas · {shownMatched.length}</strong><small>Abra para ver evidências, descrição e confiança</small></span><span aria-hidden="true">⌄</span></summary><div className="matched-list">{shownMatched.map((item) => <MatchedDetail key={item.bank.id} item={item} confirmedPreviously={applicableDecisions.some((record) => record.kind === 'PAIR_CONFIRMED' && record.identities[0] === bankIdentity(item.bank))} onUndo={() => { if (item.sheet) void removeDecision('PAIR_CONFIRMED', [bankIdentity(item.bank)]) }}/>)}</div></details>}
             {cardPdfs.length > 0 && <section className="panel"><PanelTitle title="Faturas PDF desta conciliação" note="Totais agregados; cada arquivo mantém sua análise independente."/>{cardPdfs.map((entry) => { const item = statementResults.find((result) => result.entry.key === entry.key); const status = entry.status === 'PROCESSING' ? 'Processando…' : entry.status === 'PROCESSED' ? '✓ Processado' : entry.status === 'DIVERGENCE' ? '⚠ Divergência' : '⚠ Erro de parsing'; return <div className="card-pdf-status" key={entry.key}><div><strong>{entry.fileName}</strong><small>{status}{item ? ` · Vencimento ${item.statement.dueDate ? dateLabel(item.statement.dueDate) : 'não identificado'} · Total ${item.statement.reportedTotal == null ? 'indisponível' : formatCents(item.statement.reportedTotal)} · ${item.matches.filter((match) => match.status === 'CARD_MISSING').length} compra(s) ausente(s)` : entry.error ? ` · ${entry.error}` : ''}</small>{item && <small>{item.payment ? `Pagamento identificado: ${dateLabel(item.payment.date)} · ${formatCents(item.payment.amount)}` : 'Pagamento bancário não identificado'}</small>}</div></div>})}</section>}
             {filteredItems.some((item) => item.compositionStatus === 'MATCHED') && <section className="review-list"><PanelTitle title="Pagamentos de cartão conciliados" note="Uma saída bancária pode corresponder a vários lançamentos Crédito_Bradesco"/>{filteredItems.filter((item) => item.compositionStatus === 'MATCHED').map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}</section>}
           </>}
-          {tab === 'review' && <div className="review-list">{shownReview.map((item) => item.bank.type === 'CARD_PAYMENT' ? <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/> : <ReviewCard key={item.bank.id} item={item} onConfirm={() => decide(item, 'confirm')} onReject={() => decide(item, 'reject')} onIgnore={() => decide(item, 'ignore')}/>)}{!shownReview.length && <EmptyState title="Nenhum item para revisar" copy="A conciliação não encontrou itens pendentes neste período."/>}</div>}
-          {tab === 'missing' && <div className="review-list"><MissingSummary items={shownMissing}/>{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')} onAddToSheet={() => openBankMissing(item)} eligibility={bankAddEligibility(item)} />)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
+          {tab === 'matched' && <div className="review-list">{shownMatched.map((item) => <ConciliatedBankCard key={item.bank.id} item={item} manuallyConfirmed={hasPersistedPairDecision(item)} onUndo={() => undoPairDecision(item)}/>)}{!shownMatched.length && <EmptyState title="Nenhuma movimentação conciliada" copy="Não há correspondências bancárias neste período."/>}</div>}          {tab === 'review' && <div className="review-list">{shownReview.map((item) => item.bank.type === 'CARD_PAYMENT' ? <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/> : <ReviewCard key={item.bank.id} item={item} onConfirm={(sheet) => decide(item, 'confirm', sheet)} onReject={() => decide(item, 'reject')} onIgnore={() => decide(item, 'ignore')}/>)}{!shownReview.length && <EmptyState title="Nenhum item para revisar" copy="A conciliação não encontrou itens pendentes neste período."/>}</div>}
+          {tab === 'missing' && <div className="review-list"><MissingSummary items={shownMissing}/>{shownMissing.map((item) => <MissingCard key={item.bank.id} item={item} onIgnore={() => decide(item, 'ignore')} onAddToSheet={() => openBankMissing(item)} eligibility={bankAddEligibility(item)} rejectedPairs={rejectedPairDecisions(item)} onReconsider={reconsiderRejectedPair} />)}{!shownMissing.length && <EmptyState title="Nenhuma despesa ausente" copy="Não há saídas classificadas como despesa sem correspondente neste período."/>}</div>}
           {tab === 'card' && <div className="review-list">{shownCardDivergences.map((item) => <CardPaymentCard key={item.bank.id} item={item} persisted={compositionWasSaved(item, null)} onConfirm={(ids) => confirmComposition(item, null, ids)} onUndo={() => void removeDecision('COMPOSITION_CONFIRMED', [bankIdentity(item.bank), savedCompositionIdentity(item)])} onIgnore={() => decide(item, 'ignore')}/>)}{!shownCardDivergences.length && <EmptyState title="Nenhuma divergência de cartão" copy="Todas as faturas têm uma composição confirmada ou não há pagamentos de cartão neste período."/>}</div>}
           {tab === 'statement' && <><section className="statement-filter panel" aria-label="Filtro das faturas"><strong>Exibição</strong><button className={`button ${statementOnlyIssues ? 'button-outline' : 'button-primary'}`} onClick={() => setStatementOnlyIssues(false)}>Todas</button><button className={`button ${statementOnlyIssues ? 'button-primary' : 'button-outline'}`} onClick={() => setStatementOnlyIssues(true)}>Só pendências</button></section>{visibleStatementResults.map((item) => <CardStatementResults key={item.entry.key} statement={item.statement} payment={item.payment} matches={item.matches} matchedTotal={item.matchedTotal} difference={item.difference} confirmations={item.confirmations} onlyIssues={statementOnlyIssues} focusTransactionId={item.statement.statementIdentity === auditFocusStatementIdentity ? auditFocusTransactionId : ''} onConfirm={(transactionId, sheetId) => confirmStatementMatch(item.statement, transactionId, sheetId)} onRejectCandidates={(transactionId, sheetIds) => rejectCardReviewCandidates(item.statement, transactionId, sheetIds)} onIgnore={(transactionId) => ignoreCardPurchase(item.statement, transactionId)} onAddMissing={(match) => openCardMissing(item.statement, match)} onUndo={(kind, identities) => { void undoStatementDecision(kind, item.statement, identities) }}/>) }{!visibleStatementResults.length && <EmptyState title="Nenhuma pendência nas faturas" copy="As faturas conciliadas foram ocultadas pelo filtro Só pendências."/>}</>}
           {tab === 'outofscope' && <div className="issue-columns"><section className="panel"><PanelTitle title="Movimentações fora da conciliação de despesas" note="Entradas, investimentos, transferências e tipos sem natureza confirmada"/>{shownOutOfScope.length ? <>{investFacilYields.length > 0 && <details className="investment-yield-group"><summary><strong>Rendimentos Invest Fácil</strong><span>{investFacilYields.length} créditos · total {formatCents(investFacilYields.reduce((sum, item) => sum + item.bank.amount, 0))}</span><small>Créditos de rendimento agrupados; não são lançados em CUSTOS ANO.</small></summary><div>{investFacilYields.map((item) => <div key={item.bank.id}><p>{dateLabel(item.bank.date)} · {bankDisplayDescription(item.bank.originalDescription)} · {formatCents(item.bank.amount)}</p><CounterpartyNote transaction={item.bank}/></div>)}</div></details>}{otherOutOfScope.map((item) => <div className="issue-row" key={item.bank.id}><span className="status-icon blue">ℹ</span><div><strong>{bankDisplayDescription(item.bank.originalDescription)}</strong><p>{dateLabel(item.bank.date)} · {item.bank.directionKnown === false ? 'Direção não identificada' : item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} · {formatCents(item.bank.amount)}</p><CounterpartyNote transaction={item.bank}/><small>{item.sheet ? `Correspondência de investimento: ${item.sheet.originalDescription} · ${formatCents(item.sheet.amount)}` : outOfScopeReason(item.bank.type)}</small></div></div>)}</> : <EmptyState title="Nenhuma movimentação fora do escopo" copy="Todas as movimentações deste período estão em outras seções."/>}</section></div>}
@@ -1978,10 +2209,42 @@ function Tab({ active, onClick, children }: { active: boolean; onClick: () => vo
 function EmptyState({ title, copy }: { title: string; copy: string }) { return <div className="empty-state"><span aria-hidden="true">✓</span><strong>{title}</strong><p>{copy}</p></div> }
 function ActivityItem({ item }: { item: ReconciliationItem }) { return <div className="activity-item"><span className={`status-icon ${item.status === 'REVIEW' ? 'amber' : 'red'}`}>{item.status === 'REVIEW' ? '!' : '⌕'}</span><div><strong>{item.status === 'REVIEW' ? 'Possível correspondência' : 'Possível lançamento ausente'}</strong><small>{dateLabel(item.bank.date)} · {bankDisplayDescription(item.bank.originalDescription)}{item.sheet ? ` ↔ ${item.sheet.originalDescription}` : ''}</small></div><strong className="activity-amount">{formatCents(item.bank.amount)}</strong></div> }
 function MatchReason({ reason }: { reason: string }) { const caution = /genérica|baixa similaridade|não confirmada|dia.*diferença|descrição diferente|mais de uma candidata/i.test(reason); return <span><b>{caution ? '△' : '✓'}</b> {reason}</span> }
+function ConciliatedBankCard({ item, manuallyConfirmed, onUndo }: { item: ReconciliationItem; manuallyConfirmed: boolean; onUndo: () => void }) {
+  const method = item.candidate?.matchMethod
+  const origin = manuallyConfirmed || method === 'MANUAL' ? 'Confirmação manual'
+    : item.candidate?.reasons.includes('Correspondência 1:1 escolhida globalmente') ? 'Correspondência por grupo'
+      : method === 'STRUCTURAL' ? 'Correspondência automática · estrutural'
+        : 'Correspondência automática · pontuação'
+  return <article className="panel conciliated-bank-card">
+    <div className="conciliated-bank-main">
+      <strong>{bankDisplayDescription(item.bank.originalDescription)}</strong>
+      <CounterpartyNote transaction={item.bank}/>
+      <p>{dateLabel(item.bank.date)} · {item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} · {formatCents(item.bank.amount)}</p>
+      <small>Origem: {origin}</small>
+      <div className="conciliated-sheet-link"><span>CUSTOS ANO</span><strong>{item.sheet ? `${dateLabel(item.sheet.date)} · ${item.sheet.originalDescription}` : 'Linha vinculada indisponível'}</strong>
+        {item.sheet && <small>{formatCents(item.sheet.amount)}{item.sheet.paymentMethod ? ` · Forma de pagamento: ${item.sheet.paymentMethod}` : ''}</small>}
+      </div>
+    </div>
+    {manuallyConfirmed && <button className="button button-outline" onClick={onUndo}>Desfazer decisão</button>}
+  </article>
+}
 function MatchedDetail({ item, confirmedPreviously, onUndo }: { item: ReconciliationItem; confirmedPreviously: boolean; onUndo: () => void }) { return <article className="matched-detail"><div><strong>{dateLabel(item.bank.date)} · {bankDisplayDescription(item.bank.originalDescription)}</strong><p>{formatCents(item.bank.amount)} · {item.bank.direction === 'DEBIT' ? 'Saída' : 'Entrada'} ↔ {item.sheet?.originalDescription ?? 'Planilha'}</p></div><span className="confidence">{item.candidate?.confidence ?? 96}% de confiança</span><div className="match-reasons">{item.candidate?.reasons.map((reason) => <MatchReason key={reason} reason={reason}/>)}</div><small>{confirmedPreviously ? '✓ Conciliado anteriormente; decisão salva neste dispositivo.' : item.candidate?.matchMethod === 'STRUCTURAL' ? 'Match automático: valor, data, direção e solução global 1:1.' : item.candidate?.matchMethod === 'MANUAL' ? 'Correspondência confirmada por você.' : 'Pontuação combinada de valor, data e descrição.'}</small>{confirmedPreviously && <button className="text-button" onClick={onUndo}>Desfazer confirmação</button>}</article> }
-function ReviewCard({ item, onConfirm, onReject, onIgnore }: { item: ReconciliationItem; onConfirm: () => void; onReject: () => void; onIgnore: () => void }) {
+function ReviewCard({ item, onConfirm, onReject, onIgnore }: { item: ReconciliationItem; onConfirm: (sheet?: LedgerTransaction) => void; onReject: () => void; onIgnore: () => void }) {
   const reasonText = item.reviewReason === 'REFUND_AMBIGUITY' ? 'Há mais de uma saída anterior compatível com esta devolução. Confira o vínculo antes de decidir.' : item.reviewReason === 'ASSIGNMENT_CONFLICT' ? 'O lançamento plausível está reservado por outra movimentação que também precisa de revisão.' : item.reviewReason === 'DIRECTION_UNCERTAIN' ? 'O arquivo não informa com segurança se o valor entrou ou saiu da conta.' : ''
-  return <article className="review-card"><div className="review-card-title"><span className="status-icon amber">!</span><div><span className="step-label">{item.sheet ? 'POSSÍVEL CORRESPONDÊNCIA' : 'MOVIMENTAÇÃO PARA CLASSIFICAR'}</span><h2>{item.sheet ? 'Confira este par de lançamentos' : item.bank.direction === 'CREDIT' ? 'Entrada bancária fora da conciliação de despesas' : 'Movimentação para revisar'}</h2></div><span className="confidence">{item.candidate ? `${item.candidate.confidence}% de confiança` : 'Revisão necessária'}</span></div><div className="comparison-grid"><TransactionBox label="BANCO / CARTÃO" transaction={item.bank} /><span className="compare-arrow">↔</span><TransactionBox label="CUSTOS ANO" transaction={item.sheet}/></div><div className="match-reasons">{item.candidate?.reasons.map((reason) => <MatchReason key={reason} reason={reason}/>)}{reasonText && <span>{reasonText}</span>}{!item.sheet && item.bank.direction === 'CREDIT' && <span>ℹ Entrada não tratada como despesa ausente</span>}</div><div className="review-actions">{item.sheet && <><button className="button button-primary" onClick={onConfirm}>✓ Confirmar</button><button className="button button-outline" onClick={onReject}>Não é a mesma</button></>}<button className="text-button" onClick={onIgnore}>Ignorar</button></div></article>
+  const candidates = item.candidateSheets?.length ? item.candidateSheets : item.sheet ? [item.sheet] : []
+  const multipleCandidates = candidates.length > 1
+  const candidateIsReserved = (sheet: LedgerTransaction) => {
+    const owner = item.candidateOwners?.[sheet.id]
+    return owner && owner.bankId !== item.bank.id ? owner : null
+  }
+  const singleReservation = item.sheet ? candidateIsReserved(item.sheet) : null
+  return <article className="review-card">
+    <div className="review-card-title"><span className="status-icon amber">!</span><div><span className="step-label">{item.sheet ? 'POSSÍVEL CORRESPONDÊNCIA' : 'MOVIMENTAÇÃO PARA CLASSIFICAR'}</span><h2>{item.sheet ? 'Confira este par de lançamentos' : item.bank.direction === 'CREDIT' ? 'Entrada bancária fora da conciliação de despesas' : 'Movimentação para revisar'}</h2></div><span className="confidence">{item.candidate ? `${item.candidate.confidence}% de confiança` : 'Revisão necessária'}</span></div>
+    <div className="comparison-grid"><TransactionBox label="BANCO / CARTÃO" transaction={item.bank} /><span className="compare-arrow">↔</span>{multipleCandidates ? <div className="transaction-box"><span className="step-label">CANDIDATAS DA CUSTOS ANO · {candidates.length}</span><strong>{candidates.length} lançamentos plausíveis</strong><span className="transaction-meta">Confira as opções abaixo antes de confirmar.</span></div> : <TransactionBox label="CUSTOS ANO" transaction={item.sheet}/>}</div>
+    {multipleCandidates && <div className="review-candidate-list">{candidates.map((sheet) => { const owner = candidateIsReserved(sheet); return <article className="review-candidate-option" key={sheet.id}><div><strong>{dateLabel(sheet.date)} · {sheet.originalDescription}</strong><small>{formatCents(sheet.amount)}{sheet.paymentMethod ? ` · Forma de pagamento: ${sheet.paymentMethod}` : ''}</small>{owner && <small>Reservado para: {owner.description}</small>}</div>{!owner && <button className="button button-outline button-small" onClick={() => onConfirm(sheet)}>Usar este lançamento</button>}</article> })}</div>}
+    <div className="match-reasons">{item.candidate?.reasons.map((reason) => <MatchReason key={reason} reason={reason}/>)}{reasonText && <span>{reasonText}</span>}{!item.sheet && item.bank.direction === 'CREDIT' && <span>ℹ Entrada não tratada como despesa ausente</span>}</div>
+    <div className="review-actions">{item.sheet && !multipleCandidates && <>{singleReservation ? <small>Candidata reservada para: {singleReservation.description}</small> : <button className="button button-primary" onClick={() => onConfirm(item.sheet ?? undefined)}>✓ Confirmar</button>}<button className="button button-outline" onClick={onReject}>Não é a mesma</button></>}{multipleCandidates && <button className="button button-outline" onClick={onReject}>Rejeitar candidata principal</button>}<button className="text-button" onClick={onIgnore}>Ignorar</button></div>
+  </article>
 }
 function CardPaymentCard({ item, persisted, onConfirm, onIgnore, onUndo }: { item: ReconciliationItem; persisted: boolean; onConfirm: (sheetIds: string[]) => void; onIgnore: () => void; onUndo: () => void }) {
   const options = item.composition.length ? [{ items: item.composition, score: 100, reasons: ['Composição confirmada pelo usuário'] }] : item.compositionOptions
@@ -2025,12 +2288,13 @@ function CounterpartyNote({ transaction }: { transaction: BankTransaction }) {
     if (remainingDescription === normalizeDescription(transaction.counterpartyName)) return null
     return <p className="counterparty-note"><span className="counterparty-note-label">{label}:</span> <strong>{transaction.counterpartyName}</strong></p>
   }
+
   const variants = [...new Map((transaction.counterpartyEvidence ?? []).map((item) => [item.name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase('pt-BR'), item])).values()]
   if (variants.length < 2) return null
   return <details className="counterparty-conflict"><summary>Contrapartes diferentes nas fontes</summary>{variants.map((item) => <small key={`${item.source}:${item.name}`}>{item.source}: {item.name}</small>)}</details>
 }
 function TransactionBox({ label, transaction }: { label: string; transaction: BankTransaction | LedgerTransaction | null }) { return <div className="transaction-box"><span className="step-label">{label}</span>{transaction ? <><strong className="transaction-date">{dateLabel(transaction.date)}</strong><strong className="transaction-description">{transaction.source === 'BANK' ? bankDisplayDescription(transaction.originalDescription) : transaction.originalDescription}</strong>{transaction.source === 'BANK' && <CounterpartyNote transaction={transaction}/>}<strong className="transaction-amount">{formatCents(transaction.amount)}</strong><span className="transaction-meta">{transaction.source === 'BANK' && transaction.directionKnown === false ? 'Direção não identificada no arquivo' : transaction.direction === 'DEBIT' ? 'Saída' : 'Entrada'}{transaction.paymentMethod ? ` · Forma de pagamento: ${transaction.paymentMethod}` : ''}{transaction.source === 'SHEET' && transaction.category ? ` · ${transaction.category}` : ''}</span></> : <span className="no-candidate">Nenhum lançamento sugerido para comparar.</span>}</div> }
-function MissingCard({ item, onIgnore, onAddToSheet, eligibility }: { item: ReconciliationItem; onIgnore: () => void; onAddToSheet: () => void; eligibility: MissingAddDecision }) {
+function MissingCard({ item, onIgnore, onAddToSheet, eligibility, rejectedPairs = [], onReconsider }: { item: ReconciliationItem; onIgnore: () => void; onAddToSheet: () => void; eligibility: MissingAddDecision; rejectedPairs?: { decision: PersistedDecision; candidate: LedgerTransaction }[]; onReconsider?: (decision: PersistedDecision) => void }) {
   const blockedReason: Partial<Record<MissingAddDecision['reason'], string>> = {
     ALREADY_IN_SHEET: 'A movimentação já está registrada na CUSTOS ANO.',
     ALREADY_ADDED: 'A inclusão desta movimentação já foi registrada.',
@@ -2041,9 +2305,9 @@ function MissingCard({ item, onIgnore, onAddToSheet, eligibility }: { item: Reco
     OUT_OF_SCOPE_INVESTMENT: 'Movimentações de investimento ficam fora das despesas conciliáveis.',
     NOT_DEBIT: 'Somente saídas da conta podem ser adicionadas como despesa.',
   }
-  return <article className="missing-card"><span className="status-icon red">⌕</span><div className="missing-content"><span className="step-label">POSSÍVEL LANÇAMENTO AUSENTE</span><h2>{bankDisplayDescription(item.bank.originalDescription)}</h2><CounterpartyNote transaction={item.bank}/><p>{dateLabel(item.bank.date)} · Saída{item.bank.paymentMethod ? ` · Forma de pagamento: ${item.bank.paymentMethod}` : ''}</p><strong className="transaction-amount">{formatCents(item.bank.amount)}</strong><small>Nenhum lançamento correspondente foi encontrado na CUSTOS ANO.</small>{!eligibility.eligible && blockedReason[eligibility.reason] && <small className="missing-action-reason">{blockedReason[eligibility.reason]}</small>}</div>{eligibility.eligible && <button className="button button-primary" onClick={onAddToSheet}>Adicionar à CUSTOS ANO</button>}<button className="button button-outline" onClick={onIgnore}>Ignorar</button></article>
+  return <article className="missing-card"><span className="status-icon red">⌕</span><div className="missing-content"><span className="step-label">POSSÍVEL LANÇAMENTO AUSENTE</span><h2>{bankDisplayDescription(item.bank.originalDescription)}</h2><CounterpartyNote transaction={item.bank}/><p>{dateLabel(item.bank.date)} · Saída{item.bank.paymentMethod ? ` · Forma de pagamento: ${item.bank.paymentMethod}` : ''}</p><strong className="transaction-amount">{formatCents(item.bank.amount)}</strong><small>Nenhum lançamento correspondente foi encontrado na CUSTOS ANO.</small>{!eligibility.eligible && blockedReason[eligibility.reason] && <small className="missing-action-reason">{blockedReason[eligibility.reason]}</small>}{rejectedPairs.map(({ decision, candidate }) => <div className="rejected-pair-reconsider" key={decision.key}><small>Rejeição salva para: {candidate.originalDescription} · {dateLabel(candidate.date)} · {formatCents(candidate.amount)}</small><button className="text-button" onClick={() => onReconsider?.(decision)}>Reconsiderar correspondência</button></div>)}</div>{eligibility.eligible && <button className="button button-primary" onClick={onAddToSheet}>Adicionar à CUSTOS ANO</button>}<button className="button button-outline" onClick={onIgnore}>Ignorar</button></article>
 }
 function FilterBar({ years, year, month, fromDate, toDate, onYear, onMonth, onFrom, onTo }: { years: string[]; year: string; month: string; fromDate: string; toDate: string; onYear: (value: string) => void; onMonth: (value: string) => void; onFrom: (value: string) => void; onTo: (value: string) => void }) {
   return <section className="filter-bar"><div className="filter-heading"><span>⌕</span><strong>Filtrar período</strong></div><label>Ano<select value={year} onChange={(event) => onYear(event.target.value)}><option value="all">Todos os anos</option>{years.map((item) => <option key={item}>{item}</option>)}</select></label><label>Mês<select value={month} onChange={(event) => onMonth(event.target.value)}><option value="all">Todos os meses</option>{Array.from({ length: 12 }, (_, index) => <option key={index + 1} value={String(index + 1).padStart(2, '0')}>{String(index + 1).padStart(2, '0')} - {new Intl.DateTimeFormat('pt-BR', { month: 'long', timeZone: 'UTC' }).format(new Date(Date.UTC(2026, index, 1)))}</option>)}</select></label><label>De<input type="date" value={fromDate} onChange={(event) => onFrom(event.target.value)}/></label><label>Até<input type="date" value={toDate} onChange={(event) => onTo(event.target.value)}/></label></section>
 }
-function ExportBar({ result, items, banks, sheets, consistencyAudit, hiddenAuditFindingIds }: { result: ReturnType<typeof reconcile>; items: ReconciliationItem[]; banks: BankTransaction[]; sheets: LedgerTransaction[]; consistencyAudit: ConsistencyAuditResult | null; hiddenAuditFindingIds: Set<string> }) { return <section className="export-bar"><div><strong>Exportar resultados</strong><small>Os arquivos são gerados neste dispositivo.</small></div><div className="export-actions"><button className="button button-quiet" onClick={() => exportMissing(items)}>↓ Ausências</button><button className="button button-quiet" onClick={() => exportReviews(items)}>↓ Revisão</button><button className="button button-quiet" onClick={() => exportCardPayments(items)}>↓ Faturas de cartão</button><button className="button button-quiet" onClick={() => exportOutOfScope(items)}>↓ Fora do escopo</button><button className="button button-quiet" onClick={() => exportDuplicates(result, banks, sheets)}>↓ Duplicidades</button><button className="button button-quiet" onClick={() => exportSummary(result, items)}>↓ Resumo</button><button className="button button-quiet" disabled={!consistencyAudit} title={consistencyAudit ? 'Exporta todos os findings da auditoria mais recente, inclusive avisos ocultos.' : 'Execute a auditoria de consistência para habilitar a exportação.'} onClick={() => { if (consistencyAudit) exportAuditFindings(consistencyAudit.findings, hiddenAuditFindingIds, consistencyAudit.auditedAt, consistencyAudit.mode) }}>↓ Auditoria{consistencyAudit ? ` (${consistencyAudit.findings.length})` : ''}</button><button className="button button-quiet" disabled={!consistencyAudit} title="Baixa o diagnóstico técnico completo da mesma execução da auditoria." onClick={() => { if (consistencyAudit) exportAuditDiagnosticJson(consistencyAudit, hiddenAuditFindingIds) }}>↓ Diagnóstico técnico JSON</button></div></section> }
+function ExportBar({ result, items, banks, sheets, consistencyAudit, hiddenAuditFindingIds }: { result: ReturnType<typeof reconcile>; items: ReconciliationItem[]; banks: BankTransaction[]; sheets: LedgerTransaction[]; consistencyAudit: ConsistencyAuditResult | null; hiddenAuditFindingIds: Set<string> }) { return <section className="export-bar"><div><strong>Exportar resultados</strong><small>Os arquivos são gerados neste dispositivo.</small></div><div className="export-actions"><button className="button button-quiet" onClick={() => exportMissing(items)}>↓ Ausências</button><button className="button button-quiet" onClick={() => exportReviews(items)}>↓ Revisão</button><button className="button button-quiet" onClick={() => exportCardPayments(items)}>↓ Faturas de cartão</button><button className="button button-quiet" onClick={() => exportOutOfScope(items)}>↓ Fora do escopo</button><button className="button button-quiet" onClick={() => exportDuplicates(result, banks, sheets)}>↓ Duplicidades</button><button className="button button-quiet" onClick={() => exportSummary(result, items)}>↓ Resumo</button><button className="button button-quiet" disabled={!consistencyAudit} title={consistencyAudit ? 'Exporta todos os findings da auditoria mais recente, inclusive avisos ocultos.' : 'Execute a auditoria de consistência para habilitar a exportação.'} onClick={() => { if (consistencyAudit) exportAuditFindings(consistencyAudit.findings, hiddenAuditFindingIds, consistencyAudit.auditedAt, consistencyAudit.mode, consistencyAudit.auditInputSnapshot) }}>↓ Auditoria{consistencyAudit ? ` (${consistencyAudit.findings.length})` : ''}</button><button className="button button-quiet" disabled={!consistencyAudit} title="Baixa o diagnóstico técnico completo da mesma execução da auditoria." onClick={() => { if (consistencyAudit) exportAuditDiagnosticJson(consistencyAudit, hiddenAuditFindingIds) }}>↓ Diagnóstico técnico JSON</button></div></section> }

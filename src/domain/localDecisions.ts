@@ -12,6 +12,19 @@ export interface PersistedDecision {
 const DATABASE_NAME = 'conciliador-financeiro-decisions'
 const DATABASE_VERSION = 1
 const STORE_NAME = 'decisions'
+const DECISION_CLOCK_KEY = 'conciliador.decisions.logicalClock.v1'
+
+export function nextDecisionTimestamp(...observed: string[]) {
+  let previous = 0
+  try { previous = Number(localStorage.getItem(DECISION_CLOCK_KEY)) || 0 } catch { /* storage may be unavailable in tests/private mode */ }
+  for (const value of observed) {
+    const stamp = Date.parse(value)
+    if (Number.isFinite(stamp)) previous = Math.max(previous, stamp)
+  }
+  const next = Math.max(Date.now(), previous + 1)
+  try { localStorage.setItem(DECISION_CLOCK_KEY, String(next)) } catch { /* timestamps still progress within this call */ }
+  return new Date(next).toISOString()
+}
 
 export function decisionKey(kind: DecisionKind, identities: string[]) {
   return `${kind}:${JSON.stringify(identities)}`
@@ -51,14 +64,16 @@ export async function putPersistedDecision(record: PersistedDecision) {
 }
 
 export async function savePersistedDecision(decision: Omit<PersistedDecision, 'schemaVersion' | 'updatedAt'>) {
-  const record: PersistedDecision = { ...decision, schemaVersion: 1, updatedAt: new Date().toISOString() }
+  const existing = (await listPersistedDecisions()).find((item) => item.key === decision.key)
+  const record: PersistedDecision = { ...decision, schemaVersion: 1, updatedAt: nextDecisionTimestamp(existing?.updatedAt ?? '') }
   await putPersistedDecision(record)
   return record
 }
 
 /** Replaces one manual assignment and removes its superseded owners in one IndexedDB transaction. */
 export async function replacePersistedDecision(decision: Omit<PersistedDecision, 'schemaVersion' | 'updatedAt'>, supersededKeys: string[]) {
-  const record: PersistedDecision = { ...decision, schemaVersion: 1, updatedAt: new Date().toISOString() }
+  const existing = (await listPersistedDecisions()).filter((item) => item.key === decision.key || supersededKeys.includes(item.key))
+  const record: PersistedDecision = { ...decision, schemaVersion: 1, updatedAt: nextDecisionTimestamp(...existing.map((item) => item.updatedAt)) }
   const database = await openDatabase()
   return new Promise<PersistedDecision>((resolve, reject) => {
     const transaction = database.transaction(STORE_NAME, 'readwrite')
