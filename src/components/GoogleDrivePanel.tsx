@@ -44,6 +44,15 @@ function formatPeriod(start?: string | null, end?: string | null) {
   return start && end ? `${start} → ${end}` : 'Período não identificado'
 }
 
+export function parseDriveSyncProgress(progress: string) {
+  const match = progress.match(/^Processando\s+(faturas|extratos)\s+(\d+)\s+de\s+(\d+)(?::|$)/i)
+  if (!match) return null
+  const processed = Number(match[2])
+  const total = Number(match[3])
+  const percent = total > 0 ? Math.min(100, Math.max(0, Math.round((processed / total) * 100))) : 0
+  return { stage: match[1].toLocaleLowerCase('pt-BR'), processed, total, percent }
+}
+
 export function GoogleDrivePanel({ folders, connected, configured, loading, progress, lastSync, summary, error, loadedStatements = [], onSelectFolder, onSync, onRemoveStatement = () => undefined }: {
   folders: SavedDriveFolders
   connected: boolean
@@ -69,6 +78,7 @@ export function GoogleDrivePanel({ folders, connected, configured, loading, prog
   const invoiceErrorCount = invoiceOutcomes.length ? invoiceOutcomes.filter((outcome) => outcome.status === 'PARSE_ERROR' || outcome.status === 'PROCESSING_ERROR').length : summary?.invoiceErrors ?? 0
   const statementOutcomes = summary?.statementFileOutcomes ?? []
   const loadedStatementIds = new Set(loadedStatements.map((file) => file.id))
+  const progressDetails = parseDriveSyncProgress(progress)
 
   return <section className="panel google-drive-panel" aria-labelledby="google-drive-heading">
     <div className="panel-heading"><div><h2 id="google-drive-heading">Fontes do Google Drive</h2><p>Pastas opcionais de faturas e extratos</p></div><span className={`google-connection-badge ${connected ? 'connected' : ''}`}>{connected ? '✓ Google conectado' : 'Opcional'}</span></div>
@@ -80,6 +90,12 @@ export function GoogleDrivePanel({ folders, connected, configured, loading, prog
       })}
     </div>
     <div className="google-sheets-actions"><button className="button button-primary" disabled={!connected || loading || (!folders.invoices && !folders.statements)} onClick={onSync}>{loading ? 'Sincronizando…' : 'Sincronizar arquivos'}</button>{lastSync && <small>Última sincronização: {new Date(lastSync).toLocaleString('pt-BR')}</small>}</div>
+    {loading && !error && progressDetails && <div className="drive-sync-progress">
+      <div className="drive-sync-progress-track" role="progressbar" aria-label={`Progresso da importação de ${progressDetails.stage}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progressDetails.percent}>
+        <span className="drive-sync-progress-fill" style={{ width: `${progressDetails.percent}%` }}/>
+      </div>
+      <small>{progressDetails.percent}% · {progressDetails.processed} de {progressDetails.total} {progressDetails.stage}</small>
+    </div>}
     {progress && <p className="google-sheets-note" role="status">{progress}</p>}
     {summary && <div className="drive-sync-summary" role="status">
       <strong>{summary.newProcessed ? `${summary.newProcessed} arquivo(s) novo(s) processado(s)` : 'Sincronização concluída'}</strong>

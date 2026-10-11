@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach } from 'vitest'
 import userEvent from '@testing-library/user-event'
-import { GoogleDrivePanel } from './GoogleDrivePanel'
+import { GoogleDrivePanel, parseDriveSyncProgress } from './GoogleDrivePanel'
 import type { DriveSyncSummary } from './GoogleDrivePanel'
 
 const folders = { invoices: { id: 'invoices', name: 'Faturas' }, statements: { id: 'statements', name: 'Extratos' } }
@@ -17,6 +17,35 @@ describe('painel de fontes Google Drive', () => {
     expect(screen.getByText('✓ Extratos')).toBeInTheDocument()
     expect(screen.getByRole('status')).toHaveTextContent('Processando faturas 2 de 3')
     expect(screen.getByRole('button', { name: 'Sincronizando…' })).toBeDisabled()
+  })
+
+  it.each([
+    ['0 de 16', 0, '0% · 0 de 16 faturas'],
+    ['8 de 16', 50, '50% · 8 de 16 faturas'],
+    ['14 de 16', 88, '88% · 14 de 16 faturas'],
+    ['16 de 16', 100, '100% · 16 de 16 faturas'],
+  ])('mostra progresso visual de faturas em %s', (_count, percent, label) => {
+    const { container } = render(<GoogleDrivePanel {...baseProps} loading progress={`Processando faturas ${_count.replace(' de ', ' de ')}: fatura.pdf`} summary={null}/> )
+    const progressbar = screen.getByRole('progressbar', { name: 'Progresso da importação de faturas' })
+    expect(progressbar).toHaveAttribute('aria-valuenow', String(percent))
+    expect(within(container).getByText(label)).toBeInTheDocument()
+  })
+
+  it('trata total zero sem divisão inválida e oculta a barra fora da sincronização ou após concluir', () => {
+    expect(parseDriveSyncProgress('Processando faturas 0 de 0: sem arquivos.pdf')).toEqual({ stage: 'faturas', processed: 0, total: 0, percent: 0 })
+    const { rerender } = render(<GoogleDrivePanel {...baseProps} loading progress="Processando faturas 0 de 0: sem arquivos.pdf" summary={null}/> )
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '0')
+    rerender(<GoogleDrivePanel {...baseProps} loading={false} progress="" summary={null}/> )
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+  })
+
+  it('mostra progresso da etapa atual de extratos e oculta a barra quando há erro', () => {
+    render(<GoogleDrivePanel {...baseProps} loading progress="Processando extratos 3 de 5: extrato.csv" summary={null}/> )
+    expect(screen.getByRole('progressbar', { name: 'Progresso da importação de extratos' })).toHaveAttribute('aria-valuenow', '60')
+    expect(screen.getByText('60% · 3 de 5 extratos')).toBeInTheDocument()
+    cleanup()
+    render(<GoogleDrivePanel {...baseProps} loading progress="Processando extratos 3 de 5: extrato.csv" error="Falha na sincronização" summary={null}/> )
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
   })
 
   it('separa arquivos físicos, faturas únicas, duplicados e arquivos ausentes', () => {
