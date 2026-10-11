@@ -652,6 +652,20 @@ describe('consistency audit', () => {
     expect(result.summary.informational).toBe(1)
   })
 
+  it('audita problemas físicos de _CONCILIADOR sem aplicar a decisão e sem inconsistência interna', () => {
+    const invalidDecision: PersistedDecision = { ...oldMissing, key: 'BANK_IGNORED:["bank:blocked"]', kind: 'BANK_IGNORED', identities: ['bank:blocked'], selected: [] }
+    const issue = { code: 'INVALID_DECISION_TIMESTAMP' as const, decisionId: stableFingerprint([invalidDecision.key]), decisionKeys: [invalidDecision.key], physicalRows: [7], status: 'ACTIVE' as const, invalidFields: ['updatedAt'], reason: 'Timestamp inválido em updatedAt.' }
+    const duplicateIssue = { code: 'DUPLICATE_REMOTE_DECISION_ID' as const, decisionId: stableFingerprint([invalidDecision.key]), decisionKeys: [invalidDecision.key], physicalRows: [8, 9], status: 'ACTIVE' as const, semanticallyDivergent: true, reason: 'Conteúdo divergente.' }
+    const issues = [issue, duplicateIssue]
+    const merge = auditDecisionMerge({ localDecisions: [invalidDecision], remoteDecisions: [invalidDecision], remoteDecisionIntegrityIssues: issues })
+    expect(merge.effective).toEqual([])
+    const report = auditConsistency({ banks: [], sheets: [], statements: [], currentCardMatches: [], localDecisions: [invalidDecision], remoteDecisions: [invalidDecision], remoteDecisionIntegrityIssues: issues })
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: 'INVALID_DECISION_TIMESTAMP', severity: 'REVIEW', category: 'DECISION', invariantId: 'INV-08', role: 'PRIMARY' }))
+    expect(report.findings).toContainEqual(expect.objectContaining({ code: 'DUPLICATE_REMOTE_DECISION_ID', severity: 'CRITICAL', category: 'DECISION', invariantId: 'INV-08', role: 'PRIMARY' }))
+    expect(report.findings.some((finding) => finding.code === 'AUDITOR_INTERNAL_INCONSISTENCY')).toBe(false)
+    expect(report.auditSelfChecks.every((check) => check.status !== 'FAIL')).toBe(true)
+  })
+
   it('filters every severity group and excludes maintenance/information from attention counts', () => {
     const findings = (['CRITICAL', 'REVIEW', 'INFO', 'INFO', 'INFO'] as const).map((severity, index) => ({ id: `finding-${index}`, code: 'AUDITOR_INTERNAL_INCONSISTENCY', severity, status: index === 2 ? 'MAINTENANCE' : index === 3 ? 'LEGACY' : 'ACTIVE', title: severity, detail: severity })) as AuditFinding[]
     expect(filterAuditFindings(findings, 'ALL')).toHaveLength(5)

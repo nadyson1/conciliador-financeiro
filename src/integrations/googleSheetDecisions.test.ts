@@ -14,7 +14,7 @@ function remoteRow(value: PersistedDecision, status = 'ACTIVE') { return [stable
 describe('sincronização de decisões no Google Sheets', () => {
   beforeEach(() => { localStoreMocks.put.mockReset(); localStoreMocks.remove.mockReset() })
   it('audita _CONCILIADOR estritamente em modo somente leitura', async () => {
-    const deleted = { ...decision, updatedAt: '2026-01-04T00:00:00.000Z' }
+    const deleted: PersistedDecision = { key: 'BANK_IGNORED:["bank:deleted"]', schemaVersion: 1, kind: 'BANK_IGNORED', identities: ['bank:deleted'], selected: [], updatedAt: '2026-01-04T00:00:00.000Z' }
     const fetcher = vi.fn()
       .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
       .mockResolvedValueOnce(response({ values: [headers, remoteRow(decision), remoteRow(deleted, 'DELETED')] }))
@@ -23,6 +23,75 @@ describe('sincronização de decisões no Google Sheets', () => {
     expect(fetcher.mock.calls.every(([, init]) => !init?.method || init.method === 'GET')).toBe(true)
     expect(localStoreMocks.put).not.toHaveBeenCalled()
     expect(localStoreMocks.remove).not.toHaveBeenCalled()
+  })
+  it('isola decisão com updatedAt inválido sem convertê-la em 1970', async () => {
+    const invalid = remoteRow(decision)
+    invalid[7] = 'not-a-date'
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, invalid] }))
+    const result = await readGoogleSheetDecisionsReadOnly('spreadsheet-invalid-time', 'token', fetcher)
+    expect(result.active).toEqual([])
+    expect(result.tombstones).toEqual([])
+    expect(result.integrityIssues).toMatchObject([{ code: 'INVALID_DECISION_TIMESTAMP', decisionKeys: [decision.key], physicalRows: [2], invalidFields: ['updatedAt'] }])
+    expect(JSON.stringify(result)).not.toContain('1970-01-01')
+  })
+  it('registra createdAt malformado como problema estrutural sem criar createdAt local', async () => {
+    const invalid = remoteRow(decision)
+    invalid[6] = 'not-a-date'
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, invalid] }))
+    const result = await readGoogleSheetDecisionsReadOnly('spreadsheet-invalid-created', 'token', fetcher)
+    expect(result.active).toEqual([])
+    expect(result.integrityIssues).toMatchObject([{ code: 'INVALID_REMOTE_DECISION_ROW', invalidFields: ['createdAt'], physicalRows: [2] }])
+    expect(result.integrityIssues[0]).not.toHaveProperty('createdAt')
+  })
+
+  it('tombstone com updatedAt inválido não vence nem perde silenciosamente para cópia ativa local', async () => {
+    const invalidTombstone = remoteRow(decision, 'DELETED')
+    invalidTombstone[7] = 'invalid'
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, invalidTombstone] }))
+    const active = await syncGoogleSheetDecisions('spreadsheet-invalid-tombstone', 'token', [decision], {}, fetcher)
+    expect(active).toEqual([])
+    expect(active.integrityIssues[0]).toMatchObject({ code: 'INVALID_DECISION_TIMESTAMP', status: 'DELETED', decisionKeys: [decision.key] })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(localStoreMocks.put).not.toHaveBeenCalled()
+    expect(localStoreMocks.remove).not.toHaveBeenCalled()
+  })
+
+  it('exclui todas as linhas quando decisionId remoto duplicado tem conteúdo divergente', async () => {
+    const divergent = { ...decision, selected: ['sheet:other'] }
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(decision), remoteRow(divergent)] }))
+    const result = await readGoogleSheetDecisionsReadOnly('spreadsheet-duplicate-id', 'token', fetcher)
+    expect(result.active).toEqual([])
+    expect(result.integrityIssues).toMatchObject([{ code: 'DUPLICATE_REMOTE_DECISION_ID', decisionId: stableFingerprint([decision.key]), physicalRows: [2, 3], semanticallyDivergent: true }])
+  })
+  it('não aplica nem regrava decisionId duplicado durante o merge', async () => {
+    const divergent = { ...decision, selected: ['sheet:other'] }
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, remoteRow(decision), remoteRow(divergent)] }))
+    const active = await syncGoogleSheetDecisions('spreadsheet-duplicate-merge', 'token', [decision], {}, fetcher)
+    expect(active).toEqual([])
+    expect(active.integrityIssues[0]).toMatchObject({ code: 'DUPLICATE_REMOTE_DECISION_ID', decisionKeys: [decision.key] })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(localStoreMocks.put).not.toHaveBeenCalled()
+    expect(localStoreMocks.remove).not.toHaveBeenCalled()
+  })
+
+  it('diagnostica cópias físicas idênticas e não aplica o decisionId duplicado', async () => {
+    const row = remoteRow(decision)
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ sheets: [{ properties: { title: 'CUSTOS ANO' } }, { properties: { title: '_CONCILIADOR' } }] }))
+      .mockResolvedValueOnce(response({ values: [headers, row, [...row]] }))
+    const result = await readGoogleSheetDecisionsReadOnly('spreadsheet-duplicate-identical', 'token', fetcher)
+    expect(result.active).toEqual([])
+    expect(result.integrityIssues).toMatchObject([{ code: 'DUPLICATE_REMOTE_DECISION_ID', physicalRows: [2, 3], semanticallyDivergent: false }])
   })
   it('cria somente _CONCILIADOR, grava o esquema e faz upsert local sem escrever em CUSTOS ANO', async () => {
     const fetcher = vi.fn()

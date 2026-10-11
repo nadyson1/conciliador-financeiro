@@ -1,5 +1,5 @@
 import type { DecisionKind, PersistedDecision } from '../domain/localDecisions'
-import { isDecisionStructurallyValid } from '../domain/decisionAudit'
+import { isDecisionStructurallyValid, type RemoteDecisionIntegrityIssue } from '../domain/decisionAudit'
 import { nextDecisionTimestamp, putPersistedDecision, deletePersistedDecision } from '../domain/localDecisions'
 import { stableFingerprint } from '../domain/identity'
 import { serializeDecisionMutation } from '../domain/decisionMutationQueue'
@@ -9,6 +9,7 @@ export const GOOGLE_DECISIONS_HEADERS = ['decisionId', 'decisionType', 'subjectF
 const DELETED_STATUS = 'DELETED'
 const TOMBSTONE_STORAGE_KEY = 'conciliador.googleSheets.decisionTombstones.v1'
 type DecisionRow = { decision: PersistedDecision; status: 'ACTIVE' | 'DELETED'; createdAt: string }
+type ParsedRemoteRows = { records: DecisionRow[]; integrityIssues: RemoteDecisionIntegrityIssue[] }
 export type DecisionTombstone = { updatedAt: string; decision: PersistedDecision }
 
 function readTombstones(storage: Storage = localStorage): Record<string, DecisionTombstone> {
@@ -87,6 +88,15 @@ function toRow(decision: PersistedDecision, status: 'ACTIVE' | 'DELETED' = 'ACTI
   return [stableFingerprint([decision.key]), decision.kind, stableFingerprint([decision.identities[0] ?? '']), status, JSON.stringify(decision.identities), JSON.stringify({ selected: decision.selected }), createdAt, timestamp, decision.schemaVersion]
 }
 
+const validTimestamp = (value: unknown): value is string => {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value))) return false
+  const [, year, month, day, hour, minute, second] = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) ?? []
+  if (!year) return false
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)))
+  return date.getUTCFullYear() === Number(year) && date.getUTCMonth() === Number(month) - 1 && date.getUTCDate() === Number(day)
+    && Number(hour) <= 23 && Number(minute) <= 59 && Number(second) <= 59
+}
+
 function fromRow(row: unknown[]): DecisionRow | null {
   const [decisionId, kind, subjectFingerprint, statusValue, relatedIds, metadata, createdAtValue, updatedAt, version] = row
   const validKinds: DecisionKind[] = ['PAIR_CONFIRMED', 'PAIR_REJECTED', 'BANK_IGNORED', 'SHEET_IGNORED', 'COMPOSITION_CONFIRMED', 'STATEMENT_MATCH_CONFIRMED', 'CARD_MISSING_CONFIRMED', 'CARD_PURCHASE_IGNORED', 'CARD_REVIEW_REJECTED_CANDIDATES', 'MISSING_ADDED_TO_SHEET']
@@ -98,13 +108,71 @@ function fromRow(row: unknown[]): DecisionRow | null {
     if (!Array.isArray(identities) || identities.some((identity) => typeof identity !== 'string') || !Array.isArray(parsedMetadata.selected) || parsedMetadata.selected.some((identity) => typeof identity !== 'string')) return null
     const key = `${kind}:${JSON.stringify(identities)}`
     if (decisionId !== stableFingerprint([key]) || subjectFingerprint !== stableFingerprint([identities[0] ?? ''])) return null
-    const stamp = typeof updatedAt === 'string' && !Number.isNaN(Date.parse(updatedAt)) ? updatedAt : new Date(0).toISOString()
-    const createdAt = typeof createdAtValue === 'string' && !Number.isNaN(Date.parse(createdAtValue)) ? createdAtValue : stamp
-    return { status: statusValue === DELETED_STATUS ? 'DELETED' : 'ACTIVE', createdAt, decision: { key, kind: kind as DecisionKind, identities, selected: parsedMetadata.selected as string[], updatedAt: stamp, schemaVersion: 1 } }
+    if (!validTimestamp(updatedAt) || !validTimestamp(createdAtValue)) return null
+    return { status: statusValue === DELETED_STATUS ? 'DELETED' : 'ACTIVE', createdAt: createdAtValue, decision: { key, kind: kind as DecisionKind, identities, selected: parsedMetadata.selected as string[], updatedAt, schemaVersion: 1 } }
   } catch { return null }
 }
 
-export type ReadOnlyGoogleDecisions = { exists: boolean; active: PersistedDecision[]; tombstones: PersistedDecision[] }
+function semanticRowSignature(row: unknown[]): string {
+  return JSON.stringify(row.slice(1, 9).map((value) => {
+    if (typeof value !== 'string') return value
+    try { return JSON.stringify(JSON.parse(value)) } catch { return value }
+  }))
+}
+
+function parseRemoteRows(rows: unknown[][]): ParsedRemoteRows {
+  const dataRows = rows.slice(1).map((row, index) => ({ row, physicalRow: index + 2 })).filter(({ row }) => row.some((value) => value !== '' && value != null))
+  const rowsByDecisionId = new Map<string, { row: unknown[]; physicalRow: number }[]>()
+  dataRows.forEach(({ row, physicalRow }) => {
+    const id = typeof row[0] === 'string' ? row[0].trim() : ''
+    if (id) rowsByDecisionId.set(id, [...(rowsByDecisionId.get(id) ?? []), { row, physicalRow }])
+  })
+  const duplicateIds = new Set([...rowsByDecisionId].filter(([, copies]) => copies.length > 1).map(([id]) => id))
+  const integrityIssues: RemoteDecisionIntegrityIssue[] = []
+  const records: DecisionRow[] = []
+  const blockedIds = new Set<string>()
+  dataRows.forEach(({ row, physicalRow }) => {
+    const decisionId = typeof row[0] === 'string' ? row[0].trim() : undefined
+    const parsed = fromRow(row)
+    if (decisionId && duplicateIds.has(decisionId)) {
+      blockedIds.add(decisionId)
+      return
+    }
+    if (parsed) { records.push(parsed); return }
+    const kind = typeof row[1] === 'string' ? row[1] : ''
+    let identities: unknown = null
+    try { identities = JSON.parse(String(row[4])) } catch { /* invalid JSON is kept as a diagnostic only */ }
+    const knownKey = Array.isArray(identities) && identities.every((item) => typeof item === 'string') && kind
+      ? `${kind}:${JSON.stringify(identities)}` : undefined
+    const invalidFields: string[] = []
+    if (!validTimestamp(row[7])) invalidFields.push('updatedAt')
+    if (!validTimestamp(row[6])) invalidFields.push('createdAt')
+    const rowsForId = decisionId ? rowsByDecisionId.get(decisionId) ?? [] : []
+    const semanticSignatures = new Set(rowsForId.map(({ row: duplicateRow }) => semanticRowSignature(duplicateRow)))
+    integrityIssues.push({
+      code: invalidFields.includes('updatedAt') ? 'INVALID_DECISION_TIMESTAMP' : 'INVALID_REMOTE_DECISION_ROW',
+      ...(decisionId ? { decisionId } : {}), decisionKeys: knownKey ? [knownKey] : [], physicalRows: [physicalRow],
+      status: row[3] === 'ACTIVE' || row[3] === 'DELETED' ? row[3] : 'UNKNOWN',
+      ...(invalidFields.length ? { invalidFields } : {}),
+      ...(rowsForId.length > 1 ? { semanticallyDivergent: semanticSignatures.size > 1 } : {}),
+      reason: invalidFields.length ? `Timestamp inválido em ${invalidFields.join(' e ')}.` : 'A estrutura da linha não corresponde ao contrato V1 esperado.',
+    })
+  })
+  duplicateIds.forEach((decisionId) => {
+    const copies = rowsByDecisionId.get(decisionId)!
+    const keys = [...new Set(copies.map(({ row }) => {
+      try {
+        const identities = JSON.parse(String(row[4])) as unknown
+        return typeof row[1] === 'string' && Array.isArray(identities) && identities.every((item) => typeof item === 'string') ? `${row[1]}:${JSON.stringify(identities)}` : ''
+      } catch { return '' }
+    }).filter(Boolean))]
+    const divergent = new Set(copies.map(({ row }) => semanticRowSignature(row))).size > 1
+    integrityIssues.push({ code: 'DUPLICATE_REMOTE_DECISION_ID', decisionId, decisionKeys: keys, physicalRows: copies.map(({ physicalRow }) => physicalRow), status: copies.every(({ row }) => row[3] === copies[0].row[3]) && (copies[0].row[3] === 'ACTIVE' || copies[0].row[3] === 'DELETED') ? copies[0].row[3] as 'ACTIVE' | 'DELETED' : 'UNKNOWN', semanticallyDivergent: divergent, reason: divergent ? 'O mesmo decisionId aparece em linhas com conteúdo semanticamente diferente.' : 'O mesmo decisionId aparece em mais de uma linha física equivalente.' })
+  })
+  return { records: records.filter((record) => !blockedIds.has(stableFingerprint([record.decision.key]))), integrityIssues }
+}
+
+export type ReadOnlyGoogleDecisions = { exists: boolean; active: PersistedDecision[]; tombstones: PersistedDecision[]; integrityIssues: RemoteDecisionIntegrityIssue[] }
 
 /** Read-only audit access. Unlike syncGoogleSheetDecisions this never creates a tab, writes rows, or updates IndexedDB. */
 export async function readGoogleSheetDecisionsReadOnly(id: string, token: string, fetcher: typeof fetch = fetch): Promise<ReadOnlyGoogleDecisions> {
@@ -112,17 +180,15 @@ export async function readGoogleSheetDecisionsReadOnly(id: string, token: string
   const metadata = await api(`${base}?fields=${encodeURIComponent('sheets.properties(sheetId,title)')}`, token, {}, fetcher)
   const sheets = metadata.sheets as { properties?: { title?: string } }[] | undefined
   if (!sheets?.some((sheet) => sheet.properties?.title === 'CUSTOS ANO')) throw new Error('A aba CUSTOS ANO não foi encontrada; a auditoria não modificou a planilha.')
-  if (!sheets?.some((sheet) => sheet.properties?.title === GOOGLE_DECISIONS_TAB)) return { exists: false, active: [], tombstones: [] }
+  if (!sheets?.some((sheet) => sheet.properties?.title === GOOGLE_DECISIONS_TAB)) return { exists: false, active: [], tombstones: [], integrityIssues: [] }
   const valuesUrl = `${base}/values/${rangePath(`'${GOOGLE_DECISIONS_TAB}'!A:I`)}?valueRenderOption=UNFORMATTED_VALUE&majorDimension=ROWS`
   const values = await api(valuesUrl, token, {}, fetcher)
   const rows = (values.values as unknown[][] | undefined) ?? []
-  if (!rows.length) return { exists: true, active: [], tombstones: [] }
+  if (!rows.length) return { exists: true, active: [], tombstones: [], integrityIssues: [] }
   const headers = rows[0].map((value) => String(value ?? ''))
   if (GOOGLE_DECISIONS_HEADERS.some((header, index) => headers[index] !== header)) throw new Error(`A aba ${GOOGLE_DECISIONS_TAB} tem cabeçalhos incompatíveis; a auditoria não modificou dados.`)
-  const parsed = rows.slice(1).filter((row) => row.some((value) => value !== '' && value != null)).map(fromRow)
-  if (parsed.some((item) => item == null)) throw new Error(`Há decisão inválida em ${GOOGLE_DECISIONS_TAB}; a auditoria não modificou dados.`)
-  const records = parsed as DecisionRow[]
-  return { exists: true, active: records.filter((item) => item.status === 'ACTIVE').map((item) => item.decision), tombstones: records.filter((item) => item.status === 'DELETED').map((item) => item.decision) }
+  const parsed = parseRemoteRows(rows)
+  return { exists: true, active: parsed.records.filter((item) => item.status === 'ACTIVE').map((item) => item.decision), tombstones: parsed.records.filter((item) => item.status === 'DELETED').map((item) => item.decision), integrityIssues: parsed.integrityIssues }
 }
 
 async function upsertRows(id: string, token: string, decisions: { decision: PersistedDecision; status: 'ACTIVE' | 'DELETED' }[], existingRows: unknown[][], fetcher: typeof fetch) {
@@ -149,23 +215,26 @@ export async function saveGoogleSheetDecision(id: string, token: string, decisio
   })
 }
 
-async function syncGoogleSheetDecisionsNow(id: string, token: string, localDecisions: PersistedDecision[], tombstones: Record<string, DecisionTombstone>, fetcher: typeof fetch): Promise<PersistedDecision[]> {
+export type DecisionSyncResult = PersistedDecision[] & { integrityIssues: RemoteDecisionIntegrityIssue[] }
+async function syncGoogleSheetDecisionsNow(id: string, token: string, localDecisions: PersistedDecision[], tombstones: Record<string, DecisionTombstone>, fetcher: typeof fetch): Promise<DecisionSyncResult> {
   // Keep malformed/legacy records available in local storage for diagnostics, but never
   // let them overwrite a valid remote row or participate in the effective decision set.
   const applicableLocal = localDecisions.filter(isDecisionStructurallyValid)
   const applicableTombstones = Object.fromEntries(Object.entries(tombstones).filter(([, tombstone]) => isDecisionStructurallyValid(tombstone?.decision) && !Number.isNaN(Date.parse(tombstone?.updatedAt ?? ''))))
   const rows = await ensureDecisionTab(id, token, fetcher)
-  const dataRows = rows.slice(1).filter((row) => row.some((value) => value !== '' && value != null))
-  const parsedRows = dataRows.map((row) => fromRow(row))
-  if (parsedRows.some((item) => item === null)) throw new Error(`Há decisão inválida ou versão incompatível na aba ${GOOGLE_DECISIONS_TAB}; nenhum dado local foi substituído.`)
-  const remote = parsedRows.filter((item): item is DecisionRow => item !== null)
+  const parsedRows = parseRemoteRows(rows)
+  const integrityIssues = parsedRows.integrityIssues
+  const blockedKeys = new Set(integrityIssues.flatMap((issue) => [...issue.decisionKeys, ...(issue.decisionId ? applicableLocal.filter((decision) => stableFingerprint([decision.key]) === issue.decisionId).map((decision) => decision.key) : [])]))
+  const remote = parsedRows.records.filter((item) => !blockedKeys.has(item.decision.key))
+  const safeApplicableLocal = applicableLocal.filter((decision) => !blockedKeys.has(decision.key))
+  const safeTombstones = Object.fromEntries(Object.entries(applicableTombstones).filter(([key]) => !blockedKeys.has(key)))
   const merged = new Map<string, DecisionRow>()
   remote.forEach((item) => merged.set(item.decision.key, item))
-  applicableLocal.forEach((decision) => {
+  safeApplicableLocal.forEach((decision) => {
     const current = merged.get(decision.key)
     if (!current || Date.parse(decision.updatedAt) > Date.parse(current.decision.updatedAt)) merged.set(decision.key, { decision, status: 'ACTIVE', createdAt: current?.createdAt ?? decision.updatedAt })
   })
-  Object.entries(applicableTombstones).forEach(([key, tombstone]) => {
+  Object.entries(safeTombstones).forEach(([key, tombstone]) => {
     const { updatedAt, decision } = tombstone
     const current = merged.get(key)
     if (!current || Date.parse(updatedAt) >= Date.parse(current.decision.updatedAt)) {
@@ -176,17 +245,20 @@ async function syncGoogleSheetDecisionsNow(id: string, token: string, localDecis
     const existing = remote.find((old) => old.decision.key === item.decision.key)
     return !existing || existing.status !== item.status || existing.decision.updatedAt !== item.decision.updatedAt || JSON.stringify(existing.decision) !== JSON.stringify(item.decision)
   })
-  await upsertRows(id, token, changed, rows, fetcher)
+  const blockedIds = new Set(integrityIssues.map((issue) => issue.decisionId).filter((value): value is string => Boolean(value)))
+  await upsertRows(id, token, changed.filter((item) => !blockedIds.has(stableFingerprint([item.decision.key]))), rows, fetcher)
   const active = [...merged.values()].filter((item) => item.status === 'ACTIVE').map((item) => item.decision)
-  const localKeys = new Set(applicableLocal.map((item) => item.key))
+  const localKeys = new Set(safeApplicableLocal.map((item) => item.key))
   for (const item of merged.values()) {
     if (item.status === 'DELETED') await deletePersistedDecision(item.decision.key)
     else if (!localKeys.has(item.decision.key) || applicableLocal.find((local) => local.key === item.decision.key)?.updatedAt !== item.decision.updatedAt) await putPersistedDecision(item.decision)
   }
-  return active
+  const result = active.filter((decision) => !blockedKeys.has(decision.key)) as DecisionSyncResult
+  Object.defineProperty(result, 'integrityIssues', { value: integrityIssues, enumerable: false })
+  return result
 }
 
-export function syncGoogleSheetDecisions(id: string, token: string, localDecisions: PersistedDecision[], tombstones: Record<string, DecisionTombstone> = {}, fetcher: typeof fetch = fetch): Promise<PersistedDecision[]> {
+export function syncGoogleSheetDecisions(id: string, token: string, localDecisions: PersistedDecision[], tombstones: Record<string, DecisionTombstone> = {}, fetcher: typeof fetch = fetch): Promise<DecisionSyncResult> {
   return serializeDecisionMutation(`google-sheet:${id}`, () => syncGoogleSheetDecisionsNow(id, token, localDecisions, tombstones, fetcher))
 }
 

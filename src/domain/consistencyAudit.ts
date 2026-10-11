@@ -1,6 +1,6 @@
 import type { BankRefundGroup, BankTransaction, CardStatement, CardStatementMatch, CardStatementTransaction, LedgerTransaction, ReconciliationItem } from './types'
 import type { PersistedDecision } from './localDecisions'
-import { auditPersistedDecisions, type DecisionAudit } from './decisionAudit'
+import { auditPersistedDecisions, type DecisionAudit, type RemoteDecisionIntegrityIssue } from './decisionAudit'
 import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity, stableFingerprint } from './identity'
 import { deriveCardPurchaseStatus, explainCostYearCandidateRejection, findExistingCostYearCandidates, reconcileCardStatement } from '../importers/cardStatement'
 import { canAddMissingToCostYear } from '../features/missingEligibility'
@@ -12,7 +12,7 @@ import { conflictingStatementAssignments, resolveStatementMatchAssignments } fro
 import type { AuditInputSnapshot } from './auditInputSnapshot'
 import { deriveExpectedReconciliationState, type ExpectedStateExplanationStep } from './expectedReconciliationState'
 
-export type AuditCode = 'MISSING_COM_CANDIDATO' | 'MISSING_WITH_STRONG_CANDIDATE' | 'EXPECTED_MANUAL_REJECTION' | 'CARD_MISSING_NO_CANDIDATE' | 'DERIVED_STATE_MISMATCH' | 'EXPECTED_OVERRIDE' | 'EXPECTED_GROUP_RESOLUTION' | 'EXPECTED_MANUAL_RESERVATION' | 'PREWRITE_MATCH_MISMATCH' | 'STALE_MISSING_DECISION' | 'ORPHANED_SHEET_REFERENCE' | 'EDITED_SHEET_REFERENCE' | 'MISSING_ADDED_TO_SHEET_ORPHAN' | 'DOUBLE_CLAIM' | 'DOUBLE_CLAIM_AFTER_CONFIRMATION' | 'MULTIPLE_INCOMPATIBLE_ACTIVE_DECISIONS' | 'RESERVED_SHEET_ROW_REUSED' | 'VALID_MANUAL_MATCH_NOT_APPLIED' | 'VALID_BANK_MANUAL_MATCH_NOT_APPLIED' | 'PAIR_CONFIRMED_ASSIGNMENT_CONFLICT' | 'INVALID_DECISION_APPLIED' | 'STALE_DECISION_RESULT' | 'AUDIT_INPUT_REVISION_MISMATCH' | 'AUDITOR_INTERNAL_INCONSISTENCY' | 'MISSING_ACTION_INCONSISTENCY' | 'CARD_PAYMENT_AS_EXPENSE_MISSING' | 'UNUSED_STRONG_CANDIDATE' | 'LEGACY_FINGERPRINT_MATCH' | 'LOCAL_REMOTE_DECISION_DIVERGENCE' | 'NEWER_TOMBSTONE_EXISTS' | 'WRONG_DECISION_DOMAIN' | 'REVIEW_ONLY_WRONG_CYCLE_CANDIDATES' | 'IGNORED_DECISION_REVIEW' | 'CURRENT_SOURCE_DIVERGENCE' | 'REJECTED_CANDIDATE_FILTERED' | 'SYNC_PENDING' | 'REVIEW_WITHOUT_CANDIDATES' | 'ASSIGNMENT_CONFLICT' | 'REFUNDED_BUT_MISSING' | 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS' | 'STALE_ACTIVE_SOURCE' | 'MISSING_COUNT_DIVERGENCE' | 'DUPLICATE_PRESENT_BUT_MARKED_MISSING' | 'INVOICE_TOTAL_MISMATCH' | 'CARD_SUBTOTAL_MISMATCH' | 'REFUND_NET_MISMATCH' | 'RESOLVED_SOURCE_OVERLAP' | 'MATCHED_WITHOUT_LINK' | 'ACTIVE_ENTITY_WITHOUT_SOURCE' | 'SOURCE_POINTS_TO_MISSING_ENTITY' | 'SOURCE_CONFLICT'
+export type AuditCode = 'MISSING_COM_CANDIDATO' | 'MISSING_WITH_STRONG_CANDIDATE' | 'EXPECTED_MANUAL_REJECTION' | 'CARD_MISSING_NO_CANDIDATE' | 'DERIVED_STATE_MISMATCH' | 'EXPECTED_OVERRIDE' | 'EXPECTED_GROUP_RESOLUTION' | 'EXPECTED_MANUAL_RESERVATION' | 'PREWRITE_MATCH_MISMATCH' | 'STALE_MISSING_DECISION' | 'ORPHANED_SHEET_REFERENCE' | 'EDITED_SHEET_REFERENCE' | 'MISSING_ADDED_TO_SHEET_ORPHAN' | 'DOUBLE_CLAIM' | 'DOUBLE_CLAIM_AFTER_CONFIRMATION' | 'MULTIPLE_INCOMPATIBLE_ACTIVE_DECISIONS' | 'RESERVED_SHEET_ROW_REUSED' | 'VALID_MANUAL_MATCH_NOT_APPLIED' | 'VALID_BANK_MANUAL_MATCH_NOT_APPLIED' | 'PAIR_CONFIRMED_ASSIGNMENT_CONFLICT' | 'INVALID_DECISION_APPLIED' | 'STALE_DECISION_RESULT' | 'AUDIT_INPUT_REVISION_MISMATCH' | 'AUDITOR_INTERNAL_INCONSISTENCY' | 'MISSING_ACTION_INCONSISTENCY' | 'CARD_PAYMENT_AS_EXPENSE_MISSING' | 'UNUSED_STRONG_CANDIDATE' | 'LEGACY_FINGERPRINT_MATCH' | 'LOCAL_REMOTE_DECISION_DIVERGENCE' | 'NEWER_TOMBSTONE_EXISTS' | 'WRONG_DECISION_DOMAIN' | 'REVIEW_ONLY_WRONG_CYCLE_CANDIDATES' | 'IGNORED_DECISION_REVIEW' | 'CURRENT_SOURCE_DIVERGENCE' | 'REJECTED_CANDIDATE_FILTERED' | 'SYNC_PENDING' | 'REVIEW_WITHOUT_CANDIDATES' | 'ASSIGNMENT_CONFLICT' | 'REFUNDED_BUT_MISSING' | 'DUPLICATE_BANK_TRANSACTION_ACROSS_STATEMENTS' | 'STALE_ACTIVE_SOURCE' | 'MISSING_COUNT_DIVERGENCE' | 'DUPLICATE_PRESENT_BUT_MARKED_MISSING' | 'INVOICE_TOTAL_MISMATCH' | 'CARD_SUBTOTAL_MISMATCH' | 'REFUND_NET_MISMATCH' | 'RESOLVED_SOURCE_OVERLAP' | 'MATCHED_WITHOUT_LINK' | 'ACTIVE_ENTITY_WITHOUT_SOURCE' | 'SOURCE_POINTS_TO_MISSING_ENTITY' | 'SOURCE_CONFLICT' | 'INVALID_DECISION_TIMESTAMP' | 'DUPLICATE_REMOTE_DECISION_ID' | 'INVALID_REMOTE_DECISION_ROW'
 export type AuditSeverity = 'CRITICAL' | 'REVIEW' | 'INFO'
 export type AuditMode = 'RAPIDA' | 'PROFUNDA'
 export type AuditCategory = 'SOURCE' | 'IDENTITY' | 'STATE' | 'DECISION' | 'FINANCIAL'
@@ -90,6 +90,7 @@ export type ConsistencyAuditInput = {
   duplicateInvoiceSources?: { identity: string; sourceIds: string[] }[]
   sourceProvenance?: { sourceId: string; entityIds: string[] }[]
   auditInputSnapshot?: AuditInputSnapshot
+  remoteDecisionIntegrityIssues?: RemoteDecisionIntegrityIssue[]
 }
 export type InvariantExecutionStatus = 'EXECUTED_PASS' | 'EXECUTED_FAIL' | 'NOT_APPLICABLE' | 'UNAVAILABLE' | 'SKIPPED_DUE_TO_REVISION'
 export type InvariantExecution = { invariantId: string; status: InvariantExecutionStatus; subjectsEvaluated: number; sourcesRequired: string[]; sourcesAvailable: string[]; reason?: string; findingIds: string[] }
@@ -123,13 +124,14 @@ const decisionPayload = ({ decision, state }: DecisionSnapshot) => JSON.stringif
 const validDecisionSnapshot = ({ decision }: DecisionSnapshot) => decision.key === `${decision.kind}:${JSON.stringify(decision.identities)}`
 
 /** Mirrors deterministic sync precedence: newest timestamp wins; remote wins ties; tombstone is a versioned state. */
-export function auditDecisionMerge(input: Pick<ConsistencyAuditInput, 'localDecisions' | 'remoteDecisions' | 'remoteTombstones' | 'localTombstones'>): DecisionMergeAudit {
+export function auditDecisionMerge(input: Pick<ConsistencyAuditInput, 'localDecisions' | 'remoteDecisions' | 'remoteTombstones' | 'localTombstones' | 'remoteDecisionIntegrityIssues'>): DecisionMergeAudit {
   const local = new Map<string, DecisionSnapshot>()
   const remote = new Map<string, DecisionSnapshot>()
-  input.localDecisions.forEach((decision) => local.set(decision.key, { decision, state: 'ACTIVE', source: 'LOCAL' }))
-  Object.entries(input.localTombstones ?? {}).forEach(([key, entry]) => local.set(key, { decision: { ...entry.decision, updatedAt: entry.updatedAt }, state: 'DELETED', source: 'LOCAL' }))
-  ;(input.remoteDecisions ?? []).forEach((decision) => remote.set(decision.key, { decision, state: 'ACTIVE', source: 'REMOTE' }))
-  ;(input.remoteTombstones ?? []).forEach((decision) => remote.set(decision.key, { decision, state: 'DELETED', source: 'REMOTE' }))
+  const blockedKeys = new Set((input.remoteDecisionIntegrityIssues ?? []).flatMap((issue) => [...issue.decisionKeys, ...(issue.decisionId ? [...input.localDecisions, ...(input.remoteDecisions ?? []), ...(input.remoteTombstones ?? [])].filter((decision) => stableFingerprint([decision.key]) === issue.decisionId).map((decision) => decision.key) : [])]))
+  input.localDecisions.filter((decision) => !blockedKeys.has(decision.key)).forEach((decision) => local.set(decision.key, { decision, state: 'ACTIVE', source: 'LOCAL' }))
+  Object.entries(input.localTombstones ?? {}).filter(([key]) => !blockedKeys.has(key)).forEach(([key, entry]) => local.set(key, { decision: { ...entry.decision, updatedAt: entry.updatedAt }, state: 'DELETED', source: 'LOCAL' }))
+  ;(input.remoteDecisions ?? []).filter((decision) => !blockedKeys.has(decision.key)).forEach((decision) => remote.set(decision.key, { decision, state: 'ACTIVE', source: 'REMOTE' }))
+  ;(input.remoteTombstones ?? []).filter((decision) => !blockedKeys.has(decision.key)).forEach((decision) => remote.set(decision.key, { decision, state: 'DELETED', source: 'REMOTE' }))
   const conflicts: DecisionMergeAudit['conflicts'] = [], pendingLocalUpdate: string[] = [], pendingRemoteUpdate: string[] = [], effective: DecisionSnapshot[] = []
   for (const key of new Set([...local.keys(), ...remote.keys()])) {
     const left = local.get(key), right = remote.get(key)
@@ -335,7 +337,7 @@ function groupPrimaryFindings(findings: AuditFinding[]): AuditFinding[] {
   return [...grouped.values(), ...passthrough]
 }
 
-export function runAuditSelfChecks(input: { items: AuditedCardItem[]; expectedStates?: Record<string, ReturnType<typeof deriveExpectedReconciliationState>>; findings: AuditFinding[]; decisions: PersistedDecision[]; snapshot?: AuditInputSnapshot }): AuditSelfCheck[] {
+export function runAuditSelfChecks(input: { items: AuditedCardItem[]; expectedStates?: Record<string, ReturnType<typeof deriveExpectedReconciliationState>>; findings: AuditFinding[]; decisions: PersistedDecision[]; snapshot?: AuditInputSnapshot; remoteDecisionIntegrityIssues?: RemoteDecisionIntegrityIssue[] }): AuditSelfCheck[] {
   const checks: AuditSelfCheck[] = []
   const candidateMismatches = input.findings.filter((finding) => {
     const technical = finding.technical ?? {}
@@ -348,6 +350,10 @@ export function runAuditSelfChecks(input: { items: AuditedCardItem[]; expectedSt
   const weakCritical = input.findings.filter((finding) => finding.severity === 'CRITICAL' && !finding.item && !hasSubstantiveEvidence(finding.technical))
   checks.push({ checkId: 'CRITICAL_EVIDENCE', status: weakCritical.length ? 'FAIL' : 'PASS', findingIds: weakCritical.map((finding) => finding.id), ...(weakCritical.length ? { detail: 'Finding crítico sem item ou evidência técnica.' } : {}) })
   const knownDecisionRefs = new Set(input.decisions.flatMap((decision) => [decision.key, stableFingerprint([decision.key])]))
+  ;(input.remoteDecisionIntegrityIssues ?? []).forEach((issue) => {
+    issue.decisionKeys.forEach((key) => { knownDecisionRefs.add(key); knownDecisionRefs.add(stableFingerprint([key])) })
+    if (issue.decisionId) knownDecisionRefs.add(issue.decisionId)
+  })
   const snapshotKeys = input.snapshot?.sourceIdentities.decisions ?? []
   snapshotKeys.forEach((key) => { knownDecisionRefs.add(key); if (!key.endsWith(':DELETED')) knownDecisionRefs.add(stableFingerprint([key])) })
   const collectDecisionRefs = (value: unknown, path: string[] = []): string[] => {
@@ -450,6 +456,29 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
   const currentMap = new Map(input.currentCardMatches.map(({ statementIdentity, transactionId, match }) => [`${statementIdentity}\u001f${transactionId}`, match]))
   const items: AuditedCardItem[] = []
   const findings: RawAuditFinding[] = []
+  for (const issue of input.remoteDecisionIntegrityIssues ?? []) {
+    const code: AuditCode = issue.code
+    const hasOppositeLocalVersion = issue.decisionKeys.some((key) => {
+      const hasLocalActive = input.localDecisions.some((decision) => decision.key === key)
+      const hasLocalTombstone = Boolean(input.localTombstones?.[key])
+      return issue.status === 'ACTIVE' ? hasLocalTombstone : issue.status === 'DELETED' ? hasLocalActive : false
+    })
+    const severity: AuditSeverity = issue.code === 'DUPLICATE_REMOTE_DECISION_ID'
+      ? issue.semanticallyDivergent ? 'CRITICAL' : 'REVIEW'
+      : issue.code === 'INVALID_DECISION_TIMESTAMP' && issue.invalidFields?.includes('updatedAt') && hasOppositeLocalVersion ? 'CRITICAL' : 'REVIEW'
+    const id = `${code}:${issue.decisionId ?? issue.physicalRows.join(',')}`
+    findings.push({
+      id, code, severity, category: 'DECISION', invariantId: 'INV-08',
+      title: issue.code === 'DUPLICATE_REMOTE_DECISION_ID' ? 'Identificador de decisão duplicado em _CONCILIADOR' : issue.code === 'INVALID_DECISION_TIMESTAMP' ? 'Timestamp inválido em _CONCILIADOR' : 'Linha estruturalmente inválida em _CONCILIADOR',
+      detail: `${issue.reason} Linha(s) física(s): ${issue.physicalRows.join(', ') || 'não identificada'}. A decisão ambígua ou inválida foi excluída do conjunto efetivo; nenhuma linha foi alterada.`,
+      diagnosis: issue.reason, whyItMatters: 'Uma decisão inválida ou ambígua não pode participar da precedência nem alterar o resultado financeiro.',
+      recommendedAction: 'Revise manualmente as linhas indicadas na aba técnica _CONCILIADOR antes de corrigir os dados.',
+      diagnosticConfidence: issue.code === 'DUPLICATE_REMOTE_DECISION_ID' ? issue.semanticallyDivergent ? 'HIGH' : 'HIGH' : 'HIGH',
+      safeAutomaticAction: false, status: 'ACTIVE', explanationSource: 'SYNC', role: 'PRIMARY', rootCauseCode: code,
+      rootCauseKey: `${code}:${issue.decisionId ?? issue.physicalRows.join(',')}`,
+      technical: { table: '_CONCILIADOR', decisionId: issue.decisionId ?? null, decisionKeys: issue.decisionKeys, physicalRows: issue.physicalRows, status: issue.status ?? 'UNKNOWN', invalidFields: issue.invalidFields ?? [], semanticallyDivergent: issue.semanticallyDivergent ?? null, reason: issue.reason },
+    })
+  }
   if (input.currentDecisionRevision != null && input.derivedDecisionRevision != null && input.currentDecisionRevision !== input.derivedDecisionRevision) findings.push({
     id: `STALE_DECISION_RESULT:${input.derivedDecisionRevision}`, code: 'STALE_DECISION_RESULT', severity: 'CRITICAL', category: 'STATE', invariantId: 'INV-11',
     title: 'O estado derivado está atrasado em relação às decisões', detail: 'Os resultados exibidos foram calculados com uma revisão diferente do conjunto efetivo de decisões.',
@@ -1095,7 +1124,7 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
     ...items.map((item) => [item.fingerprint, { subjectId: item.fingerprint, pureState: item.pure.status, expectedState: item.expectedState?.status ?? 'UNAVAILABLE', currentState: item.current?.status ?? 'UNAVAILABLE', explanationChain: item.explanationChain, ...(item.expectedState?.sheet ? { expectedTargetId: item.expectedState.sheet.sheetRecordId || item.expectedState.sheet.id } : {}) }]),
   ])
   let deduplicated = groupPrimaryFindings(deduplicateAuditFindings(findings.filter((finding) => finding.code !== 'DOUBLE_CLAIM_AFTER_CONFIRMATION')).map(enrichFinding))
-  const auditSelfChecks = runAuditSelfChecks({ items, expectedStates, findings: deduplicated, decisions: allDecisions, snapshot: input.auditInputSnapshot })
+  const auditSelfChecks = runAuditSelfChecks({ items, expectedStates, findings: deduplicated, decisions: allDecisions, snapshot: input.auditInputSnapshot, remoteDecisionIntegrityIssues: input.remoteDecisionIntegrityIssues })
   const failedSelfChecks = auditSelfChecks.filter((check) => check.status === 'FAIL')
   if (failedSelfChecks.length) {
     const internal = enrichFinding({
@@ -1108,7 +1137,7 @@ export function auditConsistency(input: ConsistencyAuditInput): ConsistencyAudit
   const invariantStartedAt = performance.now()
   const invariantExecutions = evaluateInvariantExecutions(input, deduplicated, mode)
   const invariantChecksMs = performance.now() - invariantStartedAt
-  const finalSelfChecks = failedSelfChecks.length ? auditSelfChecks : runAuditSelfChecks({ items, expectedStates, findings: deduplicated, decisions: allDecisions, snapshot: input.auditInputSnapshot })
+  const finalSelfChecks = failedSelfChecks.length ? auditSelfChecks : runAuditSelfChecks({ items, expectedStates, findings: deduplicated, decisions: allDecisions, snapshot: input.auditInputSnapshot, remoteDecisionIntegrityIssues: input.remoteDecisionIntegrityIssues })
   const evaluatedPurchases = input.statements.reduce((count, entry) => count + entry.statement.transactions.filter((tx) => tx.type === 'PURCHASE' && tx.financialStatus !== 'REFUNDED').length, 0)
   return { mode, recomputation: { performed: mode === 'PROFUNDA', readOnly: true, persistedDecisionsApplied: false }, findings: deduplicated, items, decisionAudit: validated.map((audit) => {
     const validity = globalDecisionValidity.get(audit.decision.key) ?? (audit.status === 'VALID' ? 'VALID_GLOBALLY' : audit.status === 'ORPHANED' || audit.status === 'STALE' ? 'INVALID_TARGET' : 'NEEDS_REVIEW')

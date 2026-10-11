@@ -57,6 +57,9 @@ const descriptions: Record<AuditFinding['code'], { title: string; explanation: s
   STALE_ACTIVE_SOURCE: { title: 'Uma movimentação usa uma origem que já não está ativa', explanation: 'A conciliação ainda inclui uma movimentação cuja fonte não aparece mais na listagem atual do Drive.' },
   MISSING_COUNT_DIVERGENCE: { title: 'Os números de Ausentes não conferem', explanation: 'Os contadores da tela receberam listas diferentes de lançamentos ausentes.' },
   DUPLICATE_PRESENT_BUT_MARKED_MISSING: { title: 'Um PDF duplicado presente foi marcado como ausente', explanation: 'Uma fatura continua presente por mais de um arquivo, mas um dos arquivos foi contado como removido.' },
+  INVALID_DECISION_TIMESTAMP: { title: 'Timestamp inválido em _CONCILIADOR', explanation: 'Uma decisão com data ausente ou inválida foi isolada porque não é seguro usá-la na precedência do merge.' },
+  DUPLICATE_REMOTE_DECISION_ID: { title: 'Identificador de decisão duplicado em _CONCILIADOR', explanation: 'Mais de uma linha física usa o mesmo decisionId; nenhuma cópia foi escolhida automaticamente.' },
+  INVALID_REMOTE_DECISION_ROW: { title: 'Linha inválida em _CONCILIADOR', explanation: 'Uma linha não passou pela validação do contrato V1 e foi mantida fora do conjunto efetivo.' },
 }
 
 export type AuditCodeLifecycle = 'emitted' | 'legacy' | 'related-only'

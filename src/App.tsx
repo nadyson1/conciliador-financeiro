@@ -22,6 +22,7 @@ import { AuditFindingCard } from './components/AuditFindingCard'
 import { clearPersistedDecisions, decisionKey, deletePersistedDecision, listPersistedDecisions, replacePersistedDecision, savePersistedDecision } from './domain/localDecisions'
 import { conflictingDecisionsForStatementRow, conflictingStatementAssignments, resolveStatementMatchAssignments } from './domain/statementMatchAssignments'
 import type { DecisionKind, PersistedDecision } from './domain/localDecisions'
+import type { RemoteDecisionIntegrityIssue } from './domain/decisionAudit'
 import { GoogleSheetsPanel } from './components/GoogleSheetsPanel'
 import type { GoogleSheetsConnectionInfo } from './components/GoogleSheetsPanel'
 import { GoogleDrivePanel } from './components/GoogleDrivePanel'
@@ -155,6 +156,7 @@ export default function App() {
   const pdfSessionGeneration = useRef(0)
   const [cardPdfNotice, setCardPdfNotice] = useState('')
   const [savedDecisions, setSavedDecisions] = useState<PersistedDecision[]>([])
+  const [remoteDecisionIntegrity, setRemoteDecisionIntegrity] = useState<{ spreadsheetId: string; issues: RemoteDecisionIntegrityIssue[] } | null>(null)
   const [pendingDecisionIds, setPendingDecisionIds] = useState<Set<string>>(() => new Set())
   const [decisionsReady, setDecisionsReady] = useState(false)
   const decisionStateRevision = useRef(0)
@@ -398,7 +400,11 @@ export default function App() {
     try {
       const local = await listPersistedDecisions()
       const tombstones = listDecisionTombstones()
-      const merged = await syncGoogleSheetDecisions(spreadsheetId, token, local, tombstones)
+      const syncResult = await syncGoogleSheetDecisions(spreadsheetId, token, local, tombstones)
+      const merged = syncResult
+      const syncIntegrityIssues = syncResult.integrityIssues ?? []
+      setRemoteDecisionIntegrity({ spreadsheetId, issues: syncIntegrityIssues })
+      const blockedKeys = new Set(syncIntegrityIssues.flatMap((issue) => [...issue.decisionKeys, ...(issue.decisionId ? local.filter((decision) => stableFingerprint([decision.key]) === issue.decisionId).map((decision) => decision.key) : [])]))
       const effectiveKeys = new Set(merged.map((decision) => decision.key))
       const deletedKeys = new Set(Object.keys(tombstones))
       const diagnosticOnly = local.filter((decision) => !effectiveKeys.has(decision.key) && !deletedKeys.has(decision.key))
@@ -413,14 +419,14 @@ export default function App() {
       }
       // The workspace queue guarantees no newer local mutation can be hidden by
       // this snapshot while it is being written. Tombstones survive every failure.
-      Object.keys(tombstones).forEach((key) => removeDecisionTombstone(key))
+      Object.keys(tombstones).filter((key) => !blockedKeys.has(key)).forEach((key) => removeDecisionTombstone(key))
       setPendingDecisionIds((current) => {
         const next = new Set(current)
-        local.forEach((decision) => next.delete(decision.key))
-        Object.keys(tombstones).forEach((key) => next.delete(key))
+        local.filter((decision) => !blockedKeys.has(decision.key)).forEach((decision) => next.delete(decision.key))
+        Object.keys(tombstones).filter((key) => !blockedKeys.has(key)).forEach((key) => next.delete(key))
         return next
       })
-      setGoogleDecisionStatus('Decisões sincronizadas entre dispositivos.')
+      setGoogleDecisionStatus(syncIntegrityIssues.length ? `Decisões válidas sincronizadas. ${syncIntegrityIssues.length} problema(s) estrutural(is) preservado(s) para revisão em _CONCILIADOR.` : 'Decisões sincronizadas entre dispositivos.')
       return true
     } catch (error) {
       setGoogleDecisionStatus(error instanceof Error ? `Decisões mantidas neste dispositivo. ${error.message}` : 'Decisões mantidas neste dispositivo; não foi possível sincronizar.')
@@ -875,11 +881,12 @@ export default function App() {
     : [], [sourceStatus.sheet, savedDecisions, data.bank, data.sheet, cardPdfs])
   const applicableDecisions = useMemo(() => sourceStatus.sheet === 'ACCEPTED'
     ? savedDecisions.filter((decision) => {
+      if (sheetSource === 'google' && remoteDecisionIntegrity?.spreadsheetId === googleSheetLink?.spreadsheetId && remoteDecisionIntegrity?.issues.some((issue) => issue.decisionKeys.includes(decision.key) || issue.decisionId === stableFingerprint([decision.key]))) return false
       const tombstone = listDecisionTombstones()[decision.key]
       const tombstoned = tombstone && Date.parse(tombstone.updatedAt) >= Date.parse(decision.updatedAt)
       return !tombstoned && persistedDecisionAudit.find((audit) => audit.decision.key === decision.key)?.status === 'VALID'
     })
-    : [], [sourceStatus.sheet, savedDecisions, persistedDecisionAudit])
+    : [], [sourceStatus.sheet, sheetSource, savedDecisions, persistedDecisionAudit, remoteDecisionIntegrity, googleSheetLink?.spreadsheetId])
   const effectiveDecisionRevision = useMemo(() => decisionRevision(applicableDecisions), [applicableDecisions])
   const bankAssignments = useMemo(() => resolveConfirmedBankAssignments(applicableDecisions, data.bank, data.sheet), [applicableDecisions, data.bank, data.sheet])
   const hydratedDecisions = useMemo(() => {
@@ -1657,6 +1664,7 @@ export default function App() {
       let auditSheets = data.sheet
       let remoteDecisions: PersistedDecision[] = []
       let remoteTombstones: PersistedDecision[] = []
+      let remoteDecisionIntegrityIssues: RemoteDecisionIntegrityIssue[] = []
       if (sheetSource === 'google' && googleSheetLink?.spreadsheetId && googleAccessToken.current) {
         const [ledger, decisions] = await Promise.all([
           readGoogleSheetLedger(googleSheetLink.spreadsheetId, googleAccessToken.current),
@@ -1665,6 +1673,8 @@ export default function App() {
         auditSheets = ledger.transactions
         remoteDecisions = decisions.active
         remoteTombstones = decisions.tombstones
+        remoteDecisionIntegrityIssues = decisions.integrityIssues ?? []
+        setRemoteDecisionIntegrity({ spreadsheetId: googleSheetLink.spreadsheetId, issues: remoteDecisionIntegrityIssues })
       }
       const refreshed = auditConsistency({
         banks: data.bank,
@@ -1684,6 +1694,7 @@ export default function App() {
         localDecisions,
         remoteDecisions,
         remoteTombstones,
+        remoteDecisionIntegrityIssues,
         localTombstones: listDecisionTombstones(),
       })
       setConsistencyAudit((previous) => {
@@ -1733,6 +1744,7 @@ export default function App() {
       let auditSheets = sessionSnapshot.sheets
       let remoteDecisions: PersistedDecision[] = []
       let remoteTombstones: PersistedDecision[] = []
+      let remoteDecisionIntegrityIssues: RemoteDecisionIntegrityIssue[] = []
       let remoteLedgerCapturedAt: string | undefined
       let remoteDecisionsCapturedAt: string | undefined
       let remoteSourcesAvailable = false
@@ -1750,6 +1762,8 @@ export default function App() {
           auditSheets = cloneAuditInput(ledgerCapture.ledger.transactions)
           remoteDecisions = cloneAuditInput(decisionsCapture.decisions.active)
           remoteTombstones = cloneAuditInput(decisionsCapture.decisions.tombstones)
+          remoteDecisionIntegrityIssues = cloneAuditInput(decisionsCapture.decisions.integrityIssues ?? [])
+          setRemoteDecisionIntegrity({ spreadsheetId: googleSheetLink.spreadsheetId, issues: remoteDecisionIntegrityIssues })
           remoteSourcesAvailable = true
           setConsistencyAuditSourceNote(`CUSTOS ANO e _CONCILIADOR lidos separadamente · ${ledgerCapture.ledger.rowCount} linhas. O Google Sheets não fornece snapshot transacional conjunto; nenhuma alteração foi feita.`)
         } catch (remoteError) {
@@ -1763,7 +1777,7 @@ export default function App() {
           : 'Auditoria das fontes carregadas nesta sessão e das decisões locais; nenhuma alteração foi feita.')
       }
       const auditStatements = sessionSnapshot.statements.map(({ statement, legacyStatementIdentity }) => ({ statement, legacyStatementIdentity }))
-      const mergedAuditDecisionSet = auditDecisionMerge({ localDecisions: localCapture.decisions, localTombstones: localCapture.tombstones, remoteDecisions, remoteTombstones })
+      const mergedAuditDecisionSet = auditDecisionMerge({ localDecisions: localCapture.decisions, localTombstones: localCapture.tombstones, remoteDecisions, remoteTombstones, remoteDecisionIntegrityIssues })
       const auditEffectiveDecisionRevision = decisionRevision(auditPersistedDecisions(mergedAuditDecisionSet.effective.filter((item) => item.state === 'ACTIVE').map((item) => item.decision), { banks: sessionSnapshot.banks, sheets: auditSheets, statements: auditStatements }).filter((item) => item.status === 'VALID').map((item) => item.decision))
       const auditedSourceRevision = revisionForDerivedSources(sessionSnapshot.banks, auditSheets, auditStatements.map(({ statement }) => statement))
       const mixedRevisionSources = [
@@ -1802,7 +1816,7 @@ export default function App() {
         }),
         sourceProvenance, sheets: auditSheets, statements: auditStatements,
         currentCardMatches: sessionSnapshot.currentCardMatches, currentSheets: sessionSnapshot.sheets,
-        localDecisions: localCapture.decisions, remoteDecisions, remoteTombstones, localTombstones: localCapture.tombstones,
+        localDecisions: localCapture.decisions, remoteDecisions, remoteTombstones, remoteDecisionIntegrityIssues, localTombstones: localCapture.tombstones,
       })
       let auditResult = auditConsistency(auditInput)
       if (mode === 'PROFUNDA') await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
@@ -1811,6 +1825,7 @@ export default function App() {
       let latestSheets = latest.data.sheet
       let latestRemoteDecisions: PersistedDecision[] = []
       let latestRemoteTombstones: PersistedDecision[] = []
+      let latestRemoteDecisionIntegrityIssues: RemoteDecisionIntegrityIssue[] = []
       let finalRemoteReadAvailable = false
       if (mode === 'PROFUNDA' && latest.sheetSource === 'google' && latest.googleSheetLink?.spreadsheetId && googleAccessToken.current) {
         try {
@@ -1818,11 +1833,12 @@ export default function App() {
           latestSheets = ledger.transactions
           latestRemoteDecisions = decisions.active
           latestRemoteTombstones = decisions.tombstones
+          latestRemoteDecisionIntegrityIssues = decisions.integrityIssues ?? []
           finalRemoteReadAvailable = true
         } catch { /* The initial frozen snapshot remains the report basis; final freshness is unknown. */ }
       }
       const latestStatements = latest.cardPdfs.flatMap((entry) => entry.statement ? [entry.statement] : [])
-      const latestMerge = auditDecisionMerge({ localDecisions: latestDecisions.decisions, localTombstones: latestDecisions.tombstones, remoteDecisions: finalRemoteReadAvailable ? latestRemoteDecisions : remoteDecisions, remoteTombstones: finalRemoteReadAvailable ? latestRemoteTombstones : remoteTombstones })
+      const latestMerge = auditDecisionMerge({ localDecisions: latestDecisions.decisions, localTombstones: latestDecisions.tombstones, remoteDecisions: finalRemoteReadAvailable ? latestRemoteDecisions : remoteDecisions, remoteTombstones: finalRemoteReadAvailable ? latestRemoteTombstones : remoteTombstones, remoteDecisionIntegrityIssues: finalRemoteReadAvailable ? latestRemoteDecisionIntegrityIssues : remoteDecisionIntegrityIssues })
       const latestEffectiveDecisionRevision = decisionRevision(auditPersistedDecisions(latestMerge.effective.filter((item) => item.state === 'ACTIVE').map((item) => item.decision), { banks: latest.data.bank, sheets: latestSheets, statements: latest.cardPdfs.flatMap((entry) => entry.statement ? [{ statement: entry.statement, legacyStatementIdentity: entry.legacyStatementIdentity }] : []) }).filter((item) => item.status === 'VALID').map((item) => item.decision))
       const latestSnapshot = createAuditInputSnapshot({
         banks: latest.data.bank, sheets: latestSheets, statements: latestStatements, decisions: [...latestDecisions.decisions, ...(finalRemoteReadAvailable ? latestRemoteDecisions : remoteDecisions)],
@@ -1891,6 +1907,7 @@ export default function App() {
         let auditSheets = data.sheet
         let remoteDecisions: PersistedDecision[] = []
         let remoteTombstones: PersistedDecision[] = []
+        let remoteDecisionIntegrityIssues: RemoteDecisionIntegrityIssue[] = []
         if (sheetSource === 'google' && googleSheetLink?.spreadsheetId && googleAccessToken.current) {
           try {
             const [ledger, decisionRows] = await Promise.all([
@@ -1900,6 +1917,8 @@ export default function App() {
             auditSheets = ledger.transactions
             remoteDecisions = decisionRows.active
             remoteTombstones = decisionRows.tombstones
+            remoteDecisionIntegrityIssues = decisionRows.integrityIssues ?? []
+            setRemoteDecisionIntegrity({ spreadsheetId: googleSheetLink.spreadsheetId, issues: remoteDecisionIntegrityIssues })
           } catch { /* preserve current data and the local tombstone if a refresh is unavailable */ }
         }
         const refreshed = auditConsistency({
@@ -1919,6 +1938,7 @@ export default function App() {
           localDecisions,
           remoteDecisions,
           remoteTombstones,
+          remoteDecisionIntegrityIssues,
           localTombstones: listDecisionTombstones(),
           onlySubjectFingerprints: pending.fingerprints,
         })

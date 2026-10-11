@@ -8,6 +8,16 @@ export type DecisionAuditStatus = 'VALID' | 'STALE' | 'ORPHANED' | 'NEEDS_REVIEW
 export type AuditableStatement = { statement: CardStatement; legacyStatementIdentity?: string }
 export type DecisionAuditContext = { banks: BankTransaction[]; sheets: LedgerTransaction[]; statements: AuditableStatement[] }
 export type DecisionAudit = { decision: PersistedDecision; status: DecisionAuditStatus; resolved: boolean }
+export type RemoteDecisionIntegrityIssue = {
+  code: 'INVALID_DECISION_TIMESTAMP' | 'DUPLICATE_REMOTE_DECISION_ID' | 'INVALID_REMOTE_DECISION_ROW'
+  decisionId?: string
+  decisionKeys: string[]
+  physicalRows: number[]
+  status?: 'ACTIVE' | 'DELETED' | 'UNKNOWN'
+  invalidFields?: string[]
+  semanticallyDivergent?: boolean
+  reason: string
+}
 
 const selectedSheet = (context: DecisionAuditContext, identity?: string) => identity ? context.sheets.find((row) => sheetIdentity(row) === identity || row.id === identity) : undefined
 
