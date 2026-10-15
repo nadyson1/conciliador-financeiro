@@ -81,6 +81,14 @@ export function descriptionWithoutCounterparty(description: string, name: string
   return description.replace(new RegExp(`\\s+${escaped}\\s*$`, 'i'), '').trim() || description.trim()
 }
 
+/** Returns the same normalized counterparty value shown by the bank transaction card. */
+export function displayableCounterpartyName(transaction: { originalDescription: string; counterpartyName?: string | null }): string | null {
+  const name = transaction.counterpartyName?.trim()
+  if (!name) return null
+  const remainingDescription = normalizeDescription(descriptionWithoutCounterparty(transaction.originalDescription, name))
+  return remainingDescription === normalizeDescription(name) ? null : name
+}
+
 export function counterpartyLabel(input: { description: string; direction: Direction; type: TransactionType }): string {
   if (input.direction === 'CREDIT' || input.type === 'REFUND' || input.type === 'INCOME') return 'De'
   const description = normalizeDescription(normalizeBankDescription(input.description).normalizedDescription)

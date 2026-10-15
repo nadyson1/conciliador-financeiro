@@ -5,8 +5,8 @@ import { readCsvFile, initialColumnMap } from './importers/csv'
 import { parseBankCsvSections, parseLedgerRows } from './importers/transactions'
 import { readBankStatementFile } from './importers/bankStatement'
 import { cardStatementFinancialIdentity, deriveCardPurchaseStatus, findExistingCostYearCandidates, identifyStatementPayments, readCardStatementPdf, reconcileCardStatement } from './importers/cardStatement'
-import { bankDisplayDescription, normalizeDate, normalizeDescription } from './importers/normalize'
-import { counterpartyLabel, descriptionWithoutCounterparty } from './importers/counterparty'
+import { bankDisplayDescription, normalizeDate } from './importers/normalize'
+import { counterpartyLabel, displayableCounterpartyName } from './importers/counterparty'
 import { canonicalCompositionKey, findPlausibleLedgerCandidates, pairKey, reconcile } from './matching/reconcile'
 import { exportAuditDiagnosticJson, exportAuditFindings, exportCardPayments, exportDuplicates, exportMissing, exportOutOfScope, exportReviews, exportSummary } from './features/export'
 import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, cardTransactionIdentityVariants, sheetIdentity, stableFingerprint } from './domain/identity'
@@ -264,8 +264,10 @@ export default function App() {
           await synchronizeSavedDecisionsNow(googleSheetLink.spreadsheetId, googleAccessToken.current)
         }
       }
+      return true
     } catch {
       setError('Não foi possível salvar esta decisão neste dispositivo. Ela continuará disponível apenas nesta sessão.')
+      return false
     }
     })
   }
@@ -1364,7 +1366,13 @@ export default function App() {
     if (target.kind === 'BANK') {
       const current = result.items.find((item) => item.bank.id === target.bank.id)
       if (!current || !bankAddEligibility(current).eligible) { setMissingWriteNotice('Este lançamento já não está elegível para inclusão; confira a conciliação atualizada.'); setMissingToAdd(null); return }
-      const googleCandidates = googleSheetRows?.length ? findPlausibleLedgerCandidates(target.bank, googleSheetRows) : []
+      const bankKey = bankIdentity(target.bank)
+      const explicitlyRejectedSheetIds = new Set(applicableDecisions
+        .filter((decision) => decision.kind === 'PAIR_REJECTED' && decision.identities[0] === bankKey)
+        .map((decision) => decision.identities[1]))
+      const googleCandidates = googleSheetRows?.length
+        ? findPlausibleLedgerCandidates(target.bank, googleSheetRows).filter((sheet) => !explicitlyRejectedSheetIds.has(sheetIdentity(sheet)))
+        : []
       if (googleCandidates.length) {
         setData((currentData) => {
           const existingIdentities = new Set(currentData.sheet.map(sheetIdentity))
@@ -1438,16 +1446,24 @@ export default function App() {
       const selectedSheetKey = sheetIdentity(appended.transaction)
       if (target.kind === 'BANK') {
         const bankKey = bankIdentity(target.bank)
-        setLocallyAddedMissingPairs((current) => ({ ...current, [bankKey]: selectedSheetKey }))
         if (selectedLedgerSource.current === 'google' || !ledgerSourceChangedByUser.current) {
           setData((current) => ({ ...current, sheet: appended.transactions }))
           setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' }))
         }
-        await persistDecision('MISSING_ADDED_TO_SHEET', [bankKey], [selectedSheetKey])
+        const persisted = await persistDecision('MISSING_ADDED_TO_SHEET', [bankKey], [selectedSheetKey])
+        if (!persisted) {
+          setMissingWriteError('A nova linha foi gravada em CUSTOS ANO, mas não foi possível salvar o vínculo neste dispositivo. Os dados preenchidos foram mantidos; sincronize e tente novamente.')
+          return
+        }
+        setLocallyAddedMissingPairs((current) => ({ ...current, [bankKey]: selectedSheetKey }))
       } else {
         setData((current) => ({ ...current, sheet: current.sheet.some((sheet) => sheetIdentity(sheet) === selectedSheetKey) ? current.sheet : [...current.sheet, appended.transaction] }))
         setSourceStatus((current) => ({ ...current, sheet: 'ACCEPTED' }))
-        await persistDecision('STATEMENT_MATCH_CONFIRMED', [targetKey], [selectedSheetKey])
+        const persisted = await persistDecision('STATEMENT_MATCH_CONFIRMED', [targetKey], [selectedSheetKey])
+        if (!persisted) {
+          setMissingWriteError('A compra foi gravada em CUSTOS ANO, mas não foi possível salvar o vínculo neste dispositivo. Os dados preenchidos foram mantidos; sincronize e tente novamente.')
+          return
+        }
       }
       setMissingWriteNotice(appended.alreadyPresent ? 'Já havia uma linha igual em CUSTOS ANO; o vínculo foi confirmado sem criar duplicata.' : target.kind === 'STATEMENT' ? 'Compra da fatura adicionada à CUSTOS ANO e conciliada.' : 'Lançamento adicionado à CUSTOS ANO e confirmado na conciliação.')
       setMissingToAdd(null)
@@ -2303,10 +2319,9 @@ function CardSummaryNotice({ item }: { item: ReconciliationItem }) {
 function outOfScopeReason(type: BankTransaction['type']) { return ({ INCOME: 'Entrada identificada; não é uma despesa ausente.', INVESTMENT: 'Movimentação de investimento, como aplicação ou resgate.', INVESTMENT_INCOME: 'Rendimento de investimento; não é uma despesa ausente.', TRANSFER: 'Transferência entre contas.', OTHER: 'Natureza não confirmada; não foi presumida como despesa.', EXPENSE: 'Despesa fora da lista principal.', CARD_PAYMENT: 'Pagamento de fatura, tratado pela composição do cartão.', REFUND: 'Devolução ou estorno bancário; analisado junto à saída original.' } as const)[type] }
 function CounterpartyNote({ transaction }: { transaction: BankTransaction }) {
   const label = counterpartyLabel({ description: transaction.originalDescription, direction: transaction.direction, type: transaction.type })
-  if (transaction.counterpartyName) {
-    const remainingDescription = normalizeDescription(descriptionWithoutCounterparty(transaction.originalDescription, transaction.counterpartyName))
-    if (remainingDescription === normalizeDescription(transaction.counterpartyName)) return null
-    return <p className="counterparty-note"><span className="counterparty-note-label">{label}:</span> <strong>{transaction.counterpartyName}</strong></p>
+  const counterpartyName = displayableCounterpartyName(transaction)
+  if (counterpartyName) {
+    return <p className="counterparty-note"><span className="counterparty-note-label">{label}:</span> <strong>{counterpartyName}</strong></p>
   }
 
   const variants = [...new Map((transaction.counterpartyEvidence ?? []).map((item) => [item.name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase('pt-BR'), item])).values()]

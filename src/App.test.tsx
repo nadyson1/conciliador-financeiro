@@ -8,6 +8,7 @@ import { appendCostYearRecord, GoogleSheetsError, readGoogleSheetLedger, request
 import { loadGoogleSheetLink, saveGoogleSheetLink } from './integrations/googleSheetLinkStorage'
 import { saveDriveFolders } from './integrations/googleDriveStorage'
 import { listDecisionTombstones } from './integrations/googleSheetDecisions'
+import { savePersistedDecision } from './domain/localDecisions'
 import { bankIdentity, cardReviewCandidateIdentity, cardTransactionIdentity, sheetIdentity, stableFingerprint } from './domain/identity'
 import { initialColumnMap, parseCsvText } from './importers/csv'
 import { parseBankRows, parseLedgerRows } from './importers/transactions'
@@ -33,7 +34,7 @@ const decisionSyncMocks = vi.hoisted(() => ({ sync: vi.fn(), save: vi.fn(), dele
 vi.mock('./domain/localDecisions', () => ({
   decisionKey: (kind: string, identities: string[]) => `${kind}:${JSON.stringify(identities)}`,
   listPersistedDecisions: async () => [...savedDecisionStore.values()],
-  savePersistedDecision: async (decision: { key: string; kind: string; identities: string[]; selected: string[] }) => { const record = { ...decision, schemaVersion: 1 as const, updatedAt: new Date().toISOString() }; savedDecisionStore.set(decision.key, record); return record },
+  savePersistedDecision: vi.fn(async (decision: { key: string; kind: string; identities: string[]; selected: string[] }) => { const record = { ...decision, schemaVersion: 1 as const, updatedAt: new Date().toISOString() }; savedDecisionStore.set(decision.key, record); return record }),
   replacePersistedDecision: async (decision: { key: string; kind: string; identities: string[]; selected: string[] }, supersededKeys: string[]) => { supersededKeys.forEach((key) => savedDecisionStore.delete(key)); const record = { ...decision, schemaVersion: 1 as const, updatedAt: new Date().toISOString() }; savedDecisionStore.set(decision.key, record); return record },
   deletePersistedDecision: decisionSyncMocks.deleteDecision,
   clearPersistedDecisions: async () => savedDecisionStore.clear(),
@@ -66,6 +67,7 @@ beforeEach(() => {
   // clearMocks clears call history, but it does not discard queued
   // mockResolvedValueOnce/mockRejectedValueOnce implementations.
   savedDecisionStore.clear()
+  vi.mocked(savePersistedDecision).mockReset().mockImplementation(async (decision) => { const record = { ...decision, schemaVersion: 1 as const, updatedAt: new Date().toISOString() }; savedDecisionStore.set(decision.key, record); return record })
   localStorage.clear()
   sessionStorage.clear()
   googleSheetsMocks.read.mockReset()
@@ -370,14 +372,14 @@ describe('fluxo completo no navegador', () => {
     saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
     render(<App />)
     await screen.findByText(/Lançamentos carregados do Google Sheets/)
-    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File(['Data,Descrição,Valor,Tipo\n08/01/2026,PIX ENVIADO Des: Uber do Brasil Tecnol,"45,00",Débito'], 'banco.csv', { type: 'text/csv' }))
     await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
     await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
     await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
     await user.click(await screen.findByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
     const dialog = screen.getByRole('dialog', { name: 'Adicionar lançamento à CUSTOS ANO' })
     expect(dialog).toBeInTheDocument()
-    expect(screen.getByLabelText('Descrição')).toHaveValue('Pix Enviado')
+    expect(screen.getByLabelText('Descrição')).toHaveValue('Uber do Brasil Tecnol')
     expect(screen.getByLabelText('Data')).toHaveValue('2026-01-08')
     expect(screen.getByLabelText('Custo (R$)')).toHaveValue(45)
     expect(screen.getByLabelText('Categoria')).toHaveValue('')
@@ -388,7 +390,7 @@ describe('fluxo completo no navegador', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
     expect(await screen.findByText('Informe uma descrição.')).toBeInTheDocument()
     expect(appendCostYearRecord).not.toHaveBeenCalled()
-    await user.type(screen.getByLabelText('Descrição'), 'PIX ENVIADO MERCADO')
+    await user.type(screen.getByLabelText('Descrição'), 'Transporte Uber')
     const appendResult = { spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [existing, created], rowCount: 2, transaction: created, alreadyPresent: false }
     let resolveAppend!: (value: typeof appendResult) => void
     googleSheetsMocks.append.mockImplementationOnce(() => new Promise((resolve) => { resolveAppend = resolve }))
@@ -398,9 +400,67 @@ describe('fluxo completo no navegador', () => {
     resolveAppend(appendResult)
     expect(await screen.findByText('Lançamento adicionado à CUSTOS ANO e confirmado na conciliação.')).toBeInTheDocument()
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-    expect(appendCostYearRecord).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', expect.objectContaining({ description: 'PIX ENVIADO MERCADO', date: '2026-01-08', amount: 4500, category: 'Casa', paymentMethod: 'Pix', isFixed: false, isEssential: false }))
+    expect(appendCostYearRecord).toHaveBeenCalledWith('spreadsheet-id-12345', 'test-access-token', expect.objectContaining({ description: 'Transporte Uber', date: '2026-01-08', amount: 4500, category: 'Casa', paymentMethod: 'Pix', isFixed: false, isEssential: false }))
     expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'MISSING_ADDED_TO_SHEET' && decision.selected[0] === 'abcd1234')).toBe(true)
     expect(screen.getByRole('button', { name: /Ausentes/ })).toHaveTextContent('0')
+  })
+
+  it('permite adicionar nova linha quando a única candidata plausível foi explicitamente rejeitada', async () => {
+    const user = userEvent.setup()
+    const bankText = 'Data,Descrição,Valor,Tipo,ID\n02/03/2026,PIX ENVIADO,"12,00",Débito,bank-rejected-candidate'
+    const parsedBank = parseCsvText(bankText)
+    const bank = parseBankRows(parsedBank.rows, initialColumnMap(parsedBank.headers, 'bank')).transactions[0]
+    const oldRow = { id: 'sheet-old', source: 'SHEET' as const, sheetRecordId: 'row-old-rejected', bankTransactionId: null, date: '2026-03-01', description: 'Mel sache Feirinha', originalDescription: 'Mel sache Feirinha', amount: 1200, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Pessoal', month: '03 - Março', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const rejectedKey = `PAIR_REJECTED:${JSON.stringify([bankIdentity(bank), sheetIdentity(oldRow)])}`
+    savedDecisionStore.set(rejectedKey, { key: rejectedKey, schemaVersion: 1, kind: 'PAIR_REJECTED', identities: [bankIdentity(bank), sheetIdentity(oldRow)], selected: [], updatedAt: '2026-10-09T01:26:28.589Z' })
+    const newRow = { ...oldRow, id: 'sheet-new', sheetRecordId: 'new-record-id', date: '2026-03-02', description: 'Pix Enviado', originalDescription: 'Pix Enviado' }
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha com candidata rejeitada', transactions: [oldRow], rowCount: 1 })
+    googleSheetsMocks.append.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha com candidata rejeitada', transactions: [oldRow, newRow], rowCount: 2, transaction: newRow, alreadyPresent: false })
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha com candidata rejeitada', lastUpdated: null, autoConnect: true })
+
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File([bankText], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    await user.click(await screen.findByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    const dialog = screen.getByRole('dialog')
+    await user.selectOptions(screen.getByLabelText('Categoria'), 'Pessoal')
+    await user.click(within(dialog).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+
+    expect(await screen.findByText('Lançamento adicionado à CUSTOS ANO e confirmado na conciliação.')).toBeInTheDocument()
+    expect(appendCostYearRecord).toHaveBeenCalledOnce()
+    expect(savedDecisionStore.has(rejectedKey)).toBe(true)
+    expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'MISSING_ADDED_TO_SHEET' && decision.identities[0] === bankIdentity(bank) && decision.selected[0] === sheetIdentity(newRow))).toBe(true)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: /Ausentes/ })).toHaveTextContent('0'))
+  })
+
+  it('mantém o formulário aberto e mostra erro quando a linha foi gravada mas o vínculo local falha', async () => {
+    const user = userEvent.setup()
+    const bankText = 'Data,Descrição,Valor,Tipo,ID\n08/01/2026,PIX ENVIADO MERCADO,"45,00",Débito,bank-decision-write-failure'
+    const existing = { id: 'sheet-old', source: 'SHEET' as const, sheetRecordId: 'sheet-old', bankTransactionId: null, date: '2026-01-05', description: 'Escola', originalDescription: 'Escola', amount: 9900, direction: 'DEBIT' as const, type: 'EXPENSE' as const, paymentMethod: 'Pix', category: 'Casa', month: '01 - Janeiro', year: '2026', isFixed: false, isEssential: false, installment: null, totalInstallments: null, balanceAfter: null, original: {} }
+    const created = { ...existing, id: 'sheet-new', sheetRecordId: 'decision-failure-new-id', date: '2026-01-08', description: 'PIX ENVIADO MERCADO', originalDescription: 'PIX ENVIADO MERCADO', amount: 4500 }
+    googleSheetsMocks.read.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [existing], rowCount: 1 })
+    googleSheetsMocks.append.mockResolvedValue({ spreadsheetId: 'spreadsheet-id-12345', spreadsheetTitle: 'Planilha para escrita', transactions: [existing, created], rowCount: 2, transaction: created, alreadyPresent: false })
+    vi.mocked(savePersistedDecision).mockRejectedValueOnce(new Error('falha local sintética'))
+    saveGoogleSheetLink({ spreadsheetId: 'spreadsheet-id-12345', sheetName: 'CUSTOS ANO', spreadsheetTitle: 'Planilha para escrita', lastUpdated: null, autoConnect: true })
+    render(<App />)
+    await screen.findByText(/Lançamentos carregados do Google Sheets/)
+    await user.upload(screen.getByLabelText('Selecionar extrato bancário'), new File([bankText], 'banco.csv', { type: 'text/csv' }))
+    await user.click(await screen.findByRole('button', { name: 'Usar 1 linha(s) válidas' }))
+    await user.click(screen.getByRole('button', { name: /Conciliar agora/ }))
+    await user.click(screen.getByRole('tab', { name: /Ausentes/ }))
+    await user.click(await screen.findByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+    const dialog = screen.getByRole('dialog')
+    await user.selectOptions(screen.getByLabelText('Categoria'), 'Casa')
+    await user.click(within(dialog).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
+
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('A nova linha foi gravada em CUSTOS ANO, mas não foi possível salvar o vínculo neste dispositivo.')
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(appendCostYearRecord).toHaveBeenCalledOnce()
+    expect([...savedDecisionStore.values()].some((decision) => decision.kind === 'MISSING_ADDED_TO_SHEET')).toBe(false)
   })
 
   it('agrupa os rendimentos Invest Fácil fora de Ausentes e não oferece adicionar crédito', async () => {
@@ -1460,7 +1520,7 @@ describe('fluxo completo no navegador', () => {
     expect(dynamicCounterparty.querySelector('strong')).toHaveTextContent('Loja Ausente')
     expect(dynamicCounterparty).toHaveClass('counterparty-note')
     await user.click(within(dynamicPixCard).getByRole('button', { name: 'Adicionar à CUSTOS ANO' }))
-    expect(screen.getByLabelText('Descrição')).toHaveValue('Pix QR Code Dinâmico')
+    expect(screen.getByLabelText('Descrição')).toHaveValue('Loja Ausente')
     expect(screen.getByLabelText('Forma de pagamento')).toHaveValue('Pix')
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancelar' }))
     const withoutCounterparty = screen.getByRole('heading', { name: 'Pix Enviado' }).closest('article')
